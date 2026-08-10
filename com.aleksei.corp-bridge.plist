@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aleksei.corp-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/aleksei/bin/socks-bridge.py</string>
+        <string>--port</string>
+        <string>1082</string>
+        <string>--dns</string>
+        <string>192.168.0.210</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/socks-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/socks-bridge.err</string>
+</dict>
+</plist>
