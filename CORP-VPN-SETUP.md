@@ -5,8 +5,8 @@
 Дата: 10.08.2026. Дополнено 11.08.2026: маршрутный демон `corp-vpn-routes.sh`
 и единый конфиг `corp-networks.conf` перенесены в этот репозиторий;
 добавлена маршрутизация сайтов `SITE_DOMAINS` через корп. VPN;
-документированы пароль из Keychain для `collect-sites.py` (п. 3.9)
-и root-вход через корп. egress (п. 6).
+документированы пароль из Keychain для `collect-sites.py` (п. 3.9),
+root-вход через корп. egress (п. 6) и watchdog автоподключения VPN (п. 3.6).
 
 ---
 
@@ -149,6 +149,14 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   - `/32`-маршруты к MySQL-серверам из `MYSQL_HOSTS` (резолв по DNS каждые 5 мин);
   - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям).
 - При отключении VPN маршруты удаляются (по state-файлу `/var/run/corp-vpn-routes.state`).
+- **Автоподключение VPN (watchdog, `AUTO_CONNECT=1` в corp-networks.conf)**: когда
+  VPN выключен, но в `netstat -an -f inet` есть TCP-сокеты к корп. целям
+  (подсети `10/8`, `192.168/16`, резолв `MYSQL_HOSTS`+`SITE_DOMAINS`+`PROBE_HOSTS`
+  с кэшем `AUTO_CONNECT_CACHE_TTL`), демон сам поднимает сервис из
+  `AUTO_CONNECT_SERVICES` (по порядку: `vpn2-ts`, `vpn3-ts`) через
+  `scutil --nc start`. Кулдауны: `AUTO_CONNECT_COOLDOWN` (между попытками),
+  `AUTO_CONNECT_RETRY` (после полного провала). Лог: `logger -t corp-vpn-routes`
+  + `/var/log/corp-vpn-routes.log`.
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 
 ### 3.7. Единый конфиг — `corp-networks.conf`
@@ -235,10 +243,14 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
    (демон маршрутов добавляет только корп. сети, п. 3.6). Если галку
    «Отправлять весь трафик» случайно вернули в System Settings — повторно
    запустить `sudo ./install.sh`.
-2. **CLI-подключение корп. VPN** (`scutil --nc start`) может не сработать из-за
-   keychain PSK → подключать через System Settings. Порядок подключения:
-   сначала корп. VPN (GUI), затем Karing; либо Karing, затем корп. VPN — если
-   Karing упал, переподключить его.
+ 2. **CLI-подключение корп. VPN** (`scutil --nc start`) не работает — проверено
+    11.08.2026. Причина: keychain PSK после пересоздания элементов лежит в
+    System.keychain, а NE-стек (pppd/racoon) при запуске через `scutil` не может
+    его прочитать и отдаёт «incorrect user shared secret found». Ввод секрета
+    заново через System Settings (пересоздание элементов в правильном домене)
+    восстанавливает только GUI-путь. Подключать VPN можно только через System
+    Settings. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
+    Karing, затем корп. VPN — если Karing упал, переподключить его.
 3. **Мост резолвит через корп. DNS** — если корп. туннель лежит, домены
    `*.tradesoft.corp` не резолвятся (мост отвечает rejected). Это
    предохранитель от утечки корп. трафика.
@@ -258,6 +270,14 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
    (direct_out) гарантирует, что трафик сайтов НЕ уходит через прокси-нод —
    иначе сервер увидел бы IP нода, и allowlist не сработал бы даже при
    включённом VPN.
+7. **Автоподключение VPN по корп. трафику (watchdog)** работает по IP-целям:
+   любой TCP-сокет к корп. IP (в т.ч. публичные корп. сайты) поднимает туннель
+   с задержкой ~10 с (цикл 5 с + коннект). Внутренние имена
+   (`sup5.tradesoft.corp`, `projects.prj`) не могут быть триггером — DNS не
+   резолвится без туннеля; они доступны уже после того, как туннель поднят по
+   любому IP-триггеру. Если `scutil --nc start` под root падает с
+   «incorrect user shared secret found» — автоподъём невозможен, VPN поднимается
+   вручную через System Settings.
 
 ---
 
