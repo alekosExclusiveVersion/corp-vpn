@@ -4,7 +4,9 @@
 все файлы, конфигурации, команды проверки, операции и известные ограничения.
 Дата: 10.08.2026. Дополнено 11.08.2026: маршрутный демон `corp-vpn-routes.sh`
 и единый конфиг `corp-networks.conf` перенесены в этот репозиторий;
-добавлена маршрутизация сайтов `SITE_DOMAINS` через корп. VPN.
+добавлена маршрутизация сайтов `SITE_DOMAINS` через корп. VPN;
+документированы пароль из Keychain для `collect-sites.py` (п. 3.9)
+и root-вход через корп. egress (п. 6).
 
 ---
 
@@ -165,6 +167,38 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - `sudo ./uninstall.sh` — останавливает и удаляет демон, чистит маршруты,
   возвращает `OverridePrimary` (`split_restore.swift`).
 
+### 3.9. Сбор сайтов — `collect-sites.py` и пароль из Keychain
+`collect-sites.py` (репо `tradesoft-vpn-setup`) собирает домены сайтов из корп.
+MySQL-серверов (реестр `servers.json` приложения `parallels-sql-admins`;
+запускать через его venv) и подставляет результат в `SITE_DOMAINS`
+файла `corp-networks.conf`.
+
+Пароль MySQL берётся по приоритету:
+1. `--password '***'` — устаревший способ (пароль светится в истории команд);
+2. `--password-keychain [SERVICE]` — из macOS Keychain (generic password).
+   `SERVICE` по умолчанию `collect-sites`, учётка — `--user` (по умолчанию
+   `koshkin`). Пароль читается через `security find-generic-password` и
+   никогда не печатается/не логируется;
+3. интерактивный `getpass` — если не задано ни то, ни другое.
+
+Настройка Keychain (один раз, в своём терминале; пароль читается из stdin):
+```bash
+security add-generic-password -a koshkin -s collect-sites -w
+```
+Первый запуск `--password-keychain` может показать системный диалог
+«разрешить доступ» — подтвердить. Если элемент отсутствует — выводится
+подсказка с командой настройки.
+
+Пример:
+```bash
+~/Work/scripts/parallels-sql-admins/.venv/bin/python collect-sites.py \
+  --password-keychain --hosts p7ru4.tradesoft.ru --out sites-p7ru4.txt
+```
+
+Безопасность: ключом управляет macOS Keychain, отдельного файла с ключом на
+диске нет (в отличие от Fernet-механизма `servers.key` приложения) — пароль
+защищён ключницей, а не только правами на файл.
+
 ---
 
 ## 4. Итоговая таблица маршрутов
@@ -191,6 +225,7 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 | Статус | `~/Work/scripts/corp-vpn/corp-vpn.sh status` | всё работает |
 | Мост жив | `nc -z 127.0.0.1 1082` | ok |
 | Корп. DNS резолвит | `dig @192.168.0.210 sup5.tradesoft.corp` | A-запись |
+| Egress сайтов (через туннель) | `curl --interface 192.168.160.160 https://ifconfig.me` | корп. IP `92.255.230.89` |
 
 ---
 
@@ -210,6 +245,19 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 4. **Узел Karing и en0**: узел NL соединяется через en0 (auto_detect_interface).
    Если телефон/локальная сеть теряет интернет — Karing-узел недоступен.
 5. Мост слушает только `127.0.0.1` (безопасно, извне недоступен).
+6. **Root-вход в админки сайтов (`systradesoft`) работает только при
+   подключённом корп. VPN** — авторизация завязана на source-IP. Трафик к
+   сайтам (`activauto.ru`, `amry.ru` и др.) при включённом `vpn2-ts`/`vpn3-ts`
+   идёт через `/32`-маршруты → `ppp0` → корп. egress `92.255.230.89`
+   (ER-Telecom/DOM.RU), который в allowlist — вход проходит. Без VPN сайт видит
+   домашний IP (напр. Tele2 `94.77.36.66`) — root-вход отклоняется, при этом
+   страницы `/admin/login/` публично доступны. Split-horizon DNS нет: корп. DNS
+   отдаёт те же публичные IP, что и публичный. Как проверить, какой IP видит
+   сервер: `curl --interface <ppp-IP> https://ifconfig.me` (через туннель)
+   против `curl https://ifconfig.me` (общий egress). Правило Karing «На прямую»
+   (direct_out) гарантирует, что трафик сайтов НЕ уходит через прокси-нод —
+   иначе сервер увидел бы IP нода, и allowlist не сработал бы даже при
+   включённом VPN.
 
 ---
 
