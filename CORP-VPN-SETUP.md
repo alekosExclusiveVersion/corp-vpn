@@ -2,7 +2,9 @@
 
 Документ фиксирует всю проделанную работу: проблему, архитектуру решения,
 все файлы, конфигурации, команды проверки, операции и известные ограничения.
-Дата: 10.08.2026.
+Дата: 10.08.2026. Дополнено 11.08.2026: маршрутный демон `corp-vpn-routes.sh`
+и единый конфиг `corp-networks.conf` перенесены в этот репозиторий;
+добавлена маршрутизация сайтов `SITE_DOMAINS` через корп. VPN.
 
 ---
 
@@ -64,7 +66,7 @@ socks-bridge.py (автозапуск через launchd, процесс 20995)
 
 ## 3. Компоненты и файлы
 
-### 3.1. Мост — `~/bin/socks-bridge.py`
+### 3.1. Мост — `socks-bridge.py` (в репо; `~/bin/socks-bridge.py` — симлинк)
 SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 
 Что делает:
@@ -87,11 +89,12 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 ### 3.2. Автозапуск моста — `~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
 - `Label`: `com.aleksei.corp-bridge`
 - `ProgramArguments`: `/opt/homebrew/bin/python3 /Users/aleksei/bin/socks-bridge.py --port 1082 --dns 192.168.0.210`
+  (`/Users/aleksei/bin/socks-bridge.py` — симлинк на файл репо)
 - `RunAtLoad: true`, `KeepAlive: true` (перезапуск при падении)
 - Логи: `/tmp/socks-bridge.log`, `/tmp/socks-bridge.err`
-- Состояние: `launchctl list | grep corp-bridge` → PID 20995.
+- Состояние: `launchctl list | grep corp-bridge` → PID процесса.
 
-### 3.3. Управление корп. VPN — `~/bin/corp-vpn.sh`
+### 3.3. Управление корп. VPN — `corp-vpn.sh` (в репо; `~/bin/corp-vpn.sh` — симлинк)
 Команды:
 - `corp-vpn.sh status` — состояние: корп. туннель (по ppp0 + ping корп. шлюза
   `192.168.160.1`), мост (порт 1082), Karing, маршруты 10/192.168.
@@ -122,8 +125,8 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
     `www.projects.prj`, `projects.prj`, `servicedesk-report.office.tradesoft.ru`
     → outbound `Корп L2TP` (мост).
   - `На прямую[Самостоятельная настройка]`: `.yandex.ru`, `.master.systest.php7`,
-    `opencode.ai`, ip_cidr `10.0.0.0/8` + `192.168.0.0/16`, процесс `opencode.exe`
-    → `direct_out`.
+    `opencode.ai`, сайты `SITE_DOMAINS` (напр. `www.amry.ru`), ip_cidr
+    `10.0.0.0/8` + `192.168.0.0/16`, процесс `opencode.exe` → `direct_out`.
 
 ### 3.5. Корпоративный VPN (система)
 - Сервисы: `vpn1`, `vpn2-ts`, `vpn3-ts`, `vpn4`; активен `vpn3-ts`.
@@ -131,10 +134,36 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   PSK в keychain (иногда «incorrect user shared secret found» при CLI).
 - Туннель: `ppp0`, адрес Mac `192.168.160.160`, шлюз `192.168.160.1`.
 - Корп. DNS: `192.168.0.210`.
-- Файл конфига: `/Library/Preferences/SystemConfiguration/preferences.plist`,
-  сервис `D3B98206-61DC-4340-B0AC-A970F8B9C582` (vpn3-ts):
-  **`IPv4.OverridePrimary = 1`** — «глобальный» режим (претендует на
-  default-маршрут). Это запасной источник конфликтов (см. п. 6).
+- **Split-режим**: у `vpn2-ts` и `vpn3-ts` убран `IPv4.OverridePrimary`
+  (применяется `install.sh` через `split_fix.swift`) — обычный интернет идёт
+  мимо VPN, а корп. маршруты добавляет демон (см. 3.6).
+
+### 3.6. Демон маршрутов — `corp-vpn-routes.sh` (split-tunnel)
+- LaunchDaemon `com.tradesoft.corp-vpn-routes` (root, проверяет каждые 5 с).
+- Файлы: `/Library/LaunchDaemons/com.tradesoft.corp-vpn-routes.plist`,
+  `/usr/local/sbin/corp-vpn-routes.sh` (устанавливаются из репо через `install.sh`).
+- При подключении `vpn2-ts`/`vpn3-ts` добавляет через ppp:
+  - сети `10/8`, `192.168.0/16`;
+  - `/32`-маршруты к MySQL-серверам из `MYSQL_HOSTS` (резолв по DNS каждые 5 мин);
+  - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям).
+- При отключении VPN маршруты удаляются (по state-файлу `/var/run/corp-vpn-routes.state`).
+- Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
+
+### 3.7. Единый конфиг — `corp-networks.conf`
+- Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
+  `install.sh` в `/usr/local/etc/corp-networks.conf`.
+- Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `MYSQL_HOSTS`,
+  `SITE_DOMAINS`, `PROBE_HOSTS`.
+- Из него берут данные оба компонента:
+  - демон маршрутов (ppp-маршруты, п. 3.6);
+  - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
+    конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
+
+### 3.8. Установка / откат — `install.sh` / `uninstall.sh`
+- `sudo ./install.sh` — копирует демон и конфиг, загружает LaunchDaemon,
+  применяет split-режим (`split_fix.swift`), проверяет результат.
+- `sudo ./uninstall.sh` — останавливает и удаляет демон, чистит маршруты,
+  возвращает `OverridePrimary` (`split_restore.swift`).
 
 ---
 
@@ -159,7 +188,7 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 | Корп. через мост | `curl --socks5-hostname 127.0.0.1:1082 http://sup5.tradesoft.corp:4000/` | 200 |
 | Полный стек TUN→мост | `curl http://sup5.tradesoft.corp:4000/` | 200 |
 | Проекты | `curl http://www.projects.prj/` | 200 |
-| Статус | `~/bin/corp-vpn.sh status` | всё работает |
+| Статус | `~/Work/scripts/corp-vpn/corp-vpn.sh status` | всё работает |
 | Мост жив | `nc -z 127.0.0.1 1082` | ok |
 | Корп. DNS резолвит | `dig @192.168.0.210 sup5.tradesoft.corp` | A-запись |
 
@@ -167,16 +196,10 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 
 ## 6. Известные ограничения / нюансы
 
-1. **Корп. VPN в «глобальном» режиме** (`OverridePrimary=1` у vpn3-ts):
-   лишний default через ppp0. Сейчас безвреден (utun4 выше приоритетом), но при
-   странностях подключения стоит выключить «Отправлять весь трафик» для корп.
-   VPN в System Settings → VPN → Details (сплит-режим: останутся только
-   маршруты 10/8 и 192.168/16).
-   Команда для смены (требует sudo):
-   ```
-   sudo /usr/libexec/PlistBuddy -c "Set :NetworkServices:D3B98206-61DC-4340-B0AC-A970F8B9C582:IPv4:OverridePrimary 0" /Library/Preferences/SystemConfiguration/preferences.plist
-   sudo killall -HUP configd
-   ```
+1. **Split-режим** корп. VPN: `OverridePrimary` у `vpn2-ts`/`vpn3-ts` убран
+   (демон маршрутов добавляет только корп. сети, п. 3.6). Если галку
+   «Отправлять весь трафик» случайно вернули в System Settings — повторно
+   запустить `sudo ./install.sh`.
 2. **CLI-подключение корп. VPN** (`scutil --nc start`) может не сработать из-за
    keychain PSK → подключать через System Settings. Порядок подключения:
    сначала корп. VPN (GUI), затем Karing; либо Karing, затем корп. VPN — если
@@ -193,9 +216,9 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 ## 7. Операции
 
 - **Включить всё**: 1) корп. VPN через System Settings (или
-  `~/bin/corp-vpn.sh start`), 2) включить Karing, 3) мост поднимется сам
-  (launchd), проверить `launchctl list | grep corp-bridge`.
-- **Статус**: `~/bin/corp-vpn.sh status`.
+  `~/Work/scripts/corp-vpn/corp-vpn.sh start`), 2) включить Karing, 3) мост
+  поднимется сам (launchd), проверить `launchctl list | grep corp-bridge`.
+- **Статус**: `~/Work/scripts/corp-vpn/corp-vpn.sh status`.
 - **Перезапуск моста**:
   `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist &&
    launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
@@ -208,11 +231,12 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 
 - Убрать автозапуск моста:
   `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`,
-  удалить plist и `~/bin/socks-bridge.py`.
+  удалить plist и `socks-bridge.py` из репо.
+- Полный откат демона маршрутов: `sudo ./uninstall.sh` (удаляет LaunchDaemon,
+  чистит маршруты, возвращает `OverridePrimary`).
 - Вернуть правило Karing в исходное состояние: в приложении Karing
   (Настройки → Правила) удалить правила «Корп L2TP» и «На прямую», или
   восстановить `karing_routing_group.json.bak.20260809-*` и
   `karing_subscribe_use.json.bak.20260809-*`.
-- Вернуть корп. VPN в глобальный режим (п. 6, `OverridePrimary 0→1`).
 - Системные маршруты `10/8`, `192.168.0/16 → ppp0` ставятся самим VPN-сервером
   и исчезают при отключении туннеля.
