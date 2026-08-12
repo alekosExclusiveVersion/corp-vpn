@@ -1,7 +1,7 @@
 import Foundation
 import SystemConfiguration
 
-let targetNames = ["vpn2-ts", "vpn3-ts"]
+let targetNames = ["vpn2-ts", "vpn3-ts", "vpn4"]
 
 guard let prefs = SCPreferencesCreate(nil, "split-fix" as CFString, nil) else {
     print("ERROR: cannot create SCPreferences")

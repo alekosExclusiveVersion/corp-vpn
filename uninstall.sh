@@ -78,6 +78,7 @@ with open(sys.argv[1], 'rb') as f:
 targets = {
     'vpn2-ts': 'DF442B03-A55C-41F1-A590-740EC2FF0068',
     'vpn3-ts': 'D3B98206-61DC-4340-B0AC-A970F8B9C582',
+    'vpn4': '931E4155-0924-4D0B-B4F7-5F8D104E494B',
 }
 ok = True
 for name, sid in targets.items():

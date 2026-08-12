@@ -3,7 +3,7 @@
 # Единый источник корпоративных сетей — /usr/local/etc/corp-networks.conf.
 # При отсутствии файла используем встроенные значения по умолчанию.
 CONF=/usr/local/etc/corp-networks.conf
-CORP_SERVICES="vpn2-ts vpn3-ts"
+CORP_SERVICES="vpn2-ts vpn3-ts vpn4"
 NET_ROUTES="10.0.0.0/8 192.168.0.0/16"
 MYSQL_HOSTS="p7ru1.tradesoft.ru p7ru2.tradesoft.ru p7ru3.tradesoft.ru p7ru4.tradesoft.ru p7ru5.tradesoft.ru p7ru8.tradesoft.ru p5g21.tradesoft.ru p5g25.tradesoft.ru p5g29.tradesoft.ru ext4.tradesoft.ru"
 SITE_DOMAINS="www.amry.ru"
