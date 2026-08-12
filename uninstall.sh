@@ -76,7 +76,7 @@ import plistlib, sys
 with open(sys.argv[1], 'rb') as f:
     d = plistlib.load(f)
 targets = {
-    'vpn2-ts': '7C0ECAF6-AEFF-464E-B293-81CB44E4A2FA',
+    'vpn2-ts': 'DF442B03-A55C-41F1-A590-740EC2FF0068',
     'vpn3-ts': 'D3B98206-61DC-4340-B0AC-A970F8B9C582',
 }
 ok = True
