@@ -229,6 +229,36 @@ EOF
   done
 }
 
+# Переключает host-маршрут на корп. интерфейс, даже если его уже занял
+# другой туннель (например, Karing прибивает *.tradesoft.ru к utun).
+# Удаляет чужой маршрут и добавляет свой.
+add_host_route() {
+  ip="$1"
+  if route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! route_via_ppp "$ip"; then
+    route -n delete -host "$ip" >/dev/null 2>&1
+    route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1
+  fi
+}
+
+# Каждые 5с перепроверяет маршруты из STATE и возвращает на корп. интерфейс
+# всё, что Karing/иные туннели успели перебить.
+assert_routes() {
+  [ -f "$STATE" ] || return 0
+  while IFS= read -r ip; do
+    case "$ip" in
+      probe:*|local:*) continue ;;
+      "") continue ;;
+      \#*) continue ;;
+    esac
+    if ! route_via_ppp "$ip"; then
+      add_host_route "$ip"
+    fi
+  done < "$STATE"
+}
+
 add_routes() {
   iface="$1"
   for r in $NET_ROUTES; do
@@ -237,13 +267,13 @@ add_routes() {
   : > "$STATE"
   for h in $MYSQL_HOSTS; do
     for ip in $(host_ip "$h"); do
-      route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1
+      add_host_route "$ip"
       echo "$ip" >> "$STATE"
     done
   done
   for h in $SITE_DOMAINS; do
     for ip in $(host_ip "$h"); do
-      route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1
+      add_host_route "$ip"
       echo "$ip" >> "$STATE"
     done
   done
@@ -297,6 +327,8 @@ while true; do
       last_iface="$iface"
       last_resolve=$now
       fail=0
+    else
+      assert_routes
     fi
   elif [ -n "$last_iface" ] || [ -f "$STATE" ]; then
     del_routes
