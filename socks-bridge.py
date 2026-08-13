@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import random
+import select
 import socket
 import struct
 import subprocess
@@ -11,6 +12,7 @@ BUFSIZE = 65536
 DNS_SERVER = ""
 CORP_IF = "ppp0"
 CORP_UP = False
+CONNECTION_SEMAPHORE = threading.Semaphore(10)
 
 
 def resolve_via_dns(name, server, timeout=5):
@@ -56,12 +58,12 @@ def corp_checker():
                 ["ifconfig", CORP_IF],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=5,
             )
             CORP_UP = "UP" in r.stdout and "inet " in r.stdout
         except Exception:
             CORP_UP = False
-        time.sleep(5)
+        time.sleep(10)
 
 
 def resolve_host(host, dns_server):
@@ -91,9 +93,12 @@ def send_all(sock, data):
         data = data[sent:]
 
 
-def relay(src, dst):
+def relay(src, dst, shutdown_event):
     try:
-        while True:
+        while not shutdown_event.is_set():
+            readable, _, _ = select.select([src], [], [], 1.0)
+            if not readable:
+                continue
             data = src.recv(BUFSIZE)
             if not data:
                 break
@@ -107,7 +112,13 @@ def relay(src, dst):
             pass
 
 
+def handle_with_semaphore(conn):
+    with CONNECTION_SEMAPHORE:
+        handle(conn)
+
+
 def handle(conn):
+    upstream = None
     try:
         conn.settimeout(30)
         ver, nmethods = read_exact(conn, 2)
@@ -141,17 +152,24 @@ def handle(conn):
         send_all(conn, b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         conn.settimeout(None)
         upstream.settimeout(None)
-        t1 = threading.Thread(target=relay, args=(conn, upstream))
-        t2 = threading.Thread(target=relay, args=(upstream, conn))
+        shutdown_event = threading.Event()
+        t1 = threading.Thread(target=relay, args=(conn, upstream, shutdown_event))
+        t2 = threading.Thread(target=relay, args=(upstream, conn, shutdown_event))
         t1.daemon = True
         t2.daemon = True
         t1.start()
         t2.start()
         t1.join()
         t2.join()
+        shutdown_event.set()
     except Exception:
         pass
     finally:
+        try:
+            if upstream is not None:
+                upstream.close()
+        except Exception:
+            pass
         try:
             conn.close()
         except Exception:
@@ -176,7 +194,7 @@ def main():
     print(f"bridge listening on {args.bind}:{args.port}", flush=True)
     while True:
         conn, _ = srv.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+        threading.Thread(target=handle_with_semaphore, args=(conn,), daemon=True).start()
 
 
 if __name__ == "__main__":
