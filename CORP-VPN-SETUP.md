@@ -149,21 +149,26 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   - `/32`-маршруты к MySQL-серверам из `MYSQL_HOSTS` (резолв по DNS каждые 5 мин);
   - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям).
 - При отключении VPN маршруты удаляются (по state-файлу `/var/run/corp-vpn-routes.state`).
-- **Автоподключение VPN (watchdog, `AUTO_CONNECT=1` в corp-networks.conf)**: когда
-  VPN выключен, но в `netstat -an -f inet` есть TCP-сокеты к корп. целям
-  (подсети `10/8`, `192.168/16`, резолв `MYSQL_HOSTS`+`SITE_DOMAINS`+`PROBE_HOSTS`
-  с кэшем `AUTO_CONNECT_CACHE_TTL`), демон сам поднимает сервис из
-  `AUTO_CONNECT_SERVICES` (по порядку: `vpn2-ts`, `vpn3-ts`) через
-  `scutil --nc start`. Кулдауны: `AUTO_CONNECT_COOLDOWN` (между попытками),
-  `AUTO_CONNECT_RETRY` (после полного провала). Лог: `logger -t corp-vpn-routes`
-  + `/var/log/corp-vpn-routes.log`.
+- **Защита локальных сетей от захвата корп. туннелем**: широкие `NET_ROUTES`
+  (`10/8`, `192.168/16`) перекрывают в т.ч. домашние подсети. Демон после
+  добавления корп. маршрутов переустанавливает пути до локальных сетей через
+  физический интерфейс (`en0` и т.п.):
+  - явный список — `LOCAL_ROUTES` в `corp-networks.conf` (CIDR, напр.
+    `192.168.31.0/24`);
+  - автодетект — подсети всех физических интерфейсов (`ifconfig`, туннельные
+    `ppp/utun/lo/...` исключены), поэтому смена Wi-Fi/подсети тоже покрыта.
+  - Снапшот путей снимается ТОЛЬКО при выключенном туннеле (иначе `route -n get`
+    вернул бы ppp) в `/var/run/corp-vpn-local.state`, обновляется раз в 30 с.
+  - При добавлении: `route add -net <local> -netmask <mask> -interface en0`.
+  - Добавленные маршруты сносятся при отключении туннеля вместе с корп.
+    маршрутами.
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 
 ### 3.7. Единый конфиг — `corp-networks.conf`
 - Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
-- Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `MYSQL_HOSTS`,
-  `SITE_DOMAINS`, `PROBE_HOSTS`.
+- Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
+  `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`.
 - Из него берут данные оба компонента:
   - демон маршрутов (ppp-маршруты, п. 3.6);
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
