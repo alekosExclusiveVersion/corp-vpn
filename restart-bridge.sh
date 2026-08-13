@@ -5,6 +5,9 @@ set -e
 echo "==> Остановка моста..."
 launchctl unload /Library/LaunchDaemons/com.aleksei.corp-bridge.plist 2>/dev/null || true
 
+echo "==> Очистка старых логов..."
+sudo truncate -s 0 /tmp/socks-bridge.err /tmp/socks-bridge.log 2>/dev/null || true
+
 echo "==> Ожидание завершения процессов..."
 sleep 2
 
