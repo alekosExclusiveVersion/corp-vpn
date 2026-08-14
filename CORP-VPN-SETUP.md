@@ -11,6 +11,9 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 хосты `btk66.ru`, `shop.eurotradeplus.pl` (SITE_DOMAINS) и
 `eurotradeplus.tradesoft.ru` (MYSQL_HOSTS) включены в единый конфиг
 `corp-networks.conf`, маршрутами управляет только демон `corp-vpn-routes.sh`.
+Заодно упрощена архитектура (см. §2): слой SOCKS5-моста `socks-bridge.py`
+(+ правило Karing «Корп L2TP») выведен из эксплуатации — корп. трафик идёт
+напрямую по /32-маршрутам ppp0, которые демон поддерживает каждые 5 с.
 
 ---
 
@@ -34,46 +37,54 @@ TradeSoft** через L2TP/IPSec VPN (`vpn1`/`vpn2-ts`/`vpn3-ts`/`vpn4`, сер
 
 ---
 
-## 2. Архитектура решения (3 слоя)
+## 2. Архитектура решения
 
 ```
-Интернет-трафик (обычные сайты)
+Обычный интернет-трафик
    │
    ▼
-Karing TUN (utun4, default → узел 🇳🇱 Netherlands)
+Karing TUN (utun*, default → прокси-узел)
    │  DNS: hijack-dns → dns_proxy_out → DoH (1.1.1.1/8.8.8.8)
    ▼
 Интернет работает через узел Karing
 
-Корпоративный трафик (*.tradesoft.corp, *.prj, 10/8, 192.168/16)
-   │
+Корпоративный трафик (SITE_DOMAINS, MYSQL_HOSTS, NET_ROUTES)
+   │  /32- и сетевые маршруты → ppp0 добавляет демон corp-vpn-routes.sh
+   │  (проверка каждые 5с: чужой маршрут Karing удаляется и возвращается ppp)
    ▼
-Karing TUN → правило «Корп L2TP» → SOCKS5 127.0.0.1:1082
-   │
+Корпоративный туннель ppp0 (split-режим, без OverridePrimary)
    ▼
-socks-bridge.py (автозапуск через launchd, процесс 20995)
-   │  DNS-резолв через корп. DNS 192.168.0.210 (сырой UDP-запрос)
-   │  проверка: ppp0 поднят + «UP» + есть inet
+Корпоративные ресурсы (админки сайтов, mysql, *.tradesoft.corp, 10/8, 192.168/16)
    ▼
-Корпоративный туннель ppp0 (маршруты 10/8, 192.168.0/16 → ppp0)
-   ▼
-Корпоративные ресурсы (sup5.tradesoft.corp:4000, www.projects.prj, ...)
+Egress корп. туннеля: 92.255.230.89 — IP в allowlist админок (root-вход)
 
-Локальная сеть / телефон (en0, 172.25.125.x) — не трогается
+Локальная сеть / телефон (en0) — не трогается (LOCAL_ROUTES + автоопределение)
 ```
 
-Ключевая идея: **не перехватывать корпоративные адреса в самом sing-box**.
-Достаточно, чтобы корпоративные DNS-имена резолвились через корп. DNS
-(`socks-bridge.py` делает это сам), а IP-пакеты попадали в корп. туннель за счёт
-системных маршрутов `10/8` и `192.168.0/16 → ppp0`. Правило в Karing лишь
-направляет корпоративный трафик в мост.
+Ключевая идея: **корпоративные адреса НЕ перехватываются в sing-box/Karing** —
+достаточно системных маршрутов до ppp0. Демон `corp-vpn-routes.sh` добавляет
+их при подключении L2TP и каждые 5с возвращает на ppp то, что Karing успел
+перебить своими TUN-пинами (`add_host_route`: удалить чужой маршрут → добавить
+через ppp0).
+
+Бывший слой SOCKS5-моста (`socks-bridge.py` 127.0.0.1:1082 + правило Karing
+«Корп L2TP») **больше не используется**: правило удалено из Karing, порт не
+слушается, агент `com.aleksei.corp-bridge` остановлен. Публичные корп. сайты
+(btk66.ru, shop.eurotradeplus.pl, *.tradesoft.ru) идут напрямую по /32-маршрутам
+ppp0, внутренние имена (*.tradesoft.corp, *.prj) резолвятся корп. DNS
+192.168.0.210 через NET_ROUTES/спец-маршруты — мост не требуется.
 
 ---
 
 ## 3. Компоненты и файлы
 
-### 3.1. Мост — `socks-bridge.py` (в репо; `~/bin/socks-bridge.py` — симлинк)
+### 3.1. Мост — `socks-bridge.py` *(устаревший компонент, не используется — см. §2)*
 SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
+
+> Мост выведен из эксплуатации 14.08.2026: правило «Корп L2TP» удалено из
+> Karing, агент `com.aleksei.corp-bridge` остановлен, порт 1082 не слушается.
+> Корп. трафик идёт напрямую по /32-маршрутам ppp0 (демон §3.6). Описание
+> оставлено для истории/отката.
 
 Что делает:
 - Принимает SOCKS5 (CONNECT, IPv4/домен/IPv6-адрес в атype).
@@ -89,10 +100,10 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - Флаги: `--port 1082`, `--bind 127.0.0.1`, `--dns 192.168.0.210`,
   `--corp-if ppp0`.
 
-Важно: старый черновик с `SyntaxError` в `/tmp/socks-bridge.err` — от
-предыдущей итерации, текущий процесс (20995) рабочий.
+Примечание: в `/tmp/socks-bridge.err` может лежать старый черновик с
+`SyntaxError` — от предыдущей итерации, к текущему состоянию не относится.
 
-### 3.2. Автозапуск моста — `~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
+### 3.2. Автозапуск моста *(устаревший компонент — агент остановлен, см. §3.1)* — `~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
 - `Label`: `com.aleksei.corp-bridge`
 - `ProgramArguments`: `/opt/homebrew/bin/python3 /Users/aleksei/bin/socks-bridge.py --port 1082 --dns 192.168.0.210`
   (`/Users/aleksei/bin/socks-bridge.py` — симлинк на файл репо)
@@ -125,14 +136,15 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - **outbounds**:
   - `Корп L2TP` = SOCKS5 `127.0.0.1:1082` (bridge)
   - `direct_out` = direct
-- **route/rules** (важные):
-  - `Корп L2TP[Самостоятельная настройка]`: domain_suffix `.tradesoft.ru`,
-    `.tradesoft.pro`, `.tradesoft.corp`, `.prj` + домены `sup5.tradesoft.corp`,
-    `www.projects.prj`, `projects.prj`, `servicedesk-report.office.tradesoft.ru`
-    → outbound `Корп L2TP` (мост).
+- **route/rules** (важные, состояние на 14.08.2026):
+  - Outbound `Корп L2TP` (socks5 `127.0.0.1:1082`) ещё остался в конфиге как
+    мёртвый объект, но **правил, направляющих в него трафик, больше нет** —
+    мост из архитектуры убран (§2).
   - `На прямую[Самостоятельная настройка]`: `.yandex.ru`, `.master.systest.php7`,
-    `opencode.ai`, сайты `SITE_DOMAINS` (напр. `www.amry.ru`), ip_cidr
-    `10.0.0.0/8` + `192.168.0.0/16`, процесс `opencode.exe` → `direct_out`.
+    `opencode.ai`, ip_cidr `10.0.0.0/8` + `192.168.0.0/16`, процесс `opencode.exe`
+    → `direct_out`. Сайты `SITE_DOMAINS` при желании добавляет генератор
+    `karing-rules.sh` (см. §3.7), но для маршрутизации это не критично: демон
+    §3.6 всё равно возвращает их трафик на ppp0 каждые 5 с.
 
 ### 3.5. Корпоративный VPN (система)
 - Сервисы: `vpn1`, `vpn2-ts`, `vpn3-ts`, `vpn4`; активен `vpn3-ts`.
@@ -221,28 +233,30 @@ security add-generic-password -a koshkin -s collect-sites -w
 ## 4. Итоговая таблица маршрутов
 
 ```
-default            link#23            UCSg       utun4    ← Karing (интернет)
+default            utun*              UCSg       utun6    ← Karing (интернет)
 default            172.25.125.111     UGScIg     en0      ← телефон/локальная сеть
-default            link#22            UCSIg      ppp0     ← корп. VPN (глобальный режим)
-10                  ppp0               USc       ppp0     ← корпоративная сеть
-192.168.0/16        ppp0               USc       ppp0     ← корпоративная сеть
+10                  ppp0               USc       ppp0     ← корпоративная сеть (демон)
+192.168.0/16        ppp0               USc       ppp0     ← корпоративная сеть (демон)
+185.137.232.115      ppp0               HSc       ppp0     ← btk66.ru (демон, /32)
+116.202.228.248      ppp0               HSc       ppp0     ← eurotradeplus / mysql (демон, /32)
 ```
-Интернет уходит через utun4 (высший приоритет), корп. подсети — через ppp0.
+Интернет уходит через Karing TUN (высший приоритет); корп. подсети и /32-хосты
+сайтов/MySQL — через ppp0, их держит демон §3.6. `default → ppp0` отсутствует
+(split-режим). Номер utun плавающий (utun4/utun6/utun7) — не привязываться.
 
 ---
 
-## 5. Проверки (все зелёные на 10.08.2026, ~14:00)
+## 5. Проверки (зелёные на 14.08.2026)
 
 | Проверка | Команда | Результат |
 |---|---|---|
 | Интернет через TUN | `curl -s --max-time 12 https://api.ipify.org` | IP узла Karing |
-| Корп. через мост | `curl --socks5-hostname 127.0.0.1:1082 http://sup5.tradesoft.corp:4000/` | 200 |
-| Полный стек TUN→мост | `curl http://sup5.tradesoft.corp:4000/` | 200 |
-| Проекты | `curl http://www.projects.prj/` | 200 |
-| Статус | `~/Work/scripts/corp-vpn/corp-vpn.sh status` | всё работает |
-| Мост жив | `nc -z 127.0.0.1 1082` | ok |
+| Маршруты на ppp | `route -n get 185.137.232.115 \| grep interface` | `ppp0` |
+| Админка btk66 (root-вход) | `curl --interface 192.168.160.160 -L https://www.btk66.ru/admin/` | 200/302 |
+| MySQL eurotradeplus | `nc -z -w 3 116.202.228.248 3306` | ok |
+| Корп. egress | `curl --interface 192.168.160.160 https://ifconfig.me` | корп. IP `92.255.230.89` |
+| Демон жив | `sudo launchctl print system/com.tradesoft.corp-vpn-routes \| grep 'state = '` | running |
 | Корп. DNS резолвит | `dig @192.168.0.210 sup5.tradesoft.corp` | A-запись |
-| Egress сайтов (через туннель) | `curl --interface 192.168.160.160 https://ifconfig.me` | корп. IP `92.255.230.89` |
 
 ---
 
@@ -260,12 +274,12 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
     восстанавливает только GUI-путь. Подключать VPN можно только через System
     Settings. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
     Karing, затем корп. VPN — если Karing упал, переподключить его.
-3. **Мост резолвит через корп. DNS** — если корп. туннель лежит, домены
-   `*.tradesoft.corp` не резолвятся (мост отвечает rejected). Это
-   предохранитель от утечки корп. трафика.
+3. ~~**Мост резолвит через корп. DNS**~~ — устарело (мост выведен, §3.1).
+   Внутренние имена `*.tradesoft.corp` доступны только при поднятом туннеле
+   (маршруты → ppp0, корп. DNS 192.168.0.210).
 4. **Узел Karing и en0**: узел NL соединяется через en0 (auto_detect_interface).
    Если телефон/локальная сеть теряет интернет — Karing-узел недоступен.
-5. Мост слушает только `127.0.0.1` (безопасно, извне недоступен).
+5. ~~Мост слушает только `127.0.0.1`~~ — устарело (мост выведен, §3.1).
 6. **Root-вход в админки сайтов (`systradesoft`) работает только при
    подключённом корп. VPN** — авторизация завязана на source-IP. Трафик к
    сайтам (`activauto.ru`, `amry.ru`, `btk66.ru`, `shop.eurotradeplus.pl` и др.)
@@ -276,10 +290,10 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
    страницы `/admin/login/` публично доступны. Split-horizon DNS нет: корп. DNS
    отдаёт те же публичные IP, что и публичный. Как проверить, какой IP видит
    сервер: `curl --interface <ppp-IP> https://ifconfig.me` (через туннель)
-   против `curl https://ifconfig.me` (общий egress). Правило Karing «На прямую»
-   (direct_out) гарантирует, что трафик сайтов НЕ уходит через прокси-нод —
-   иначе сервер увидел бы IP нода, и allowlist не сработал бы даже при
-   включённом VPN.
+   против `curl https://ifconfig.me` (общий egress). Трафик сайтов не уходит
+   в прокси-нод (что дало бы IP нода вместо корп. и сломало allowlist):
+   маршруты до сайтов держит демон (§3.6) — он каждые 5 с возвращает на ppp0
+   то, что Karing перебил TUN-пинами.
 7. **Автоподключение VPN по корп. трафику (watchdog)** работает по IP-целям:
    любой TCP-сокет к корп. IP (в т.ч. публичные корп. сайты) поднимает туннель
    с задержкой ~10 с (цикл 5 с + коннект). Внутренние имена
@@ -294,22 +308,24 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 ## 7. Операции
 
 - **Включить всё**: 1) корп. VPN через System Settings (или
-  `~/Work/scripts/corp-vpn/corp-vpn.sh start`), 2) включить Karing, 3) мост
-  поднимется сам (launchd), проверить `launchctl list | grep corp-bridge`.
+  `~/Work/scripts/corp-vpn/corp-vpn.sh start`), 2) включить Karing,
+  3) маршруты до корп. ресурсов автоматически добавит демон (§3.6), проверить
+  `route -n get 185.137.232.115 | grep interface` → `ppp0`.
 - **Статус**: `~/Work/scripts/corp-vpn/corp-vpn.sh status`.
-- **Перезапуск моста**:
+- ~~**Перезапуск моста**~~ (устарело — мост выведен, §3.1):
   `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist &&
    launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
-- **Логи**: мост — `/tmp/socks-bridge.log` (+ `.err`), Karing —
-  `…/group.com.nebula.karing/service_core.log`, `app.log`.
+- **Логи**: Karing — `…/group.com.nebula.karing/service_core.log`, `app.log`;
+  демон маршрутов — `journal`/`launchctl print` (§3.6).
 
 ---
 
 ## 8. Откат (если понадобится)
 
-- Убрать автозапуск моста:
-  `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`,
-  удалить plist и `socks-bridge.py` из репо.
+- Мост уже выведен (14.08.2026): агент `com.aleksei.corp-bridge` остановлен,
+  правило «Корп L2TP» из Karing удалено. Полный откат (если понадобится):
+  `launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist` и
+  вернуть `socks-bridge.py` в репо.
 - Полный откат демона маршрутов: `sudo ./uninstall.sh` (удаляет LaunchDaemon,
   чистит маршруты, возвращает `OverridePrimary`).
 - Вернуть правило Karing в исходное состояние: в приложении Karing
