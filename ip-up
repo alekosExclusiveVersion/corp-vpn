@@ -1,4 +1,0 @@
-#!/bin/bash
-# Вызывается pppd при поднятии PPP-соединения ($1 = имя интерфейса)
-[ "$1" = "ppp0" ] && /bin/bash /Users/aleksei/corp-vpn/fix-mysql-routes.sh
-exit 0

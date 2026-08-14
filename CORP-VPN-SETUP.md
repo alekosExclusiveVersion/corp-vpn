@@ -7,6 +7,10 @@
 добавлена маршрутизация сайтов `SITE_DOMAINS` через корп. VPN;
 документированы пароль из Keychain для `collect-sites.py` (п. 3.9),
 root-вход через корп. egress (п. 6) и watchdog автоподключения VPN (п. 3.6).
+Дополнено 14.08.2026: отдельный скрипт-дубль `fix-mysql-routes.sh` удалён —
+хосты `btk66.ru`, `shop.eurotradeplus.pl` (SITE_DOMAINS) и
+`eurotradeplus.tradesoft.ru` (MYSQL_HOSTS) включены в единый конфиг
+`corp-networks.conf`, маршрутами управляет только демон `corp-vpn-routes.sh`.
 
 ---
 
@@ -264,7 +268,8 @@ default            link#22            UCSIg      ppp0     ← корп. VPN (г�
 5. Мост слушает только `127.0.0.1` (безопасно, извне недоступен).
 6. **Root-вход в админки сайтов (`systradesoft`) работает только при
    подключённом корп. VPN** — авторизация завязана на source-IP. Трафик к
-   сайтам (`activauto.ru`, `amry.ru` и др.) при включённом `vpn2-ts`/`vpn3-ts`
+   сайтам (`activauto.ru`, `amry.ru`, `btk66.ru`, `shop.eurotradeplus.pl` и др.)
+   при включённом `vpn2-ts`/`vpn3-ts`
    идёт через `/32`-маршруты → `ppp0` → корп. egress `92.255.230.89`
    (ER-Telecom/DOM.RU), который в allowlist — вход проходит. Без VPN сайт видит
    домашний IP (напр. Tele2 `94.77.36.66`) — root-вход отклоняется, при этом
