@@ -14,6 +14,11 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 Заодно упрощена архитектура (см. §2): слой SOCKS5-моста `socks-bridge.py`
 (+ правило Karing «Корп L2TP») выведен из эксплуатации — корп. трафик идёт
 напрямую по /32-маршрутам ppp0, которые демон поддерживает каждые 5 с.
+Дополнено 15.08.2026: демон автодетекта `corp-learn.sh` — корп. сайты
+добавляются автоматически: по PTR-записи исходящих соединений он определяет
+сайты на корп. хостинге Tradesoft и дописывает их в локальный
+`corp-networks-auto.conf` (AUTO_SITE_DOMAINS), который маршрутный демон
+подхватывает в течение секунд.
 
 ---
 
@@ -163,8 +168,10 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - При подключении `vpn2-ts`/`vpn3-ts` добавляет через ppp:
   - сети `10/8`, `192.168.0/16`;
   - `/32`-маршруты к MySQL-серверам из `MYSQL_HOSTS` (резолв по DNS каждые 5 мин);
-  - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям).
+  - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям);
+  - `/32`-маршруты к сайтам автодетекта `AUTO_SITE_DOMAINS` (см. п. 3.7).
 - При отключении VPN маршруты удаляются (по state-файлу `/var/run/corp-vpn-routes.state`).
+- Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 - **Защита локальных сетей от захвата корп. туннелем**: широкие `NET_ROUTES`
   (`10/8`, `192.168/16`) перекрывают в т.ч. домашние подсети. Демон после
   добавления корп. маршрутов переустанавливает пути до локальных сетей через
@@ -185,16 +192,26 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
   `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`.
+- **Автодетект** — `corp-learn.sh` дописывает найденные корп. сайты в
+  `/usr/local/etc/corp-networks-auto.conf` (по одному домену на строку,
+  строки `#`/пустые игнорируются). Маршрутный демон читает его вместе с
+  основным конфигом и применяет новые домены сразу при изменении.
+  Автонайденные домены не попадают в git — их переносят в `SITE_DOMAINS`
+  вручную, когда нужно закрепить.
 - Из него берут данные оба компонента:
   - демон маршрутов (ppp-маршруты, п. 3.6);
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
 
 ### 3.8. Установка / откат — `install.sh` / `uninstall.sh`
-- `sudo ./install.sh` — копирует демон и конфиг, загружает LaunchDaemon,
-  применяет split-режим (`split_fix.swift`), проверяет результат.
-- `sudo ./uninstall.sh` — останавливает и удаляет демон, чистит маршруты,
+- `sudo ./install.sh` — копирует демоны (`corp-vpn-routes.sh`,
+  `corp-learn.sh`) и конфиги, загружает LaunchDaemon'ы, применяет split-режим
+  (`split_fix.swift`), проверяет результат.
+- `sudo ./uninstall.sh` — останавливает и удаляет демоны, чистит маршруты,
   возвращает `OverridePrimary` (`split_restore.swift`).
+- Перезапуск демона маршрутов: `sudo launchctl kickstart -k
+  system/com.tradesoft.corp-vpn-routes`; демона автодетекта: `sudo launchctl
+  kickstart -k system/com.tradesoft.corp-learn`.
 
 ### 3.9. Сбор сайтов — `collect-sites.py` и пароль из Keychain
 `collect-sites.py` (репо `tradesoft-vpn-setup`) собирает домены сайтов из корп.

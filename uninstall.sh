@@ -19,6 +19,10 @@ DAEMON_PLIST="/Library/LaunchDaemons/$LABEL.plist"
 DAEMON_SCRIPT="/usr/local/sbin/corp-vpn-routes.sh"
 STATE="/var/run/corp-vpn-routes.state"
 NETWORKS_CONF="/usr/local/etc/corp-networks.conf"
+LEARN_LABEL="com.tradesoft.corp-learn"
+LEARN_PLIST="/Library/LaunchDaemons/$LEARN_LABEL.plist"
+LEARN_SCRIPT="/usr/local/sbin/corp-learn.sh"
+AUTO_NETWORKS_CONF="/usr/local/etc/corp-networks-auto.conf"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -29,6 +33,12 @@ if launchctl list | grep -q "$LABEL"; then
 fi
 rm -f "$DAEMON_PLIST" "$DAEMON_SCRIPT"
 rm -f "$NETWORKS_CONF"
+
+echo "==> Остановка и удаление демона автодетекта (corp-learn)..."
+if launchctl list | grep -q "$LEARN_LABEL"; then
+  launchctl unload "$LEARN_PLIST"
+fi
+rm -f "$LEARN_PLIST" "$LEARN_SCRIPT" "$AUTO_NETWORKS_CONF"
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -62,6 +72,13 @@ if [ -e "$DAEMON_SCRIPT" ] || [ -e "$DAEMON_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы демона удалены"
+fi
+
+if [ -e "$LEARN_SCRIPT" ] || [ -e "$LEARN_PLIST" ] || [ -e "$AUTO_NETWORKS_CONF" ]; then
+  echo "  [FAIL] файлы демона автодетекта остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона автодетекта удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then

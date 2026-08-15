@@ -18,6 +18,10 @@ LABEL="com.tradesoft.corp-vpn-routes"
 DAEMON_PLIST="/Library/LaunchDaemons/$LABEL.plist"
 DAEMON_SCRIPT="/usr/local/sbin/corp-vpn-routes.sh"
 NETWORKS_CONF="/usr/local/etc/corp-networks.conf"
+LEARN_LABEL="com.tradesoft.corp-learn"
+LEARN_PLIST="/Library/LaunchDaemons/$LEARN_LABEL.plist"
+LEARN_SCRIPT="/usr/local/sbin/corp-learn.sh"
+AUTO_NETWORKS_CONF="/usr/local/etc/corp-networks-auto.conf"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -35,6 +39,23 @@ if launchctl list | grep -q "$LABEL"; then
   launchctl unload "$DAEMON_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$DAEMON_PLIST"
+
+echo "==> Установка демона автодетекта сайтов (corp-learn)..."
+cp "$DIR/corp-learn.sh" "$LEARN_SCRIPT"
+chmod 755 "$LEARN_SCRIPT"
+cp "$DIR/com.tradesoft.corp-learn.plist" "$LEARN_PLIST"
+if [ ! -f "$AUTO_NETWORKS_CONF" ]; then
+  cat > "$AUTO_NETWORKS_CONF" <<'EOF'
+# Автодетект corp-learn.sh: корп. сайты добавляются сюда автоматически по PTR.
+# Домены, которые нужно сохранить навсегда, переносите в corp-networks.conf
+# (SITE_DOMAINS). Строки вида "# " и пустые игнорируются.
+EOF
+fi
+chmod 644 "$AUTO_NETWORKS_CONF"
+if launchctl list | grep -q "$LEARN_LABEL"; then
+  launchctl unload "$LEARN_PLIST" 2>/dev/null || true
+fi
+launchctl load -w "$LEARN_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -56,6 +77,20 @@ if [ -x "$DAEMON_SCRIPT" ]; then
   echo "  [OK]   скрипт $DAEMON_SCRIPT"
 else
   echo "  [FAIL] скрипт $DAEMON_SCRIPT отсутствует"
+  fail=1
+fi
+
+if launchctl list | grep -q "$LEARN_LABEL"; then
+  echo "  [OK]   демон $LEARN_LABEL загружен"
+else
+  echo "  [FAIL] демон $LEARN_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$LEARN_SCRIPT" ]; then
+  echo "  [OK]   скрипт автодетекта $LEARN_SCRIPT"
+else
+  echo "  [FAIL] скрипт автодетекта $LEARN_SCRIPT отсутствует"
   fail=1
 fi
 

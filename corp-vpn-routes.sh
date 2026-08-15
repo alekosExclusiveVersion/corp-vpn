@@ -2,15 +2,23 @@
 
 # Единый источник корпоративных сетей — /usr/local/etc/corp-networks.conf.
 # При отсутствии файла используем встроенные значения по умолчанию.
+# Автодетект corp-learn.sh дописывает домены в corp-networks-auto.conf
+# (AUTO_SITE_DOMAINS, по одному домену на строку).
 CONF=/usr/local/etc/corp-networks.conf
+AUTO_CONF=/usr/local/etc/corp-networks-auto.conf
 CORP_SERVICES="vpn2-ts vpn3-ts vpn4"
 NET_ROUTES="10.0.0.0/8 192.168.0.0/16"
 LOCAL_ROUTES=""
 MYSQL_HOSTS="p7ru1.tradesoft.ru p7ru2.tradesoft.ru p7ru3.tradesoft.ru p7ru4.tradesoft.ru p7ru5.tradesoft.ru p7ru8.tradesoft.ru p5g21.tradesoft.ru p5g25.tradesoft.ru p5g29.tradesoft.ru ext4.tradesoft.ru"
 SITE_DOMAINS="www.amry.ru"
 PROBE_HOSTS="sup5.tradesoft.corp:4000 projects.prj:80 servicedesk-report.office.tradesoft.ru:443"
+AUTO_SITE_DOMAINS=""
 if [ -f "$CONF" ]; then
   . "$CONF"
+fi
+# Домены автодетекта (corp-learn.sh), по одному на строку в AUTO_CONF.
+if [ -f "$AUTO_CONF" ]; then
+  AUTO_SITE_DOMAINS=$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" | tr '\n' ' ')
 fi
 STATE=/var/run/corp-vpn-routes.state
 LOCAL_STATE=/var/run/corp-vpn-local.state
@@ -271,7 +279,7 @@ add_routes() {
       echo "$ip" >> "$STATE"
     done
   done
-  for h in $SITE_DOMAINS; do
+  for h in $SITE_DOMAINS $AUTO_SITE_DOMAINS; do
     for ip in $(host_ip "$h"); do
       add_host_route "$ip"
       echo "$ip" >> "$STATE"
@@ -329,6 +337,14 @@ while true; do
       fail=0
     else
       assert_routes
+      # Подхват доменов автодетекта (corp-learn.sh): при изменении
+      # auto-конфига пересчитываем маршруты сразу, не дожидаясь 300с.
+      new_auto=$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" 2>/dev/null | tr '\n' ' ')
+      if [ "$new_auto" != "$AUTO_SITE_DOMAINS" ]; then
+        AUTO_SITE_DOMAINS=$new_auto
+        del_routes
+        add_routes "$iface"
+      fi
     fi
   elif [ -n "$last_iface" ] || [ -f "$STATE" ]; then
     del_routes
