@@ -4,8 +4,11 @@
 #
 # Каждые 10 секунд сканирует установленные исходящие TCP-соединения. Для новых
 # внешних IP запрашивает PTR-запись (dig -x); если домен попадает в корпоративную
-# зону Tradesoft (DOMAIN_SUFFIX из corp-networks.conf), домен дописывается в
-# /usr/local/etc/corp-networks-auto.conf (по одному на строку, без дублей).
+# зону Tradesoft (DOMAIN_SUFFIX из corp-networks.conf), домен:
+#   1) навсегда дописывается в строку SITE_DOMAINS установленного конфига
+#      ($MAIN_CONF) и его репозиторной копии ($REPO_CONF) — переживает рестарты;
+#   2) для немедленного применения (не дожидаясь 300-сек цикла основного демона)
+#      также дописывается в /usr/local/etc/corp-networks-auto.conf.
 #
 # Уже маршрутизированные через ppp IP не трогаем (их маршрут держит основной
 # демон), а известные домены отсеивает строковая проверка known_domain.
@@ -16,6 +19,7 @@
 
 CONF=/usr/local/etc/corp-networks.conf
 AUTO_CONF=/usr/local/etc/corp-networks-auto.conf
+REPO_CONF=/Users/aleksei/corp-vpn/corp-networks.conf
 
 # Значения по умолчанию, если CONF не установлен
 DOMAIN_SUFFIX=".tradesoft.ru .tradesoft.pro .tradesoft.corp"
@@ -71,14 +75,36 @@ add_auto() {
   echo "learn: $d -> $AUTO_CONF"
 }
 
+# BSD (macOS) / GNU (Linux) sed -i совместимость.
+sed_inplace() {
+  if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi
+}
+
+# Навсегда: дописать домен в строку SITE_DOMAINS указанного конфига.
+append_site_domains() {
+  f="$1"
+  d="$2"
+  grep -qw "$d" "$f" 2>/dev/null && return 0
+  sed_inplace "/^SITE_DOMAINS=/ s/\"$/ $d\"/" "$f"
+}
+
+add_permanent() {
+  d="$1"
+  [ -f "$MAIN_CONF" ] && append_site_domains "$MAIN_CONF" "$d"
+  [ -n "$REPO_CONF" ] && [ -f "$REPO_CONF" ] && append_site_domains "$REPO_CONF" "$d"
+  echo "learn: $d -> SITE_DOMAINS (навсегда)"
+}
+
 while true; do
   now=$(date +%s)
 
-  # Кэш доменов auto-конфига (только чтение локального файла, быстро).
+  # Кэш доменов auto-конфига и перечитывание основного конфига (мог
+  # дополниться нами же — SITE_DOMAINS теперь пополняется навсегда).
   if [ $((now - last_auto)) -ge 60 ]; then
     last_auto=$now
     AUTO_KNOWN=""
     [ -f "$AUTO_CONF" ] && AUTO_KNOWN=$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" | tr '\n' ' ')
+    [ -f "$CONF" ] && . "$CONF"
   fi
 
   for ip in $(scan_conns); do
@@ -91,6 +117,7 @@ while true; do
     ptr=${ptr%.}
     if in_zone "$ptr" && ! known_domain "$ptr"; then
       add_auto "$ptr"
+      add_permanent "$ptr"
     fi
   done
 
