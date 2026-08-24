@@ -23,6 +23,7 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 попадает в `corp-networks-auto.conf` (AUTO_SITE_DOMAINS), который маршрутный
 демон подхватывает в течение секунд. Git-коммит найденных доменов остаётся
 за пользователем.
+20.08.2026: добавлено автовосстановление VPN после сна через sleepwatcher (п. 3.6).
 
 ---
 
@@ -165,7 +166,63 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   (применяется `install.sh` через `split_fix.swift`) — обычный интернет идёт
   мимо VPN, а корп. маршруты добавляет демон (см. 3.6).
 
-### 3.6. Демон маршрутов — `corp-vpn-routes.sh` (split-tunnel)
+### 3.6. Автовосстановление VPN после сна — `~/.wakeup` + sleepwatcher
+L2TP VPN (`vpn3-ts`) отключается после выхода macOS из спящего режима.
+Для автовосстановления используется `sleepwatcher` (homebrew).
+
+**Компоненты:**
+- `brew services start sleepwatcher` — демон, запускается при логине
+- `~/.wakeup` — скрипт, вызываемый sleepwatcher при пробуждении
+
+**Как работает `~/.wakeup`:**
+1. Ждёт пока en0 получит IP (до 30 с, проверка каждые 2 с)
+2. Дополнительные 5 с на стабилизацию сети
+3. Если VPN уже подключён — выходит
+4. Пытается подключить через `networksetup -connectpppoeservice` (до 3 попыток)
+5. Между попытками: ожидание 20 с, проверка статуса, отключение перед повтором
+6. Логирует результат в system log (`logger "corp-vpn: ..."`)
+
+**Важно:** `scutil --nc start` **не работает** для L2TP VPN — используйте
+`networksetup -connectpppoeservice` (проверено 20.08.2026).
+
+**Установка (выполнено 20.08.2026):**
+```bash
+brew install sleepwatcher
+brew services start sleepwatcher
+```
+
+**Проверка:**
+```bash
+log show --predicate 'message CONTAINS "corp-vpn"' --last 30m
+```
+
+### 3.6.1. Watchdog автоподключения VPN — `vpn-watchdog.sh`
+Если VPN отключился в любой момент (не только после сна), watchdog
+переподключает его автоматически.
+
+**Компоненты:**
+- `vpn-watchdog.sh` — скрипт проверки и переподключения
+- `com.aleksei.vpn-watchdog` — LaunchAgent (каждые 60 с, `RunAtLoad: true`)
+
+**Как работает:**
+1. Проверяет статус `vpn3-ts` через `scutil --nc status`
+2. Если `Connected` — выходит
+3. Подключает через `networksetup -connectpppoeservice`
+4. Ждёт до 20 с, проверяет результат
+5. Логирует в system log
+
+**Установка (выполнено 20.08.2026):**
+```bash
+launchctl load ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist
+```
+
+**Проверка:**
+```bash
+launchctl list | grep vpn-watchdog
+log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
+```
+
+### 3.6.2. Демон маршрутов — `corp-vpn-routes.sh` (split-tunnel)
 - LaunchDaemon `com.tradesoft.corp-vpn-routes` (root, проверяет каждые 5 с).
 - Файлы: `/Library/LaunchDaemons/com.tradesoft.corp-vpn-routes.plist`,
   `/usr/local/sbin/corp-vpn-routes.sh` (устанавливаются из репо через `install.sh`).
@@ -204,7 +261,7 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   вместе с основным и применяет новые домены сразу при изменении.
   Git-коммит найденных доменов — за пользователем.
 - Из него берут данные оба компонента:
-  - демон маршрутов (ppp-маршруты, п. 3.6);
+  - демон маршрутов (ppp-маршруты, п. 3.6.2);
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
 
@@ -288,13 +345,13 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    (демон маршрутов добавляет только корп. сети, п. 3.6). Если галку
    «Отправлять весь трафик» случайно вернули в System Settings — повторно
    запустить `sudo ./install.sh`.
- 2. **CLI-подключение корп. VPN** (`scutil --nc start`) не работает — проверено
-    11.08.2026. Причина: keychain PSK после пересоздания элементов лежит в
-    System.keychain, а NE-стек (pppd/racoon) при запуске через `scutil` не может
-    его прочитать и отдаёт «incorrect user shared secret found». Ввод секрета
-    заново через System Settings (пересоздание элементов в правильном домене)
-    восстанавливает только GUI-путь. Подключать VPN можно только через System
-    Settings. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
+ 2. **CLI-подключение корп. VPN** (`scutil --nc start`) не работает для L2TP —
+    проверено 11.08.2026 и подтверждено 20.08.2026. Причина: keychain PSK после
+    пересоздания элементов лежит в System.keychain, а NE-стек (pppd/racoon) при
+    запуске через `scutil` не может его прочитать и отдаёт «incorrect user shared
+    secret found». **Обходное решение**: `networksetup -connectpppoeservice "vpn3-ts"`
+    работает (используется в `~/.wakeup` для автовосстановления после сна).
+    Подключать VPN можно через System Settings или через `networksetup`. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
     Karing, затем корп. VPN — если Karing упал, переподключить его.
 3. ~~**Мост резолвит через корп. DNS**~~ — устарело (мост выведен, §3.1).
    Внутренние имена `*.tradesoft.corp` доступны только при поднятом туннеле
@@ -323,7 +380,17 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    резолвится без туннеля; они доступны уже после того, как туннель поднят по
    любому IP-триггеру. Если `scutil --nc start` под root падает с
    «incorrect user shared secret found» — автоподъём невозможен, VPN поднимается
-   вручную через System Settings.
+   вручную через System Settings или `networksetup -connectpppoeservice`.
+8. **Автовосстановление VPN после сна**: `sleepwatcher` + `~/.wakeup` —
+   автоматически переподключает `vpn3-ts` после пробуждения (п. 3.6).
+   Watchdog `vpn-watchdog.sh` (п. 3.6.1) проверяет VPN каждые 60 с и
+   переподключает при отключении. Используется
+   `networksetup -connectpppoeservice` вместо `scutil --nc start`.
+9. **Баг Karing автообновления (1.2.22 → 1.2.23)**: автообновитель скачивает
+   DMG, но не может установить — `xattr -c` падает с `Operation not permitted`
+   (macOS sandbox). Karing молча остаётся на старой версии. Обход: вручную
+   `xattr -d com.apple.quarantine <dmg>`, смонтировать, скопировать в
+   `/Applications`. Проверено 20.08.2026.
 
 ---
 
@@ -337,8 +404,14 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 - ~~**Перезапуск моста**~~ (устарело — мост выведен, §3.1):
   `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist &&
    launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
+- **Перезапуск sleepwatcher**:
+  `brew services restart sleepwatcher`
+- **Перезапуск watchdog VPN**:
+  `launchctl unload ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist &&
+   launchctl load ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist`
 - **Логи**: Karing — `…/group.com.nebula.karing/service_core.log`, `app.log`;
-  демон маршрутов — `journal`/`launchctl print` (§3.6).
+  демон маршрутов — `journal`/`launchctl print` (§3.6);
+  VPN reconnect/watchdog — `log show --predicate 'message CONTAINS "corp-vpn"'`.
 
 ---
 
