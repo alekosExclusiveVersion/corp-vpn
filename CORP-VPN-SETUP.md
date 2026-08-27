@@ -24,6 +24,13 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 демон подхватывает в течение секунд. Git-коммит найденных доменов остаётся
 за пользователем.
 20.08.2026: добавлено автовосстановление VPN после сна через sleepwatcher (п. 3.6).
+27.08.2026: найден и устранён корень провала корп. VPN на корп. Wi-Fi — публичные
+IP L2TP/IPSec серверов уходили в нод-туннель Karing (не было в direct-группе),
+теперь `VPN_SERVERS` закрепляются в Karing-direct (`karing-rules.sh`, репо
+`tradesoft-vpn-setup`) и `/32 → en0` (`corp-wifi-routes.sh`); корп. DNS
+`DNS_HOSTS` закрепляется `/32 → ppp0` (см. §3.7). Watchdog `vpn-watchdog.sh`
+переведён на рабочий метод `networksetup -connectpppoeservice` (scutil для L2TP
+не подключает) и проверен end-to-end через LaunchDaemon.
 
 ---
 
@@ -78,11 +85,16 @@ Egress корп. туннеля: 92.255.230.89 — IP в allowlist админо�
 через ppp0).
 
 Бывший слой SOCKS5-моста (`socks-bridge.py` 127.0.0.1:1082 + правило Karing
-«Корп L2TP») **больше не используется**: правило удалено из Karing, порт не
-слушается, агент `com.aleksei.corp-bridge` остановлен. Публичные корп. сайты
+«Корп L2TP») **больше не используется** и удалён из launchd: правило убрано из
+Karing, порт не слушается, демон `com.aleksei.corp-bridge` выгружен (§3.1).
+Публичные корп. сайты
 (btk66.ru, shop.eurotradeplus.pl, *.tradesoft.ru) идут напрямую по /32-маршрутам
 ppp0, внутренние имена (*.tradesoft.corp, *.prj) резолвятся корп. DNS
 192.168.0.210 через NET_ROUTES/спец-маршруты — мост не требуется.
+
+Отдельный уровень — **public IP VPN-серверов** (§3.7.1): они закрепляются в
+direct-группу Karing и `/32 → en0`, чтобы IPSec (UDP 500/4500, ESP) не уходил
+в нод-туннель и корп VPN поднимался даже на изолированной корп. Wi-Fi.
 
 ---
 
@@ -91,8 +103,11 @@ ppp0, внутренние имена (*.tradesoft.corp, *.prj) резолвят
 ### 3.1. Мост — `socks-bridge.py` *(устаревший компонент, не используется — см. §2)*
 SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 
-> Мост выведен из эксплуатации 14.08.2026: правило «Корп L2TP» удалено из
-> Karing, агент `com.aleksei.corp-bridge` остановлен, порт 1082 не слушается.
+> Мост выведен из эксплуатации 14.08.2026 и полностью удалён из launchd
+> 27.08.2026: правило «Корп L2TP» удалено из Karing, порт 1082 не слушается,
+> демон `com.aleksei.corp-bridge` выгружен из обоих доменов (system и gui —
+> job был в gui). Файл `com.aleksei.corp-bridge.plist` сохранён в репо
+> (`~/Library/LaunchAgents/...` тоже есть) для отката.
 > Корп. трафик идёт напрямую по /32-маршрутам ppp0 (демон §3.6). Описание
 > оставлено для истории/отката.
 
@@ -121,13 +136,20 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - Логи: `/tmp/socks-bridge.log`, `/tmp/socks-bridge.err`
 - Состояние: `launchctl list | grep corp-bridge` → PID процесса.
 
-### 3.3. Управление корп. VPN — `corp-vpn.sh` (в репо; `~/bin/corp-vpn.sh` — симлинк)
+### 3.3. Управление корп. VPN — `corp-vpn.sh`
+Канонический репозиторий — `~/corp-vpn` (на него указывают все пути ниже).
+> Внимание: существует старый дубль репо `~/Work/scripts/corp-vpn` (отстал от
+> канонического, на него всё ещё указывает симлинк `~/bin/corp-vpn.sh`).
+> Синхронизировать при необходимости; в новых установках использовать `~/corp-vpn`.
+
 Команды:
-- `corp-vpn.sh status` — состояние: корп. туннель (по ppp0 + ping корп. шлюза
-  `192.168.160.1`), мост (порт 1082), Karing, маршруты 10/192.168.
-- `corp-vpn.sh start [vpn]` — CLI-подключение (`scutil --nc start`).
-  **Может не сработать**: keychain PSK, туннель обычно поднимают через GUI.
-- `corp-vpn.sh stop [vpn]` — отключение.
+- `~/corp-vpn/corp-vpn.sh status` — состояние: корп. туннель (по ppp0 + ping
+  корп. шлюза `192.168.160.1`), мост (порт 1082 — устаревший компонент), Karing,
+  маршруты 10/192.168.
+- `~/corp-vpn/corp-vpn.sh start [vpn]` — CLI-подключение
+  (`scutil --nc start`). **Может не сработать**: keychain PSK; для L2TP
+  работает `networksetup -connectpppoeservice` (см. §6 п. 2).
+- `~/corp-vpn/corp-vpn.sh stop [vpn]` — отключение.
 - VPN по умолчанию: `vpn3-ts` (допустимы vpn1, vpn2-ts, vpn4).
 
 ### 3.4. Конфигурация Karing
@@ -146,12 +168,13 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - **outbounds**:
   - `Корп L2TP` = SOCKS5 `127.0.0.1:1082` (bridge)
   - `direct_out` = direct
-- **route/rules** (важные, состояние на 14.08.2026):
+- **route/rules** (важные, состояние на 27.08.2026):
   - Outbound `Корп L2TP` (socks5 `127.0.0.1:1082`) ещё остался в конфиге как
     мёртвый объект, но **правил, направляющих в него трафик, больше нет** —
     мост из архитектуры убран (§2).
-  - `На прямую[Самостоятельная настройка]`: `.yandex.ru`, `.master.systest.php7`,
-    `opencode.ai`, ip_cidr `10.0.0.0/8` + `192.168.0.0/16`, процесс `opencode.exe`
+  - `На прямую` (direct_out): `.yandex.ru`, `.master.systest.php7`,
+    `opencode.ai`, процесс `opencode.exe`, ip_cidr `10.0.0.0/8` +
+    `192.168.0.0/16` + public IP `VPN_SERVERS` (добавляет `karing-rules.sh` §3.7)
     → `direct_out`. Сайты `SITE_DOMAINS` при желании добавляет генератор
     `karing-rules.sh` (см. §3.7), но для маршрутизации это не критично: демон
     §3.6 всё равно возвращает их трафик на ppp0 каждые 5 с.
@@ -260,11 +283,11 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 
 ### 3.7. Единый конфиг — `corp-networks.conf`
-- Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
+- Источник: `~/corp-vpn/corp-networks.conf`, устанавливается
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
   `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`.
-- `DNS_HOSTS` — корп. DNS-серверы (`192.168.0.210 192.168.0.220`). Пинмются
+- `DNS_HOSTS` — корп. DNS-серверы (`192.168.0.210 192.168.0.220`). Закрепляются
   `/32`-маршрутами через `ppp0` демоном `corp-vpn-routes.sh` (см. 3.6.2), чтобы
   корп. резолвинг не перехватывал Karing/en0, когда туннель поднят.
 - `VPN_SERVERS` — публичные IP L2TP/IPSec серверов
@@ -279,8 +302,10 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   строку, строки `#`/пустые игнорируются). Маршрутный демон читает auto-конфиг
   вместе с основным и применяет новые домены сразу при изменении.
   Git-коммит найденных доменов — за пользователем.
-- Из него берут данные оба компонента:
+- Источник данных для всех компонентов:
   - демон маршрутов (ppp-маршруты, п. 3.6.2);
+  - демон корп. Wi-Fi `corp-wifi-routes.sh` (маршруты через en0, п. 3.8.1;
+    читает `VPN_SERVERS`);
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
 
@@ -314,7 +339,7 @@ VPN не устанавливается. Метод подключения ту�
   `/usr/local/sbin/corp-wifi-routes.sh` (устанавливаются из репо через `install.sh`).
 - **Проблема**: при подключении к корп. Wi-Fi (`192.168.128.0/24`) Karing
   добавляет `/32`-маршруты для корп. IP (`192.168.0.210`, `192.168.0.33`,
-  `192.168.0.232`) через `utun9`. DNS-запросы к корп. DNS идут через Karing,
+  `192.168.0.232`) через `utun*` (номер плавающий). DNS-запросы к корп. DNS идут через Karing,
   который перехватывает их и возвращает node IPs (`198.20.x.x`) вместо реальных
   корп. IP. Результат: `www.projects.prj` (198.20.0.105) не открывается
   (Empty reply from server).
@@ -330,7 +355,7 @@ VPN не устанавливается. Метод подключения ту�
   не поднимается на этой Wi-Fi (подробнее §3.7.1).
 - **Ограничение**: корп. Wi-Fi (`192.168.128.0/24`) — изолированная сеть,
   не маршрутизирует в `192.168.0.0/16`. Демон добавляет маршруты через `en0`,
-  но Wi-Fi шлюз не knows как доставить пакеты. **VPN обязателен** для
+  но Wi-Fi шлюз не знает, как доставить пакеты. **VPN обязателен** для
   `192.168.0.0/16` и `10.0.0.0/8`. Демон полезен только для DNS-резолва
   (если Wi-Fi сеть умеет маршрутизировать к DNS-серверу).
 - **При подключении VPN**: демон удаляет свои маршруты через `en0`,
@@ -368,10 +393,14 @@ default → ppp0  (VPN)       — корп.
 
 ### 3.8. Установка / откат — `install.sh` / `uninstall.sh`
 - `sudo ./install.sh` — копирует демоны (`corp-vpn-routes.sh`,
-  `corp-learn.sh`, `corp-wifi-routes.sh`) и конфиги, загружает LaunchDaemon'ы,
-  применяет split-режим (`split_fix.swift`), проверяет результат.
-- `sudo ./uninstall.sh` — останавливает и удаляет демоны, чистит маршруты,
-  возвращает `OverridePrimary` (`split_restore.swift`).
+  `corp-learn.sh`, `corp-wifi-routes.sh`, `vpn-watchdog.sh`) и конфиги,
+  загружает LaunchDaemon'ы (`com.tradesoft.corp-vpn-routes`,
+  `com.tradesoft.corp-learn`, `com.tradesoft.corp-wifi-routes`,
+  `com.tradesoft.corp-vpn-watchdog`), применяет split-режим
+  (`split_fix.swift`), проверяет результат.
+- `sudo ./uninstall.sh` — останавливает и удаляет демоны (в т.ч.
+  vpn-watchdog), чистит маршруты, возвращает `OverridePrimary`
+  (`split_restore.swift`).
 - Перезапуск демона маршрутов: `sudo launchctl kickstart -k
   system/com.tradesoft.corp-vpn-routes`; демона автодетекта: `sudo launchctl
   kickstart -k system/com.tradesoft.corp-learn`; демона wifi-routes:
@@ -451,14 +480,14 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    (демон маршрутов добавляет только корп. сети, п. 3.6). Если галку
    «Отправлять весь трафик» случайно вернули в System Settings — повторно
    запустить `sudo ./install.sh`.
- 2. **CLI-подключение корп. VPN** (`scutil --nc start`) не работает для L2TP —
-    проверено 11.08.2026 и подтверждено 20.08.2026. Причина: keychain PSK после
-    пересоздания элементов лежит в System.keychain, а NE-стек (pppd/racoon) при
-    запуске через `scutil` не может его прочитать и отдаёт «incorrect user shared
-    secret found». **Обходное решение**: `networksetup -connectpppoeservice "vpn3-ts"`
-    работает (используется в `~/.wakeup` для автовосстановления после сна).
-    Подключать VPN можно через System Settings или через `networksetup`. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
-    Karing, затем корп. VPN — если Karing упал, переподключить его.
+2. **CLI-подключение корп. VPN** (`scutil --nc start`) не работает для L2TP —
+   проверено 11.08.2026 и подтверждено 20.08.2026. Причина: keychain PSK после
+   пересоздания элементов лежит в System.keychain, а NE-стек (pppd/racoon) при
+   запуске через `scutil` не может его прочитать и отдаёт «incorrect user shared
+   secret found». **Рабочий метод**: `networksetup -connectpppoeservice "vpn3-ts"`
+   (используется в `~/.wakeup`, `reconnect-vpn-wake.sh` и watchdog §3.6.1).
+   Подключать VPN можно через System Settings или через `networksetup`. Порядок подключения: сначала корп. VPN (GUI), затем Karing; либо
+   Karing, затем корп. VPN — если Karing упал, переподключить его.
 3. ~~**Мост резолвит через корп. DNS**~~ — устарело (мост выведен, §3.1).
    Внутренние имена `*.tradesoft.corp` доступны только при поднятом туннеле
    (маршруты → ppp0, корп. DNS 192.168.0.210).
@@ -479,17 +508,15 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    в прокси-нод (что дало бы IP нода вместо корп. и сломало allowlist):
    маршруты до сайтов держит демон (§3.6) — он каждые 5 с возвращает на ppp0
    то, что Karing перебил TUN-пинами.
-7. **Автоподключение VPN по корп. трафику (watchdog)** работает по IP-целям:
-   любой TCP-сокет к корп. IP (в т.ч. публичные корп. сайты) поднимает туннель
-   с задержкой ~10 с (цикл 5 с + коннект). Внутренние имена
-   (`sup5.tradesoft.corp`, `projects.prj`) не могут быть триггером — DNS не
-   резолвится без туннеля; они доступны уже после того, как туннель поднят по
-   любому IP-триггеру. Если `scutil --nc start` под root падает с
-   «incorrect user shared secret found» — автоподъём невозможен, VPN поднимается
-   вручную через System Settings или `networksetup -connectpppoeservice`.
+7. **Автоподъём VPN при обрыве — watchdog по таймеру (§3.6.1)**: проверяет
+   VPN каждые 30 с и переподключает через `networksetup -connectpppoeservice`
+   (рабочий метод; `scutil --nc start` для L2TP не подключает — см. п. 2).
+   Ранний вариант «по IP-целям» (подъём по TCP-сокету к корп. IP) снят: он
+   зависел от `scutil` и не работал. Порядок восстановления: сон →
+   `sleepwatcher`/`~/.wakeup` (п. 3.6), обрыв в любой момент → watchdog.
 8. **Автовосстановление VPN после сна**: `sleepwatcher` + `~/.wakeup` —
    автоматически переподключает `vpn3-ts` после пробуждения (п. 3.6).
-   Watchdog `vpn-watchdog.sh` (п. 3.6.1) проверяет VPN каждые 60 с и
+   Watchdog `vpn-watchdog.sh` (п. 3.6.1) проверяет VPN каждые 30 с и
    переподключает при отключении. Используется
    `networksetup -connectpppoeservice` вместо `scutil --nc start`.
 9. **Баг Karing автообновления (1.2.22 → 1.2.23)**: автообновитель скачивает
@@ -497,8 +524,7 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    (macOS sandbox). Karing молча остаётся на старой версии. Обход: вручную
    `xattr -d com.apple.quarantine <dmg>`, смонтировать, скопировать в
    `/Applications`. Проверено 20.08.2026.
-
-8. **Корпоративный Wi-Fi и VPN (27.08.2026)**: корп. Wi-Fi
+10. **Корпоративный Wi-Fi и VPN (27.08.2026)**: корп. Wi-Fi
    (`192.168.128.0/24`) — **изолированная гостевая сеть**, не имеющая доступа
    к корп. ресурсам (`192.168.0.0/16`, `10.0.0.0/8`). Подтверждено:
    - `ping 192.168.0.210` (корп. DNS) без VPN → TTL exceeded (маршрут
@@ -515,18 +541,15 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 ## 7. Операции
 
 - **Включить всё**: 1) корп. VPN через System Settings (или
-  `~/Work/scripts/corp-vpn/corp-vpn.sh start`), 2) включить Karing,
+  `~/corp-vpn/corp-vpn.sh start`), 2) включить Karing,
   3) маршруты до корп. ресурсов автоматически добавит демон (§3.6), проверить
   `route -n get 185.137.232.115 | grep interface` → `ppp0`.
-- **Статус**: `~/Work/scripts/corp-vpn/corp-vpn.sh status`.
-- ~~**Перезапуск моста**~~ (устарело — мост выведен, §3.1):
-  `launchctl unload ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist &&
-   launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
+- **Статус**: `~/corp-vpn/corp-vpn.sh status`.
+- ~~**Перезапуск моста**~~ (устарело — мост выведен и удалён из launchd, §3.1).
 - **Перезапуск sleepwatcher**:
   `brew services restart sleepwatcher`
-- **Перезапуск watchdog VPN**:
-  `launchctl unload ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist &&
-   launchctl load ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist`
+- **Перезапуск watchdog VPN** (LaunchDaemon, system-домен):
+  `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-watchdog`
 - **Логи**: Karing — `…/group.com.nebula.karing/service_core.log`, `app.log`;
   демон маршрутов — `journal`/`launchctl print` (§3.6);
   VPN reconnect/watchdog — `log show --predicate 'message CONTAINS "corp-vpn"'`.
@@ -535,10 +558,12 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 
 ## 8. Откат (если понадобится)
 
-- Мост уже выведен (14.08.2026): агент `com.aleksei.corp-bridge` остановлен,
-  правило «Корп L2TP» из Karing удалено. Полный откат (если понадобится):
-  `launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist` и
-  вернуть `socks-bridge.py` в репо.
+- Мост выведен из эксплуатации и удалён из launchd (14.08.2026 выведен,
+  27.08.2026 полностью выгружен из gui-домена): правило «Корп L2TP» из Karing
+  удалено, порт 1082 не слушается. Откат (если понадобится): вернуть
+  `socks-bridge.py` в репо и загрузить агент
+  `launchctl load ~/Library/LaunchAgents/com.aleksei.corp-bridge.plist`
+  (файл plist сохранён в репо и в `~/Library/LaunchAgents/`).
 - Полный откат демона маршрутов: `sudo ./uninstall.sh` (удаляет LaunchDaemon,
   чистит маршруты, возвращает `OverridePrimary`).
 - Вернуть правило Karing в исходное состояние: в приложении Karing
