@@ -27,6 +27,9 @@ WIFI_LABEL="com.tradesoft.corp-wifi-routes"
 WIFI_PLIST="/Library/LaunchDaemons/$WIFI_LABEL.plist"
 WIFI_SCRIPT="/usr/local/sbin/corp-wifi-routes.sh"
 WIFI_STATE="/var/run/corp-wifi-routes.state"
+WATCHDOG_LABEL="com.tradesoft.corp-vpn-watchdog"
+WATCHDOG_PLIST="/Library/LaunchDaemons/$WATCHDOG_LABEL.plist"
+WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -50,6 +53,13 @@ if launchctl list | grep -q "$WIFI_LABEL"; then
 fi
 rm -f "$WIFI_PLIST" "$WIFI_SCRIPT"
 rm -f "$WIFI_STATE"
+
+echo "==> Остановка и удаление демона-вачдога корп. VPN (vpn-watchdog)..."
+if launchctl list | grep -q "$WATCHDOG_LABEL"; then
+  launchctl unload "$WATCHDOG_PLIST"
+fi
+rm -f "$WATCHDOG_PLIST" "$WATCHDOG_SCRIPT"
+rm -f /tmp/corp-vpn-watchdog.lock
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -111,6 +121,20 @@ if [ -e "$WIFI_SCRIPT" ] || [ -e "$WIFI_PLIST" ] || [ -e "$WIFI_STATE" ]; then
   fail=1
 else
   echo "  [OK]   файлы демона wifi-routes удалены"
+fi
+
+if launchctl list | grep -q "$WATCHDOG_LABEL"; then
+  echo "  [FAIL] демон $WATCHDOG_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $WATCHDOG_LABEL удалён"
+fi
+
+if [ -e "$WATCHDOG_SCRIPT" ] || [ -e "$WATCHDOG_PLIST" ]; then
+  echo "  [FAIL] файлы демона vpn-watchdog остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона vpn-watchdog удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then

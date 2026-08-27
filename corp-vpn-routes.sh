@@ -10,6 +10,7 @@ CORP_SERVICES="vpn2-ts vpn3-ts vpn4"
 NET_ROUTES="10.0.0.0/8 192.168.0.0/16"
 LOCAL_ROUTES=""
 MYSQL_HOSTS="p7ru1.tradesoft.ru p7ru2.tradesoft.ru p7ru3.tradesoft.ru p7ru4.tradesoft.ru p7ru5.tradesoft.ru p7ru8.tradesoft.ru p5g21.tradesoft.ru p5g25.tradesoft.ru p5g29.tradesoft.ru ext4.tradesoft.ru"
+DNS_HOSTS="192.168.0.210 192.168.0.220"
 SITE_DOMAINS="www.amry.ru"
 PROBE_HOSTS="sup5.tradesoft.corp:4000 projects.prj:80 servicedesk-report.office.tradesoft.ru:443"
 AUTO_SITE_DOMAINS=""
@@ -292,6 +293,12 @@ add_routes() {
       add_host_route "$ip"
       echo "$ip" >> "$STATE"
     done
+  done
+  # Корп. DNS-серверы строго через ppp: перебиваем устаревший /32 через en0,
+  # иначе резолвинг корп. доменов при активном VPN не работает.
+  for ip in $DNS_HOSTS; do
+    add_host_route "$ip"
+    echo "$ip" >> "$STATE"
   done
   for h in $SITE_DOMAINS $AUTO_SITE_DOMAINS; do
     for ip in $(host_ip "$h"); do

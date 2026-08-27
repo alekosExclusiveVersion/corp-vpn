@@ -20,6 +20,20 @@ CORP_DNS="192.168.0.210"
 CORP_DNS_SECONDARY="192.168.0.33"
 CORP_PROBE="192.168.0.232"
 
+# VPN-серверы корп. L2TP/IPSec (внешние публичные IP).
+# Их трафик должен идти напрямую через en0, НЕ через Karing (utun11).
+# Иначе IPSec/L2TP (UDP 500/4500, ESP) не может установиться — см. анализ
+# «почему корп VPN не подключается при корп. Wi-Fi».
+VPN_SERVERS="109.194.204.122 178.141.80.30 109.194.204.125"
+
+# Если в corp-networks.conf задан свой VPN_SERVERS — используем его (централизованно)
+if [ -f "$CONF" ]; then
+  cfg_vpn=$(grep -E '^VPN_SERVERS=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+  if [ -n "$cfg_vpn" ]; then
+    VPN_SERVERS="$cfg_vpn"
+  fi
+fi
+
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
   # Ограничиваем размер лога 1000 строк
@@ -78,6 +92,30 @@ add_host_route_en0() {
   return 1
 }
 
+# Добавляет host-маршрут до VPN-сервера через en0 (внешний IP, минуя is_corp_ip).
+# Нужно для установки L2TP/IPSec в обход Karing (utun11).
+add_vpn_server_route_en0() {
+  local ip="$1"
+  # Удаляем конфликтующий маршрут через utun/Karing, если есть
+  if ! route_via_en0 "$ip"; then
+    route -n delete -host "$ip" >/dev/null 2>&1
+  fi
+  if route -n add -host "$ip" -interface en0 >/dev/null 2>&1; then
+    log "Added VPN server route $ip via en0"
+    echo "$ip" >> "$STATE"
+    return 0
+  fi
+  log "Failed to add VPN server route $ip via en0"
+  return 1
+}
+
+# Добавляет маршруты до всех VPN-серверов напрямую через en0
+add_vpn_server_routes() {
+  for ip in $VPN_SERVERS; do
+    add_vpn_server_route_en0 "$ip"
+  done
+}
+
 # Удаляет все добавленные маршруты
 del_routes() {
   if [ -f "$STATE" ]; then
@@ -111,6 +149,10 @@ while true; do
       sleep 10
       continue
     fi
+
+    # Маршруты до VPN-серверов напрямую через en0 — чтобы L2TP/IPSec мог
+    # установиться в обход Karing (utun11), который иначе перехватывает их.
+    add_vpn_server_routes
 
     # Добавляем маршруты для корп. DNS
     add_host_route_en0 "$CORP_DNS"
