@@ -1,6 +1,8 @@
 #!/bin/bash
 # Watchdog: держит один активный корпоративный VPN (L2TP/IPSec).
-# Профили — это L2TP-сервисы, подключаются через scutil --nc start.
+# Профили — это L2TP-сервисы. Подключаются через networksetup
+# -connectpppoeservice (проверенный рабочий метод для L2TP на этой машине;
+# scutil --nc start для L2TP не работает — keychain PSK).
 # Если ни один не подключён — поднимает по приоритету. Активный не трогает.
 # Запускается LaunchDaemon'ом com.tradesoft.corp-vpn-watchdog каждые 30с.
 
@@ -21,9 +23,13 @@ for p in $PROFILES; do
     fi
 done
 
-# Пытаемся поднять по приоритету (L2TP/IPSec через scutil --nc start)
+# Пытаемся поднять по приоритету (L2TP/IPSec)
 for p in $PROFILES; do
-    scutil --nc start "$p" 2>/dev/null
+    if command -v networksetup >/dev/null 2>&1; then
+        networksetup -connectpppoeservice "$p" 2>/dev/null
+    else
+        scutil --nc start "$p" 2>/dev/null
+    fi
     for i in $(seq 1 10); do
         sleep 2
         if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then

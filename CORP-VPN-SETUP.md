@@ -201,25 +201,33 @@ log show --predicate 'message CONTAINS "corp-vpn"' --last 30m
 переподключает его автоматически.
 
 **Компоненты:**
-- `vpn-watchdog.sh` — скрипт проверки и переподключения
-- `com.aleksei.vpn-watchdog` — LaunchAgent (каждые 60 с, `RunAtLoad: true`)
+- `vpn-watchdog.sh` — скрипт проверки и переподключения (root)
+- `com.tradesoft.corp-vpn-watchdog` — **LaunchDaemon** (каждые 30 с,
+  `RunAtLoad: true`), файл `/Library/LaunchDaemons/com.tradesoft.corp-vpn-watchdog.plist`
 
 **Как работает:**
-1. Проверяет статус `vpn3-ts` через `scutil --nc status`
-2. Если `Connected` — выходит
-3. Подключает через `networksetup -connectpppoeservice`
-4. Ждёт до 20 с, проверяет результат
-5. Логирует в system log
+1. Замок на `mkdir /tmp/corp-vpn-watchdog.lock` (протухший через 3 мин
+   автоочищается) — защита от параллельных запусков.
+2. Проверяет статус профилей через `scutil --nc status` в порядке
+   приоритета `vpn3-ts → vpn4 → vpn2-ts`. Если хоть один `Connected` — выходит.
+3. Иначе поднимает по приоритету через **`networksetup -connectpppoeservice`**
+   (рабочий метод для L2TP; `scutil --nc start` для L2TP не работает —
+   keychain PSK, см. §6).
+4. Ждёт до 20 с, проверяет результат, при неуспехе отменяет и пробует следующий.
+5. Логирует в system log (`logger "corp-vpn: ..."`).
 
-**Установка (выполнено 20.08.2026):**
+**Важно:** подключать корп. L2TP через `scutil --nc start` нельзя — метод
+`networksetup -connectpppoeservice` (проверено 27.08.2026).
+
+**Установка (выполнено 27.08.2026 через `install.sh`):**
 ```bash
-launchctl load ~/Library/LaunchAgents/com.aleksei.vpn-watchdog.plist
+sudo ./install.sh
 ```
 
 **Проверка:**
 ```bash
-launchctl list | grep vpn-watchdog
-log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
+sudo launchctl print system/com.tradesoft.corp-vpn-watchdog
+log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
 ```
 
 ### 3.6.2. Демон маршрутов — `corp-vpn-routes.sh` (split-tunnel)
@@ -230,7 +238,10 @@ log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
   - сети `10/8`, `192.168.0/16`;
   - `/32`-маршруты к MySQL-серверам из `MYSQL_HOSTS` (резолв по DNS каждые 5 мин);
   - `/32`-маршруты к сайтам `SITE_DOMAINS` (по всем A-записям);
-  - `/32`-маршруты к сайтам автодетекта `AUTO_SITE_DOMAINS` (см. п. 3.7).
+  - `/32`-маршруты к сайтам автодетекта `AUTO_SITE_DOMAINS` (см. п. 3.7);
+  - `/32`-маршруты к корп. DNS из `DNS_HOSTS` (`192.168.0.210 192.168.0.220`)
+    — чтобы корп. резолвинг `*.tradesoft.corp` шёл через `ppp0`, а не
+    перехватывался Karing/en0, когда туннель поднят (фикс 27.08.2026).
 - При отключении VPN маршруты удаляются (по state-файлу `/var/run/corp-vpn-routes.state`).
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 - **Защита локальных сетей от захвата корп. туннелем**: широкие `NET_ROUTES`
@@ -252,7 +263,15 @@ log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
 - Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
-  `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`.
+  `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`.
+- `DNS_HOSTS` — корп. DNS-серверы (`192.168.0.210 192.168.0.220`). Пинмются
+  `/32`-маршрутами через `ppp0` демоном `corp-vpn-routes.sh` (см. 3.6.2), чтобы
+  корп. резолвинг не перехватывал Karing/en0, когда туннель поднят.
+- `VPN_SERVERS` — публичные IP L2TP/IPSec серверов
+  (`109.194.204.122 178.141.80.30 109.194.204.125`). Демон `corp-wifi-routes.sh`
+  добавляет `/32`-маршруты через `en0` на корп. Wi-Fi (см. 3.8.1), а
+  `karing-rules.sh` добавляет их в direct-группу Karing «На прямую» (см. 3.7.1),
+  чтобы IPSec-пакеты не уходили в нод-туннель.
 - **Автодетект** — `corp-learn.sh` по PTR-записи исходящих соединений находит
   корп. сайты и **навсегда** дописывает их в строку `SITE_DOMAINS` конфига
   (и установленного, и репозиторной копии), а для немедленного применения —
@@ -264,6 +283,30 @@ log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
   - демон маршрутов (ppp-маршруты, п. 3.6.2);
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
+
+### 3.7.1. Маршрутизация VPN-серверов (корп VPN на изолированной Wi-Fi)
+**Симптом (исправлено 27.08.2026):** на корп. Wi-Fi (`192.168.128.0/24`)
+корп. VPN не поднимался ни одним методом (`scutil --nc start` или
+`networksetup -connectpppoeservice`) — «не удалось поднять ни один сервис».
+Все последствия были списаны на нерабочий CLI, но настоящая причина — маршрут.
+
+**Корень:** публичные IP L2TP/IPSec серверов (`109.194.204.122/.125`,
+`178.141.80.30`) не входили в NET_ROUTES (`10/8`, `192.168/16`) и не были в
+direct-группе Karing, поэтому Karing забирал их `/32 → utun11` (в нод-туннель).
+IPSec-трафик (UDP 500/4500, ESP) через нод не проходит → handshake падает,
+VPN не устанавливается. Метод подключения тут ни при чём.
+
+**Решение (два уровня, оба определяются `VPN_SERVERS` в конфиге):**
+1. **Karing direct** — `karing-rules.sh` (репо `tradesoft-vpn-setup`) добавляет
+   `VPN_SERVERS` в `ip_cidr` группы «На прямую» (direct_out). После применения
+   (`./karing-rules.sh -i`) и reload'а Karing его IPSec-пакеты выпускаются
+   напрямую через `en0`, а не в нод. Это устраняет гонку маршрутов.
+2. **OS-маршрут** — `corp-wifi-routes.sh` на корп. Wi-Fi при отсутствии `ppp0`
+   держит `/32 → en0` для `VPN_SERVERS` (см. 3.8.1).
+
+**Проверка после фикса:** при выключенном туннеле `route -n get 109.194.204.125`
+даёт `interface: en0`, и `networksetup -connectpppoeservice "vpn3-ts"` успешно
+поднимает туннель.
 
 ### 3.8.1. Демон маршрутизации при корп. Wi-Fi — `corp-wifi-routes.sh`
 - LaunchDaemon `com.tradesoft.corp-wifi-routes` (root, проверяет каждые 10–30 с).
@@ -282,6 +325,9 @@ log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
   `/32`-маршруты для внутренних IP (`10/8`, `192.168/16`) через `en0`.
 - Добавляет ТОЛЬКО внутренние корп. IP (10.x.x.x, 192.168.x.x) — внешние IP
   (Karing nodes 198.20.x.x) пропускаются.
+- **VPN-серверы**: дополнительно добавляет `/32 → en0` для публичных
+  `VPN_SERVERS` (L2TP/IPSec), иначе Karing забирает их в `utun11` и корп VPN
+  не поднимается на этой Wi-Fi (подробнее §3.7.1).
 - **Ограничение**: корп. Wi-Fi (`192.168.128.0/24`) — изолированная сеть,
   не маршрутизирует в `192.168.0.0/16`. Демон добавляет маршруты через `en0`,
   но Wi-Fi шлюз не knows как доставить пакеты. **VPN обязателен** для
@@ -381,7 +427,7 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 
 ---
 
-## 5. Проверки (зелёные на 14.08.2026)
+## 5. Проверки (зелёные на 27.08.2026)
 
 | Проверка | Команда | Результат |
 |---|---|---|
@@ -392,6 +438,10 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Корп. egress | `curl --interface 192.168.160.160 https://ifconfig.me` | корп. IP `92.255.230.89` |
 | Демон жив | `sudo launchctl print system/com.tradesoft.corp-vpn-routes \| grep 'state = '` | running |
 | Корп. DNS резолвит | `dig @192.168.0.210 sup5.tradesoft.corp` | A-запись |
+| Корп. DNS через ppp | `route -n get 192.168.0.210 \| grep interface` | `ppp0` |
+| Корп. Bitrix | `curl -sk -o /dev/null -w '%{http_code}' https://192.168.0.33` | `200` |
+| VPN-сервер (корп Wi-Fi) | `route -n get 109.194.204.125 \| grep interface` | `en0` |
+| Автоподъём watchdog | `scutil --nc stop vpn3-ts` → через ≤60 с `scutil --nc status vpn3-ts` | `Connected` |
 
 ---
 
