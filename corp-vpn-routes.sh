@@ -254,6 +254,14 @@ add_host_route() {
 # Каждые 5с перепроверяет маршруты из STATE и возвращает на корп. интерфейс
 # всё, что Karing/иные туннели успели перебить.
 assert_routes() {
+  # Сетевые маршруты корп. зон всегда через ppp.
+  for r in $NET_ROUTES; do
+    probe=$(cidr_net "$r")
+    if ! route_via_ppp "$probe"; then
+      route -n delete -net "$r" >/dev/null 2>&1
+      route -n add -net "$r" -interface "$iface" >/dev/null 2>&1
+    fi
+  done
   [ -f "$STATE" ] || return 0
   while IFS= read -r ip; do
     case "$ip" in
@@ -269,7 +277,13 @@ assert_routes() {
 
 add_routes() {
   iface="$1"
+  # Восстанавливаем сетевые маршруты корп. зон через ppp: удаляем чужие
+  # (en0/utun/Karing), затем добавляем свои. Приоритет у ppp0.
   for r in $NET_ROUTES; do
+    probe=$(cidr_net "$r")
+    if ! route_via_ppp "$probe"; then
+      route -n delete -net "$r" >/dev/null 2>&1
+    fi
     route -n add -net "$r" -interface "$iface" >/dev/null 2>&1
   done
   : > "$STATE"
@@ -295,7 +309,20 @@ add_routes() {
   add_local_routes
 }
 
+# Идентификатор VPN-сессии (уникален для каждого переподключения).
+# Сравнивается каждые 5с: если VPN переподключился (сменился IP ppp0 или
+# service), force-флаг заставляет пересобрать маршруты, даже если имя
+# интерфейса то же (ppp0).
+vpn_session_id() {
+  if [ -n "$iface" ]; then
+    ip=$(ifconfig "$iface" 2>/dev/null | grep '^[[:space:]]*inet ' | awk '{print $2}')
+    mtu=$(ifconfig "$iface" 2>/dev/null | awk '/<UP.*RUNNING/{print "up"}')
+    echo "$iface:$ip"
+  fi
+}
+
 last_iface=""
+last_session=""
 last_resolve=0
 fail=0
 dead_until=0
@@ -304,6 +331,7 @@ last_local_snap=0
 while true; do
   now=$(date +%s)
   iface=$(find_iface)
+  session=$(vpn_session_id)
 
   # Кулдаун после ложного Connected: не доверяем configd,
   # возвращаем маршруты только когда туннель снова отвечает на пробы.
@@ -329,10 +357,13 @@ while true; do
   fi
 
   if [ -n "$iface" ]; then
-    if [ "$iface" != "$last_iface" ] || [ $((now - last_resolve)) -ge 300 ]; then
+    # Пересобираем маршруты если: сменился интерфейс, сменился IP сессии
+    # (VPN переподключился — даже если имя то же ppp0), либо прошло 300с.
+    if [ "$iface" != "$last_iface" ] || [ "$session" != "$last_session" ] || [ $((now - last_resolve)) -ge 300 ]; then
       del_routes
       add_routes "$iface"
       last_iface="$iface"
+      last_session="$session"
       last_resolve=$now
       fail=0
     else

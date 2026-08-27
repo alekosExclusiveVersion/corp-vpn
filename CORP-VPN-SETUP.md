@@ -265,15 +265,71 @@ log show --predicate 'message CONTAINS "vpn-watchdog"' --last 5m
   - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
 
+### 3.8.1. Демон маршрутизации при корп. Wi-Fi — `corp-wifi-routes.sh`
+- LaunchDaemon `com.tradesoft.corp-wifi-routes` (root, проверяет каждые 10–30 с).
+- Файлы: `/Library/LaunchDaemons/com.tradesoft.corp-wifi-routes.plist`,
+  `/usr/local/sbin/corp-wifi-routes.sh` (устанавливаются из репо через `install.sh`).
+- **Проблема**: при подключении к корп. Wi-Fi (`192.168.128.0/24`) Karing
+  добавляет `/32`-маршруты для корп. IP (`192.168.0.210`, `192.168.0.33`,
+  `192.168.0.232`) через `utun9`. DNS-запросы к корп. DNS идут через Karing,
+  который перехватывает их и возвращает node IPs (`198.20.x.x`) вместо реальных
+  корп. IP. Результат: `www.projects.prj` (198.20.0.105) не открывается
+  (Empty reply from server).
+- **Решение**: демон определяет корп. Wi-Fi по IP `en0` (`192.168.128.x`),
+  проверяет, что VPN не активен (`ppp0` отсутствует), и добавляет маршруты
+  для корп. DNS (`192.168.0.210`, `192.168.0.33`, `192.168.0.232`) через `en0`.
+  Также резолвит ключевые домены (`DOMAINS`) через корп. DNS напрямую и добавляет
+  `/32`-маршруты для внутренних IP (`10/8`, `192.168/16`) через `en0`.
+- Добавляет ТОЛЬКО внутренние корп. IP (10.x.x.x, 192.168.x.x) — внешние IP
+  (Karing nodes 198.20.x.x) пропускаются.
+- **Ограничение**: корп. Wi-Fi (`192.168.128.0/24`) — изолированная сеть,
+  не маршрутизирует в `192.168.0.0/16`. Демон добавляет маршруты через `en0`,
+  но Wi-Fi шлюз не knows как доставить пакеты. **VPN обязателен** для
+  `192.168.0.0/16` и `10.0.0.0/8`. Демон полезен только для DNS-резолва
+  (если Wi-Fi сеть умеет маршрутизировать к DNS-серверу).
+- **При подключении VPN**: демон удаляет свои маршруты через `en0`,
+  чтобы не конфликтовали с `ppp0` (corp-vpn-routes.sh берёт управление).
+- Логи: `/var/log/corp-wifi-routes.log`, состояние: `/var/run/corp-wifi-routes.state`.
+- Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-wifi-routes`.
+
+### 3.8.2. Маршрутизация opencode (анализ на 27.08.2026)
+Текущая конфигурация подключений: `en0` (Wi-Fi, корп.), `ppp0` (корп. VPN,
+`192.168.160.x`), `utun11` (Karing TUN, `10.20.0.1`).
+
+Default routes (приоритет сверху вниз):
+```
+default → utun11 (Karing)   — главный (интернет-нод)
+default → en0   (Wi-Fi)     — запасной
+default → ppp0  (VPN)       — корп.
+```
+
+**opencode** (`opencode.exe`) подключается к `opencode.ai` (172.65.90.22):
+- `route -n get 172.65.90.22` → `utun11` (Karing)
+- Соединение: `10.20.0.1:xxxxx → 172.65.90.22:443` (ESTABLISHED)
+- **Вывод: opencode идёт через Karing (прокси-нод), НЕ через корп. VPN и НЕ
+  напрямую через en0.** Karing-правило для процесса `opencode.exe` не
+  направляет в direct — уходит через default (нод).
+
+Маршрутизация остальных приложений (для сравнения):
+- Bitrix24 (`192.168.0.33`) → `ppp0` (корп.)
+- Yandex (`*.yandex.ru`, `office.tradesoft.ru`) → `ppp0` (корп.) или `utun11`
+- Telegram/M.TALKER → `utun11` (Karing)
+- `sup5.tradesoft.corp:4000` → `ppp0` (корп.)
+
+Нюанс: множество `/32`-маршрутов (например, все `172.65.90.x`, `74.125.x`,
+`213.180.x`, `149.154.x` для Telegram/Yandex и т.п.) добавляет сам Karing —
+это его per-app routing. Приоритет у Karing (`utun11`) выше, чем у en0/ppp0.
+
 ### 3.8. Установка / откат — `install.sh` / `uninstall.sh`
 - `sudo ./install.sh` — копирует демоны (`corp-vpn-routes.sh`,
-  `corp-learn.sh`) и конфиги, загружает LaunchDaemon'ы, применяет split-режим
-  (`split_fix.swift`), проверяет результат.
+  `corp-learn.sh`, `corp-wifi-routes.sh`) и конфиги, загружает LaunchDaemon'ы,
+  применяет split-режим (`split_fix.swift`), проверяет результат.
 - `sudo ./uninstall.sh` — останавливает и удаляет демоны, чистит маршруты,
   возвращает `OverridePrimary` (`split_restore.swift`).
 - Перезапуск демона маршрутов: `sudo launchctl kickstart -k
   system/com.tradesoft.corp-vpn-routes`; демона автодетекта: `sudo launchctl
-  kickstart -k system/com.tradesoft.corp-learn`.
+  kickstart -k system/com.tradesoft.corp-learn`; демона wifi-routes:
+  `sudo launchctl kickstart -k system/com.tradesoft.corp-wifi-routes`.
 
 ### 3.9. Сбор сайтов — `collect-sites.py` и пароль из Keychain
 `collect-sites.py` (репо `tradesoft-vpn-setup`) собирает домены сайтов из корп.
@@ -391,6 +447,18 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
    (macOS sandbox). Karing молча остаётся на старой версии. Обход: вручную
    `xattr -d com.apple.quarantine <dmg>`, смонтировать, скопировать в
    `/Applications`. Проверено 20.08.2026.
+
+8. **Корпоративный Wi-Fi и VPN (27.08.2026)**: корп. Wi-Fi
+   (`192.168.128.0/24`) — **изолированная гостевая сеть**, не имеющая доступа
+   к корп. ресурсам (`192.168.0.0/16`, `10.0.0.0/8`). Подтверждено:
+   - `ping 192.168.0.210` (корп. DNS) без VPN → TTL exceeded (маршрут
+     неизвестен Wi-Fi шлюзу);
+   - `b24.tradesoft.ru` (резолвится в `192.168.0.33`) → No route to host;
+   - `sup5.tradesoft.corp`, `www.projects.prj` → Karing DNS возвращает
+     node IPs (`198.20.0.x`), трафик уходит в Karing tunnel → пустой ответ.
+   **VPN обязателен** для корп. ресурсов даже при корп. Wi-Fi.
+   Дополнительно: `corp-wifi-routes.sh` (§3.8.1) при подключении VPN
+   удаляет свои маршруты через `en0`, чтобы не конфликтовали с `ppp0`.
 
 ---
 

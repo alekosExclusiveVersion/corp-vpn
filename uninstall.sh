@@ -23,6 +23,10 @@ LEARN_LABEL="com.tradesoft.corp-learn"
 LEARN_PLIST="/Library/LaunchDaemons/$LEARN_LABEL.plist"
 LEARN_SCRIPT="/usr/local/sbin/corp-learn.sh"
 AUTO_NETWORKS_CONF="/usr/local/etc/corp-networks-auto.conf"
+WIFI_LABEL="com.tradesoft.corp-wifi-routes"
+WIFI_PLIST="/Library/LaunchDaemons/$WIFI_LABEL.plist"
+WIFI_SCRIPT="/usr/local/sbin/corp-wifi-routes.sh"
+WIFI_STATE="/var/run/corp-wifi-routes.state"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -40,6 +44,13 @@ if launchctl list | grep -q "$LEARN_LABEL"; then
 fi
 rm -f "$LEARN_PLIST" "$LEARN_SCRIPT" "$AUTO_NETWORKS_CONF"
 
+echo "==> Остановка и удаление демона маршрутизации при корп. Wi-Fi (corp-wifi-routes)..."
+if launchctl list | grep -q "$WIFI_LABEL"; then
+  launchctl unload "$WIFI_PLIST"
+fi
+rm -f "$WIFI_PLIST" "$WIFI_SCRIPT"
+rm -f "$WIFI_STATE"
+
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
   while IFS= read -r ip; do
@@ -48,6 +59,13 @@ if [ -f "$STATE" ]; then
   done < "$STATE"
 fi
 rm -f "$STATE"
+if [ -f "$WIFI_STATE" ]; then
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    route -n delete -host "$ip" >/dev/null 2>&1 || true
+  done < "$WIFI_STATE"
+fi
+rm -f "$WIFI_STATE"
 route -n delete -net 10.0.0.0/8 >/dev/null 2>&1 || true
 route -n delete -net 192.168.0.0/16 >/dev/null 2>&1 || true
 
@@ -79,6 +97,20 @@ if [ -e "$LEARN_SCRIPT" ] || [ -e "$LEARN_PLIST" ] || [ -e "$AUTO_NETWORKS_CONF"
   fail=1
 else
   echo "  [OK]   файлы демона автодетекта удалены"
+fi
+
+if launchctl list | grep -q "$WIFI_LABEL"; then
+  echo "  [FAIL] демон $WIFI_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $WIFI_LABEL удалён"
+fi
+
+if [ -e "$WIFI_SCRIPT" ] || [ -e "$WIFI_PLIST" ] || [ -e "$WIFI_STATE" ]; then
+  echo "  [FAIL] файлы демона wifi-routes остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона wifi-routes удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then
