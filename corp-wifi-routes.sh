@@ -92,20 +92,24 @@ add_host_route_en0() {
   return 1
 }
 
-# Добавляет host-маршрут до VPN-сервера через en0 (внешний IP, минуя is_corp_ip).
+# Добавляет host-маршрут до VPN-сервера через шлюз корп. Wi-Fi (внешний публичный IP,
+# минуя is_corp_ip). Публичный IP не лежит на локальном линке, поэтому его НЕЛЬЗЯ
+# привязывать через "-interface en0" (on-link -> ARP на чужой IP -> пакеты гаснут).
+# Правильно: маршрут через шлюз (-gateway), который форвардит на реальный интернет.
 # Нужно для установки L2TP/IPSec в обход Karing (utun11).
 add_vpn_server_route_en0() {
   local ip="$1"
-  # Удаляем конфликтующий маршрут через utun/Karing, если есть
-  if ! route_via_en0 "$ip"; then
-    route -n delete -host "$ip" >/dev/null 2>&1
-  fi
-  if route -n add -host "$ip" -interface en0 >/dev/null 2>&1; then
-    log "Added VPN server route $ip via en0"
+  local gw
+  gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
+  # Удаляем конфликтующий маршрут через utun/Karing или on-link, если есть
+  route -n delete -host "$ip" >/dev/null 2>&1
+  if route -n add -host "$ip" -gateway "$gw" >/dev/null 2>&1; then
+    log "Added VPN server route $ip via gateway $gw"
     echo "$ip" >> "$STATE"
     return 0
   fi
-  log "Failed to add VPN server route $ip via en0"
+  log "Failed to add VPN server route $ip via gateway $gw"
   return 1
 }
 
@@ -133,12 +137,46 @@ resolve_corp_dns() {
   dig @"$CORP_DNS" +short +time=2 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
+# Хосты, которые вне корп. Wi-Fi (или без VPN) резолвятся в публичный IP,
+# блокируемый корп. шлюзом, а внутри корп. сети доступны напрямую. Пинним их
+# в /etc/hosts ТОЛЬКО пока подключены к корп. Wi-Fi. Маркер-блок помечаем,
+# чтобы корректно убирать только свои строки.
+CORP_HOSTS_MARKER_BEGIN="# >>> corp-wifi hosts (auto) <<<"
+CORP_HOSTS_MARKER_END="# <<< corp-wifi hosts (auto) >>>"
+CORP_HOSTS_ENTRIES="192.168.0.33 b24.tradesoft.ru"
+
+add_corp_hosts() {
+  if grep -qF "$CORP_HOSTS_MARKER_BEGIN" /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+  {
+    echo "$CORP_HOSTS_MARKER_BEGIN"
+    echo "$CORP_HOSTS_ENTRIES"
+    echo "$CORP_HOSTS_MARKER_END"
+  } >> /etc/hosts
+  log "Added corp WiFi hosts (b24 -> corp IP)"
+}
+
+del_corp_hosts() {
+  local tmp
+  if ! grep -qF "$CORP_HOSTS_MARKER_BEGIN" /etc/hosts 2>/dev/null; then
+    return 0
+  fi
+  tmp="/etc/hosts.corpwifi.tmp.$$"
+  awk -v b="$CORP_HOSTS_MARKER_BEGIN" -v e="$CORP_HOSTS_MARKER_END" \
+    'BEGIN{inb=0} $0==b{inb=1; next} $0==e{inb=0; next} !inb{print}' \
+    /etc/hosts > "$tmp" && mv "$tmp" /etc/hosts
+  log "Removed corp WiFi hosts"
+}
+
 # Главный цикл
 log "Starting corp-wifi-routes.sh"
 : > "$STATE"
+add_corp_hosts
 
 while true; do
   if is_corp_wifi; then
+    add_corp_hosts
     # Проверяем, не активен ли VPN (ppp0 интерфейс)
     if ifconfig ppp0 >/dev/null 2>&1; then
       # VPN активен — удаляем свои маршруты через en0, ppp0 берёт управление
@@ -176,11 +214,12 @@ while true; do
 
     sleep 30
   else
-    # Не корп. Wi-Fi — очищаем маршруты
+    # Не корп. Wi-Fi — очищаем маршруты и hosts-пины
     if [ -f "$STATE" ]; then
       del_routes
       log "Corp Wi-Fi disconnected, routes cleaned"
     fi
+    del_corp_hosts
     sleep 10
   fi
 done

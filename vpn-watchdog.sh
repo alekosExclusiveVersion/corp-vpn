@@ -26,6 +26,19 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 PROFILES="vpn3-ts vpn4 vpn2-ts"
 
+# Подключены ли к корп. Wi-Fi (en0 в подсети 192.168.128.0/24).
+# На корп. Wi-Fi L2TP/IPSec не поднимается (сетевое оборудование глушит L2TP-в-ESP),
+# поэтому корп. VPN там не подключаем — на этом Wi-Fi он бесполезен и только
+# молотит попытки.
+is_corp_wifi() {
+    local ip
+    ip=$(ipconfig getifaddr en0 2>/dev/null)
+    [ -n "$ip" ] && case "$ip" in
+        192.168.128.*) return 0 ;;
+    esac
+    return 1
+}
+
 # Корп. DNS и первый host:port из PROBE_HOSTS (обязаны маршрутизироваться через ppp0).
 PROBE_DNS_IP="192.168.0.210"
 PROBE_DNS_PORT=53
@@ -73,6 +86,20 @@ restart_profile() {
     done
     return 1
 }
+
+# --- Корп. Wi-Fi: VPN не поднимаем ---
+# На корп. Wi-Fi L2TP/IPSec не работает (сеть глушит L2TP-в-ESP). Если профиль там
+# числится Connected — это зомби/бесполезный туннель, гасим его и не пытаемся поднять.
+if is_corp_wifi; then
+    for p in $PROFILES; do
+        if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
+            scutil --nc stop "$p" 2>/dev/null
+            logger "corp-vpn: $p torn down on corp Wi-Fi (L2TP blocked there)"
+        fi
+    done
+    logger "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped"
+    exit 0
+fi
 
 # --- Состояние с прошлого тика ---
 last_ip="$(cat "$LAST_IP_FILE" 2>/dev/null)"
