@@ -45,7 +45,10 @@ log() {
   fi
 }
 
-# Проверяет, подключён ли к корп. Wi-Fi (en0 имеет IP в 192.168.128.0/24)
+# Проверяет, подключён ли к корп. Wi-Fi (en0 в подсети 192.168.128.0/24).
+# Критерий по IP en0: корп. Wi-Fi единственный выдаёт подсеть 192.168.128.0/24.
+# SSID/ассоциацию через networksetup получить НЕЛЬЗЯ (отдаёт "not associated"
+# даже при рабочей сети без DHCP), поэтому IP-детект — единственный надёжный.
 is_corp_wifi() {
   local ip
   ip=$(ipconfig getifaddr en0 2>/dev/null)
@@ -103,7 +106,13 @@ add_host_route_en0() {
 add_vpn_server_route_en0() {
   local ip="$1"
   local gw
-  gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  # Шлюз берём из default-маршрута ИМЕННО через физический en0 (не из общего
+  # "route -n get default", который при активном Karing идёт через utun10 без
+  # gateway:). Маршрут default->en0 гарантирует актуальный шлюз Wi-Fi.
+  gw=$(netstat -rn -f inet | awk '$1=="default" && $NF=="en0"{print $2; exit}')
+  if [ -z "$gw" ]; then
+    gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  fi
   [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
   # Удаляем конфликтующий маршрут через utun/Karing или on-link, если есть
   route -n delete -host "$ip" >/dev/null 2>&1
@@ -145,18 +154,17 @@ log "Starting corp-wifi-routes.sh"
 : > "$STATE"
 
 while true; do
-  if is_corp_wifi; then
-    # Проверяем, не активен ли VPN (ppp0 интерфейс)
-    if ifconfig ppp0 >/dev/null 2>&1; then
-      # VPN активен — удаляем свои маршруты через en0, ppp0 берёт управление
-      if [ -f "$STATE" ]; then
-        del_routes
-        log "VPN connected, cleaned wifi-routes"
-      fi
-      sleep 10
-      continue
+  # VPN активен — удаляем свои маршруты через en0 (ppp0 берёт управление)
+  if ifconfig ppp0 >/dev/null 2>&1; then
+    if [ -f "$STATE" ]; then
+      del_routes
+      log "VPN connected, cleaned wifi-routes"
     fi
+    sleep 10
+    continue
+  fi
 
+  if is_corp_wifi; then
     # Маршруты до VPN-серверов напрямую через en0 — чтобы L2TP/IPSec мог
     # установиться в обход Karing (utun11), который иначе перехватывает их.
     add_vpn_server_routes
@@ -183,11 +191,15 @@ while true; do
 
     sleep 30
   else
-    # Не корп. Wi-Fi — очищаем маршруты
+    # Не корп. Wi-Fi: держим только VPN_SERVERS (нужны для подъёма L2TP на
+    # любой сети, пока VPN не активен), корп. DNS/site-маршруты не трогаем —
+    # они тут не нужны. Если до этого держались корп. DNS-маршруты, сносим их.
     if [ -f "$STATE" ]; then
       del_routes
       log "Corp Wi-Fi disconnected, routes cleaned"
     fi
+    # VPN-серверы возвращаем всегда (после del_routes они снесены)
+    add_vpn_server_routes
     sleep 10
   fi
 done
