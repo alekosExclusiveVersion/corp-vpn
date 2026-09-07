@@ -6,6 +6,9 @@
 # из-за чего DNS-запросы к корп. DNS (192.168.0.210) проходят через Karing
 # и возвращают node IPs (198.20.x.x) вместо реальных корп. IP.
 # Решение: добавляем маршруты для корп. DNS и ключевых доменов через en0.
+# Доступ к корп. ресурсам (*.tradesoft.corp, *.prj, b24) на этой Wi-Fi
+# обеспечивает правило Karing «На прямую» (DNS через local/dhcp://auto из
+# настроек Wi-Fi, трафик через direct_out) — hosts-пины не используются.
 
 CONF=/usr/local/etc/corp-networks.conf
 STATE=/var/run/corp-wifi-routes.state
@@ -137,46 +140,12 @@ resolve_corp_dns() {
   dig @"$CORP_DNS" +short +time=2 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
-# Хосты, которые вне корп. Wi-Fi (или без VPN) резолвятся в публичный IP,
-# блокируемый корп. шлюзом, а внутри корп. сети доступны напрямую. Пинним их
-# в /etc/hosts ТОЛЬКО пока подключены к корп. Wi-Fi. Маркер-блок помечаем,
-# чтобы корректно убирать только свои строки.
-CORP_HOSTS_MARKER_BEGIN="# >>> corp-wifi hosts (auto) <<<"
-CORP_HOSTS_MARKER_END="# <<< corp-wifi hosts (auto) >>>"
-CORP_HOSTS_ENTRIES="192.168.0.33 b24.tradesoft.ru"
-
-add_corp_hosts() {
-  if grep -qF "$CORP_HOSTS_MARKER_BEGIN" /etc/hosts 2>/dev/null; then
-    return 0
-  fi
-  {
-    echo "$CORP_HOSTS_MARKER_BEGIN"
-    echo "$CORP_HOSTS_ENTRIES"
-    echo "$CORP_HOSTS_MARKER_END"
-  } >> /etc/hosts
-  log "Added corp WiFi hosts (b24 -> corp IP)"
-}
-
-del_corp_hosts() {
-  local tmp
-  if ! grep -qF "$CORP_HOSTS_MARKER_BEGIN" /etc/hosts 2>/dev/null; then
-    return 0
-  fi
-  tmp="/etc/hosts.corpwifi.tmp.$$"
-  awk -v b="$CORP_HOSTS_MARKER_BEGIN" -v e="$CORP_HOSTS_MARKER_END" \
-    'BEGIN{inb=0} $0==b{inb=1; next} $0==e{inb=0; next} !inb{print}' \
-    /etc/hosts > "$tmp" && mv "$tmp" /etc/hosts
-  log "Removed corp WiFi hosts"
-}
-
 # Главный цикл
 log "Starting corp-wifi-routes.sh"
 : > "$STATE"
-add_corp_hosts
 
 while true; do
   if is_corp_wifi; then
-    add_corp_hosts
     # Проверяем, не активен ли VPN (ppp0 интерфейс)
     if ifconfig ppp0 >/dev/null 2>&1; then
       # VPN активен — удаляем свои маршруты через en0, ppp0 берёт управление
@@ -214,12 +183,11 @@ while true; do
 
     sleep 30
   else
-    # Не корп. Wi-Fi — очищаем маршруты и hosts-пины
+    # Не корп. Wi-Fi — очищаем маршруты
     if [ -f "$STATE" ]; then
       del_routes
       log "Corp Wi-Fi disconnected, routes cleaned"
     fi
-    del_corp_hosts
     sleep 10
   fi
 done
