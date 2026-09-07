@@ -106,10 +106,14 @@ add_host_route_en0() {
 add_vpn_server_route_en0() {
   local ip="$1"
   local gw
-  # Шлюз берём из default-маршрута ИМЕННО через физический en0 (не из общего
-  # "route -n get default", который при активном Karing идёт через utun10 без
-  # gateway:). Маршрут default->en0 гарантирует актуальный шлюз Wi-Fi.
-  gw=$(netstat -rn -f inet | awk '$1=="default" && $NF=="en0"{print $2; exit}')
+  # Шлюз берём из default-маршрута через НЕ-туннельный интерфейс (en0/wlan).
+  # На этой машине исходящий в интернет идёт через Wi-Fi (en0). При активной
+  # system-extension Karing default-маршрут уходит в utun10 (без gateway:), но
+  # параллельно сеть держит ещё один default через физический интерфейс с
+  # реальным шлюзом. Исключаем utun*, чтобы гарантированно взять шлюз Wi-Fi,
+  # а не пустой gateway туннеля. Это критично для не-корп. сети: без маршрута
+  # -> en0 L2TP/IPSec не доходит до сервера ("No route to host").
+  gw=$(netstat -rn -f inet | awk '$1=="default" && $NF!~/^utun/{print $2; exit}')
   if [ -z "$gw" ]; then
     gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
   fi
