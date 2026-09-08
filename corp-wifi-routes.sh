@@ -2,15 +2,22 @@
 
 # Маршрутизация корп. трафика при подключении к корп. Wi-Fi (192.168.128.0/24).
 # Работает параллельно с corp-vpn-routes.sh (для L2TP VPN).
-# Единственная задача: pin VPN_SERVERS (публичные IP корп. L2TP/IPSec) через
-# шлюз Wi-Fi, чтобы VPN мог установиться в обход Karing (utun11).
+# Задачи:
+#   1) pin VPN_SERVERS (публичные IP корп. L2TP/IPSec) через шлюз Wi-Fi, чтобы
+#      VPN мог установиться в обход Karing (utun11);
+#   2) pin КОРП. DNS (192.168.0.210) через en0. Без этого Karing утаскивает его в
+#      utun4 и fake-ип'ит корп. домены (sup5 -> 198.20.0.x), реальный IP не
+#      резолвится, сайты недоступны (HTTP 000);
+#   3) pin КОРП. СЕРВЕРОВ, лежащих в той же /24, что Wi-Fi (sup5 = 192.168.128.123):
+#      macOS шлёт их on-link на ARP-proxy шлюза и они гаснут, реальный путь —
+#      через шлюз 192.168.128.1 (см. CORP_GATEWAY_HOSTS).
 #
-# ИСТОРИЯ: раньше скрипт дополнительно привязывал корп. хосты (0.210, 0.33,
-# 0.232 и резолвы DOMAINS/SITE_DOMAINS) к en0 через on-link/АРП-пины. Проверено
-# 2026-09-08: на этой Wi-Fi такие пины НЕ доставляются для 0.33/0.232 (b24,
-# servicedesk) — TCP к ним гаснет (Arp-proxy шлюза не форвардит). Исправление:
-# корп. hosts-пины убраны, доступ к корп. ресурсам и DNS обеспечивает правило
-# Karing «На прямую» (ip_cidr 192.168.0.0/16, direct_out через реальный шлюз).
+# ИСТОРИЯ: раньше скрипт привязывал корп. хосты (0.210, 0.33, 0.232 и резолвы
+# DOMAINS/SITE_DOMAINS) к en0 через on-link/АРП-пины. Проверено 2026-09-08: пины
+# 0.33/0.232 (b24, servicedesk) НЕ доставляются (TCP гаснет, Arp-proxy шлюза не
+# форвардит) — их убрали. Пин корп. DNS 0.210 оказался КРИТИЧЕН (см. задачу 2)
+# и возвращён (08.09.2026). Доступ к корп. ресурсам даёт правило Karing
+# «На прямую» (ip_cidr 192.168.0.0/16, direct_out через реальный шлюз).
 
 CONF=/usr/local/etc/corp-networks.conf
 STATE=/var/run/corp-wifi-routes.state
@@ -30,6 +37,14 @@ CORP_PROBE="192.168.0.232"
 # Иначе IPSec/L2TP (UDP 500/4500, ESP) не может установиться — см. анализ
 # «почему корп VPN не подключается при корп. Wi-Fi».
 VPN_SERVERS="109.194.204.122 178.141.80.30 109.194.204.125"
+
+# Корп. серверы, лежащие в той же /24, что Wi-Fi (192.168.128.0/24).
+# macOS считает их on-link и шлёт напрямую -> пакеты идут на ARP-proxy шлюза
+# (b6:be:c:d5:9a:24) и гаснут (sup5: HTTP 000). Реальный путь — ЧЕРЕЗ шлюз
+# 192.168.128.1, как для корп. ресурсов из 192.168.0.0/16 через Karing-direct.
+# Проверено 08.09.2026: `route add -host <ip> -gateway 192.168.128.1` даёт 200.
+# Пока только sup5 (это host-маршрут, новый сервер добавляем сюда же списком).
+CORP_GATEWAY_HOSTS="192.168.128.123"
 
 # Если в corp-networks.conf задан свой VPN_SERVERS — используем его (централизованно)
 if [ -f "$CONF" ]; then
@@ -117,6 +132,14 @@ add_host_route_en0() {
   return 1
 }
 
+# Шлюз Wi-Fi из default-маршрута через НЕ-туннельный интерфейс (en0/wlan).
+# При активной system-extension Karing default уходит в utun10 (без gateway),
+# но параллельно сеть держит default через физический интерфейс с реальным
+# шлюзом. Исключаем utun*, чтобы гарантированно взять шлюз Wi-Fi.
+wifi_gateway() {
+  netstat -rn -f inet | awk '$1=="default" && $NF!~/^utun/{print $2; exit}'
+}
+
 # Добавляет host-маршрут до VPN-сервера через шлюз корп. Wi-Fi (внешний публичный IP,
 # минуя is_corp_ip). Публичный IP не лежит на локальном линке, поэтому его НЕЛЬЗЯ
 # привязывать через "-interface en0" (on-link -> ARP на чужой IP -> пакеты гаснут).
@@ -125,14 +148,12 @@ add_host_route_en0() {
 add_vpn_server_route_en0() {
   local ip="$1"
   local gw
-  # Шлюз берём из default-маршрута через НЕ-туннельный интерфейс (en0/wlan).
-  # На этой машине исходящий в интернет идёт через Wi-Fi (en0). При активной
-  # system-extension Karing default-маршрут уходит в utun10 (без gateway:), но
-  # параллельно сеть держит ещё один default через физический интерфейс с
-  # реальным шлюзом. Исключаем utun*, чтобы гарантированно взять шлюз Wi-Fi,
-  # а не пустой gateway туннеля. Это критично для не-корп. сети: без маршрута
-  # -> en0 L2TP/IPSec не доходит до сервера ("No route to host").
-  gw=$(netstat -rn -f inet | awk '$1=="default" && $NF!~/^utun/{print $2; exit}')
+  local all
+  all=$(netstat -rn -f inet | awk '$1=="default" {print}')
+  if [ -z "$all" ]; then
+    return 1
+  fi
+  gw=$(echo "$all" | awk '$NF!~/^utun/{print $2; exit}')
   if [ -z "$gw" ]; then
     gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
   fi
@@ -152,6 +173,31 @@ add_vpn_server_route_en0() {
 add_vpn_server_routes() {
   for ip in $VPN_SERVERS; do
     add_vpn_server_route_en0 "$ip"
+  done
+}
+
+# Добавляет host-маршруты до корп. серверов, лежащих в той же /24, что Wi-Fi
+# (см. CORP_GATEWAY_HOSTS). macOS считает их on-link и шлёт напрямую на
+# ARP-proxy шлюза (гаснут); реальный путь — через шлюз Wi-Fi.
+add_gateway_host_routes() {
+  local gw
+  gw=$(wifi_gateway)
+  [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
+  local ip
+  for ip in $CORP_GATEWAY_HOSTS; do
+    [ -z "$ip" ] && continue
+    # Уже через нужный шлюз — не трогаем
+    if route -n get "$ip" 2>/dev/null | grep -q "gateway: $gw"; then
+      continue
+    fi
+    # Удаляем on-link/utun-маршрут и ставим через шлюз
+    route -n delete -host "$ip" >/dev/null 2>&1
+    if route -n add -host "$ip" -gateway "$gw" >/dev/null 2>&1; then
+      log "Added corp gw-host route $ip via gateway $gw"
+      echo "$ip" >> "$STATE"
+    else
+      log "Failed to add corp gw-host route $ip via gateway $gw"
+    fi
   done
 }
 
@@ -199,9 +245,14 @@ while true; do
     # установиться в обход Karing (utun11), который иначе перехватывает их.
     add_vpn_server_routes
 
-    # Корп. хосты (192.168.0.x) к en0 НЕ привязываем: на этой Wi-Fi on-link/
-    # АРП-пины для 0.33/0.232 не доставляются (TCP гаснет). Доступ и DNS даёт
-    # Karing («На прямую»: ip_cidr 192.168.0.0/16, direct_out). См. шапку файла.
+    # Корп. серверы в той же /24 (sup5 192.168.128.123): через шлюз, не on-link
+    add_gateway_host_routes
+
+    # Корп. DNS (192.168.0.210) закрепляем через en0. БЕЗ этого пина Karing
+    # утаскивает корп. DNS в utun4 и fake-ип'ит корп. домены (sup5 -> 198.20.0.x),
+    # а реальный sup5 (192.168.128.123) не резолвится -> сайты недоступны.
+    # Только DNS; корп. хосты 0.33/0.232 на этой Wi-Fi НЕ пинуются (см. шапку).
+    add_host_route_en0 "$CORP_DNS"
 
     sleep 30
   else
