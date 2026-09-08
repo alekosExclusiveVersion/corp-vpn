@@ -2,13 +2,15 @@
 
 # Маршрутизация корп. трафика при подключении к корп. Wi-Fi (192.168.128.0/24).
 # Работает параллельно с corp-vpn-routes.sh (для L2TP VPN).
-# Проблема: Karing добавляет /32-маршруты для корп. IP (192.168.0.x) через utun,
-# из-за чего DNS-запросы к корп. DNS (192.168.0.210) проходят через Karing
-# и возвращают node IPs (198.20.x.x) вместо реальных корп. IP.
-# Решение: добавляем маршруты для корп. DNS и ключевых доменов через en0.
-# Доступ к корп. ресурсам (*.tradesoft.corp, *.prj, b24) на этой Wi-Fi
-# обеспечивает правило Karing «На прямую» (DNS через local/dhcp://auto из
-# настроек Wi-Fi, трафик через direct_out) — hosts-пины не используются.
+# Единственная задача: pin VPN_SERVERS (публичные IP корп. L2TP/IPSec) через
+# шлюз Wi-Fi, чтобы VPN мог установиться в обход Karing (utun11).
+#
+# ИСТОРИЯ: раньше скрипт дополнительно привязывал корп. хосты (0.210, 0.33,
+# 0.232 и резолвы DOMAINS/SITE_DOMAINS) к en0 через on-link/АРП-пины. Проверено
+# 2026-09-08: на этой Wi-Fi такие пины НЕ доставляются для 0.33/0.232 (b24,
+# servicedesk) — TCP к ним гаснет (Arp-proxy шлюза не форвардит). Исправление:
+# корп. hosts-пины убраны, доступ к корп. ресурсам и DNS обеспечивает правило
+# Karing «На прямую» (ip_cidr 192.168.0.0/16, direct_out через реальный шлюз).
 
 CONF=/usr/local/etc/corp-networks.conf
 STATE=/var/run/corp-wifi-routes.state
@@ -18,7 +20,7 @@ LOG=/var/log/corp-wifi-routes.log
 CORP_WIFI_SUBNET="192.168.128.0"
 CORP_WIFI_MASK="255.255.255.0"
 
-# Корп. DNS и ключевые серверы (всегда маршрутизируем через en0 при корп. Wi-Fi)
+# Корп. DNS и ключевые серверы (справочно; больше не пинуются к en0 — см. шапку)
 CORP_DNS="192.168.0.210"
 CORP_DNS_SECONDARY="192.168.0.33"
 CORP_PROBE="192.168.0.232"
@@ -31,7 +33,7 @@ VPN_SERVERS="109.194.204.122 178.141.80.30 109.194.204.125"
 
 # Если в corp-networks.conf задан свой VPN_SERVERS — используем его (централизованно)
 if [ -f "$CONF" ]; then
-  cfg_vpn=$(grep -E '^VPN_SERVERS=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2-)
+  cfg_vpn=$(grep -E '^VPN_SERVERS=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
   if [ -n "$cfg_vpn" ]; then
     VPN_SERVERS="$cfg_vpn"
   fi
@@ -43,6 +45,23 @@ log() {
   if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
     tail -500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
   fi
+}
+
+# Предохранитель: удаляет осиротевшие /32-маршруты, оставшиеся от СТАРОЙ
+# версии скрипта (которая добавляла SITE_DOMAINS/DOMAINS/DNS через
+# `route add -host <ip> -interface en0`). Вне on-link (192.168.128.0/24) такие
+# маршруты macOS превращает в `UHS <ip> 192.168.0.6 en0` через ARP-proxy шлюза
+# (MAC b6:be:c:d5:9a:24) — они ведут трафик сайтов в никуда (HTTP 000).
+# Удаляем любую UHS-запись, чей gateway 192.168.0.6 и интерфейс физический (en*),
+# кроме самого host-маршрута до 192.168.0.6. Вызывается на каждом цикле, пока
+# корп. VPN (ppp0) не активен.
+clean_dead_gw_routes() {
+  netstat -rn -f inet 2>/dev/null |
+    awk '$2=="192.168.0.6" && $1!="192.168.0.6" && $NF ~ /^en/{print $1}' |
+    while read -r ip; do
+      [ -n "$ip" ] || continue
+      route -n delete -host "$ip" >/dev/null 2>&1 && log "cleaned dead /32 $ip (gw 192.168.0.6)"
+    done
 }
 
 # Проверяет, подключён ли к корп. Wi-Fi (en0 в подсети 192.168.128.0/24).
@@ -158,6 +177,13 @@ log "Starting corp-wifi-routes.sh"
 : > "$STATE"
 
 while true; do
+  # Предохранитель от осиротевших /32 -> 192.168.0.6 (см. clean_dead_gw_routes).
+  # Чистим на любой сети, пока корп. VPN не активен (при активном ppp маршруты
+  # через ppp и их не трогаем).
+  if ! ifconfig ppp0 >/dev/null 2>&1; then
+    clean_dead_gw_routes
+  fi
+
   # VPN активен — удаляем свои маршруты через en0 (ppp0 берёт управление)
   if ifconfig ppp0 >/dev/null 2>&1; then
     if [ -f "$STATE" ]; then
@@ -169,29 +195,13 @@ while true; do
   fi
 
   if is_corp_wifi; then
-    # Маршруты до VPN-серверов напрямую через en0 — чтобы L2TP/IPSec мог
+    # Маршруты до VPN-серверов напрямую через шлюз Wi-Fi — чтобы L2TP/IPSec мог
     # установиться в обход Karing (utun11), который иначе перехватывает их.
     add_vpn_server_routes
 
-    # Добавляем маршруты для корп. DNS
-    add_host_route_en0 "$CORP_DNS"
-    add_host_route_en0 "$CORP_DNS_SECONDARY"
-    add_host_route_en0 "$CORP_PROBE"
-
-    # Резолвим и добавляем маршруты для корп. доменов
-    for domain in $(grep -E '^DOMAINS=' "$CONF" 2>/dev/null | cut -d= -f2); do
-      for ip in $(resolve_corp_dns "$domain"); do
-        add_host_route_en0 "$ip"
-      done
-    done
-
-    # Добавляем маршруты для SITE_DOMAINS (первые 20 для экономии)
-    # Полный список обрабатывается только при VPN
-    for domain in $(head -20 <<< "$(grep -E '^SITE_DOMAINS=' "$CONF" 2>/dev/null | cut -d= -f2)"); do
-      for ip in $(resolve_corp_dns "$domain"); do
-        add_host_route_en0 "$ip"
-      done
-    done
+    # Корп. хосты (192.168.0.x) к en0 НЕ привязываем: на этой Wi-Fi on-link/
+    # АРП-пины для 0.33/0.232 не доставляются (TCP гаснет). Доступ и DNS даёт
+    # Karing («На прямую»: ip_cidr 192.168.0.0/16, direct_out). См. шапку файла.
 
     sleep 30
   else
