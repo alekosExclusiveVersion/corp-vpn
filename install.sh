@@ -28,6 +28,9 @@ WIFI_SCRIPT="/usr/local/sbin/corp-wifi-routes.sh"
 WATCHDOG_LABEL="com.tradesoft.corp-vpn-watchdog"
 WATCHDOG_PLIST="/Library/LaunchDaemons/$WATCHDOG_LABEL.plist"
 WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
+DIAG_LABEL="com.tradesoft.corp-vpn-diag"
+DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
+DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -80,6 +83,15 @@ if launchctl list | grep -q "$WATCHDOG_LABEL"; then
   launchctl unload "$WATCHDOG_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$WATCHDOG_PLIST"
+
+echo "==> Установка демона-логгера корп. сети/VPN (пилот MAC-детекта)..."
+cp "$DIR/corp-vpn-diagd.sh" "$DIAG_SCRIPT"
+chmod 755 "$DIAG_SCRIPT"
+cp "$DIR/com.tradesoft.corp-vpn-diag.plist" "$DIAG_PLIST"
+if launchctl list | grep -q "$DIAG_LABEL"; then
+  launchctl unload "$DIAG_PLIST" 2>/dev/null || true
+fi
+launchctl load -w "$DIAG_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -146,6 +158,20 @@ else
   fail=1
 fi
 
+if launchctl list | grep -q "$DIAG_LABEL"; then
+  echo "  [OK]   демон $DIAG_LABEL загружен"
+else
+  echo "  [FAIL] демон $DIAG_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$DIAG_SCRIPT" ]; then
+  echo "  [OK]   скрипт $DIAG_SCRIPT"
+else
+  echo "  [FAIL] скрипт $DIAG_SCRIPT отсутствует"
+  fail=1
+fi
+
 if [ -r "$NETWORKS_CONF" ]; then
   echo "  [OK]   конфиг корп. сетей $NETWORKS_CONF"
 else
@@ -180,6 +206,7 @@ if [ "$fail" -eq 0 ]; then
   echo "из /usr/local/etc/corp-networks.conf добавятся автоматически."
   echo "При корп. Wi-Fi маршруты добавляются автоматически (corp-wifi-routes)."
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
+  echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
 else
   echo
   echo "Есть ошибки — проверьте вывод выше."

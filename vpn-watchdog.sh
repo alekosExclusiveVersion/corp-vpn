@@ -32,14 +32,65 @@ PROFILES="vpn3-ts vpn4-ts vpn2-ts"
 # молотит попытки.
 # Критерий по IP en0: корп. Wi-Fi единственный выдаёт подсеть 192.168.128.0/24.
 # SSID/ассоциацию через networksetup здесь получить НЕЛЬЗЯ (отдаёт "not associated"
-# даже при рабочей сети без DHCP), поэтому IP-детект — единственный надёжный.
+# даже при рабочей сети без DHCP), поэтому IP-детект — основной.
+# ДОПОЛНИТЕЛЬНО (08.09): хотспот телефона раздаёт ту же 192.168.128.0/24, но
+# приватный MAC en0 per-network отличается (корп b6:be:0c:d5:9a:24 vs хотспот
+# 3e:e9:15:74:f3:be) — см. CORP_WIFI_EN0_MACS в конфиге.
+#
+# ПИЛОТ (сбор данных): хотспот телефона тоже раздаёт 192.168.128.0/24, поэтому
+# по IP сети не различить. Вердикт решений оставляем прежним (по IP), а рядом
+# логируем ARP-MAC реального шлюза и приватный MAC en0
+# (corp-vpn: pilot [verdict] gw_mac=... mac_en0=...) через logger — раз в
+# log-запись при смене. Решение НЕ меняется, пока списки
+# CORP_WIFI_GATEWAY_MACS/CORP_WIFI_EN0_MACS не задействованы в логике.
+
+# ARP-MAC реального шлюза (default через НЕ-туннельный интерфейс).
+gw_mac() {
+    local gw ifs
+    ifs=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print}')
+    [ -n "$ifs" ] || return 1
+    gw=$(echo "$ifs" | awk '$NF!~/^utun/{print $2; exit}')
+    [ -n "$gw" ] || gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+    [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
+    arp -n "$gw" 2>/dev/null | awk '{print $4; exit}'
+}
+
+PILOT_STATE=/tmp/corp-vpn-diagd/pilot-watchdog.last
+
+# Приватный MAC en0 — per-network признак (стабилен в рамках сети/SSID).
+en0_mac() { ifconfig en0 2>/dev/null | awk '/ether/{print $2; exit}'; }
+
+pilot_log_verdict() {
+    local gm line
+    gm=$(gw_mac)
+    line="$1 gw_mac=${gm:-?} mac_en0=$(en0_mac)"
+    if [ ! -f "$PILOT_STATE" ] || [ "$(cat "$PILOT_STATE" 2>/dev/null)" != "$line" ]; then
+        logger "corp-vpn: pilot $line"
+        echo "$line" > "$PILOT_STATE"
+    fi
+}
+
+CORP_WIFI_EN0_MACS_DEFAULT="b6:be:0c:d5:9a:24"
+CORP_WIFI_GATEWAY_MACS_DEFAULT="54:b8:a:cf:80:0"
+
+# Вердикт «корп. сеть»: корп, если per-network приватный MAC en0 ИЛИ ARP-MAC
+# шлюза совпадает с эталонами (см. corp-networks.conf). Второй признак
+# подстраховывает, но на хотспоте ARP-шлюза обычно не резолвится вовсе.
 is_corp_wifi() {
-    local ip
+    local ip verdict mac gm
     ip=$(ipconfig getifaddr en0 2>/dev/null)
-    [ -n "$ip" ] && case "$ip" in
-        192.168.128.*) return 0 ;;
-    esac
-    return 1
+    mac=$(en0_mac)
+    gm=$(gw_mac)
+    if [ -n "$ip" ] && [ -n "$mac" ]; then
+        case " $CORP_WIFI_EN0_MACS_DEFAULT $CORP_WIFI_GATEWAY_MACS_DEFAULT " in
+            *" $mac "*|*" $gm "*) verdict="corp" ;;
+            *) verdict="not-corp" ;;
+        esac
+    else
+        verdict="no-ip"
+    fi
+    pilot_log_verdict "$verdict"
+    [ "$verdict" = "corp" ]
 }
 
 # Корп. DNS и первый host:port из PROBE_HOSTS (обязаны маршрутизироваться через ppp0).
@@ -51,6 +102,16 @@ if [ -f "$CONF" ] && grep -qE '^PROBE_HOSTS=' "$CONF"; then
     # Значение в конфиге в кавычках (PROBE_HOSTS="a:1 b:2 ...") — снимаем кавычки.
     PROBE_HOSTS_DEFAULT="$(grep -E '^PROBE_HOSTS=' "$CONF" | head -1 | cut -d= -f2- | tr -d '"' | awk '{print $1}')"
 fi
+# Эталоны корп. сети (приватный MAC en0 + ARP-MAC шлюза) — из конфига, если заданы.
+for v in CORP_WIFI_EN0_MACS CORP_WIFI_GATEWAY_MACS; do
+    if [ -f "$CONF" ] && grep -qE "^$v=" "$CONF"; then
+        val=$(grep -E "^$v=" "$CONF" | head -1 | cut -d= -f2- | tr -d '"' | tr -d '\n')
+        case "$v" in
+            CORP_WIFI_EN0_MACS)   CORP_WIFI_EN0_MACS_DEFAULT="$val" ;;
+            CORP_WIFI_GATEWAY_MACS) CORP_WIFI_GATEWAY_MACS_DEFAULT="$val" ;;
+        esac
+    fi
+done
 PROBE_HOST="${PROBE_HOSTS_DEFAULT%:*}"
 PROBE_PORT="${PROBE_HOSTS_DEFAULT##*:}"
 

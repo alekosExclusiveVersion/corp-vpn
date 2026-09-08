@@ -30,6 +30,11 @@ WIFI_STATE="/var/run/corp-wifi-routes.state"
 WATCHDOG_LABEL="com.tradesoft.corp-vpn-watchdog"
 WATCHDOG_PLIST="/Library/LaunchDaemons/$WATCHDOG_LABEL.plist"
 WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
+DIAG_LABEL="com.tradesoft.corp-vpn-diag"
+DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
+DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
+DIAG_LOG="/var/log/corp-vpn-diag.log"
+DIAG_STATE="/tmp/corp-vpn-diagd"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -60,6 +65,14 @@ if launchctl list | grep -q "$WATCHDOG_LABEL"; then
 fi
 rm -f "$WATCHDOG_PLIST" "$WATCHDOG_SCRIPT"
 rm -f /tmp/corp-vpn-watchdog.lock
+
+echo "==> Остановка и удаление демона-логгера корп. сети/VPN (corp-vpn-diag)..."
+if launchctl list | grep -q "$DIAG_LABEL"; then
+  launchctl unload "$DIAG_PLIST"
+fi
+rm -f "$DIAG_PLIST" "$DIAG_SCRIPT"
+rm -f "$DIAG_LOG" "${DIAG_LOG}.tmp" "${DIAG_LOG}.stdout.log" "${DIAG_LOG}.stderr.log"
+rm -rf "$DIAG_STATE"
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -137,6 +150,20 @@ else
   echo "  [OK]   файлы демона vpn-watchdog удалены"
 fi
 
+if launchctl list | grep -q "$DIAG_LABEL"; then
+  echo "  [FAIL] демон $DIAG_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $DIAG_LABEL удалён"
+fi
+
+if [ -e "$DIAG_SCRIPT" ] || [ -e "$DIAG_PLIST" ]; then
+  echo "  [FAIL] файлы демона corp-vpn-diag остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона corp-vpn-diag удалены"
+fi
+
 if [ -e "$NETWORKS_CONF" ]; then
   echo "  [FAIL] конфиг корп. сетей остался на диске"
   fail=1
@@ -151,7 +178,7 @@ with open(sys.argv[1], 'rb') as f:
 targets = {
     'vpn2-ts': 'DF442B03-A55C-41F1-A590-740EC2FF0068',
     'vpn3-ts': 'D3B98206-61DC-4340-B0AC-A970F8B9C582',
-    'vpn4': '931E4155-0924-4D0B-B4F7-5F8D104E494B',
+    'vpn4-ts': '931E4155-0924-4D0B-B4F7-5F8D104E494B',
 }
 ok = True
 for name, sid in targets.items():
