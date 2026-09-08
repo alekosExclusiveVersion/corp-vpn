@@ -42,7 +42,7 @@ IP L2TP/IPSec серверов уходили в нод-туннель Karing (�
 
 Рабочий Mac (aleksei) подключён к интернету через **Karing** (TUN, узлы VLESS,
 выход через 🇳🇱 Netherlands). Параллельно нужен доступ к **корпоративной сети
-TradeSoft** через L2TP/IPSec VPN (`vpn1`/`vpn2-ts`/`vpn3-ts`/`vpn4`, сервер
+TradeSoft** через L2TP/IPSec VPN (`vpn1-ts`/`vpn2-ts`/`vpn3-ts`/`vpn4-ts`, сервер
 `vpn3.tradesoft.ru`).
 
 Возникали конфликты:
@@ -154,7 +154,7 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   (`scutil --nc start`). **Может не сработать**: keychain PSK; для L2TP
   работает `networksetup -connectpppoeservice` (см. §6 п. 2).
 - `~/corp-vpn/corp-vpn.sh stop [vpn]` — отключение.
-- VPN по умолчанию: `vpn3-ts` (допустимы vpn1, vpn2-ts, vpn4).
+- VPN по умолчанию: `vpn3-ts` (допустимы vpn1-ts, vpn2-ts, vpn4-ts).
 
 ### 3.4. Конфигурация Karing
 Путь: `~/Library/Group Containers/group.com.nebula.karing/`
@@ -196,7 +196,7 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   конфликтует: демон §3.6 всё равно возвращает корп. маршруты на ppp0.
 
 ### 3.5. Корпоративный VPN (система)
-- Сервисы: `vpn1`, `vpn2-ts`, `vpn3-ts`, `vpn4`; активен `vpn3-ts`.
+- Сервисы: `vpn1-ts`, `vpn2-ts`, `vpn3-ts`, `vpn4-ts`; активен `vpn3-ts`.
 - Сервер: `vpn3.tradesoft.ru` (109.194.204.125), авторизация `a.koshkin`,
   PSK в keychain (иногда «incorrect user shared secret found» при CLI).
 - Туннель: `ppp0`, адрес Mac `192.168.160.160`, шлюз `192.168.160.1`.
@@ -254,7 +254,7 @@ log show --predicate 'message CONTAINS "corp-vpn"' --last 30m
    поднимать его бессмысленно (корп. ресурсы на этой сети доступны напрямую
    через правило Karing «На прямую», §3.4).
 3. Проверяет статус профилей через `scutil --nc status` в порядке
-   приоритета `vpn3-ts → vpn4 → vpn2-ts`. Если хоть один `Connected` — выходит.
+   приоритета `vpn3-ts → vpn4-ts → vpn2-ts`. Если хоть один `Connected` — выходит.
 4. Иначе поднимает по приоритету через **`networksetup -connectpppoeservice`**
    (рабочий метод для L2TP; `scutil --nc start` для L2TP не работает —
    keychain PSK, см. §6).

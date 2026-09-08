@@ -13,7 +13,7 @@ CORP_GW="192.168.160.1"
 usage() {
     cat <<EOF
 Использование: corp-vpn.sh {status|start|stop} [имя VPN]
-VPN (по умолчанию vpn3-ts): vpn1, vpn2-ts, vpn3-ts, vpn4
+VPN (по умолчанию vpn3-ts): vpn1-ts, vpn2-ts, vpn3-ts, vpn4-ts
 EOF
 }
 
@@ -31,7 +31,7 @@ status() {
     if corp_up; then
         echo "  СТАТУС: работает ($(ifconfig "$CORP_IF" 2>/dev/null | grep 'inet ' | awk '{print $2}'))"
         local vpn
-        for vpn in vpn1 vpn2-ts vpn3-ts vpn4; do
+        for vpn in vpn1-ts vpn2-ts vpn3-ts vpn4-ts; do
             local st
             st=$(scutil --nc status "$vpn" 2>/dev/null | head -1)
             [ "$st" = "Connected" ] && echo "  активный: $vpn"

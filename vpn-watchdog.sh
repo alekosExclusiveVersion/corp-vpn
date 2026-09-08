@@ -24,7 +24,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
-PROFILES="vpn3-ts vpn4 vpn2-ts"
+PROFILES="vpn3-ts vpn4-ts vpn2-ts"
 
 # Подключены ли к корп. Wi-Fi (en0 в подсети 192.168.128.0/24).
 # На корп. Wi-Fi L2TP/IPSec не поднимается (сетевое оборудование глушит L2TP-в-ESP),

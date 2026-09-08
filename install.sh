@@ -160,7 +160,7 @@ with open(sys.argv[1], 'rb') as f:
 targets = {
     'vpn2-ts': 'DF442B03-A55C-41F1-A590-740EC2FF0068',
     'vpn3-ts': 'D3B98206-61DC-4340-B0AC-A970F8B9C582',
-    'vpn4': '931E4155-0924-4D0B-B4F7-5F8D104E494B',
+    'vpn4-ts': '931E4155-0924-4D0B-B4F7-5F8D104E494B',
 }
 ok = True
 for name, sid in targets.items():
@@ -176,7 +176,7 @@ EOF
 
 if [ "$fail" -eq 0 ]; then
   echo
-  echo "Готово. Подключите vpn2-ts, vpn3-ts или vpn4 — корпоративные маршруты"
+  echo "Готово. Подключите vpn1-ts, vpn2-ts, vpn3-ts или vpn4-ts — корпоративные маршруты"
   echo "из /usr/local/etc/corp-networks.conf добавятся автоматически."
   echo "При корп. Wi-Fi маршруты добавляются автоматически (corp-wifi-routes)."
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
