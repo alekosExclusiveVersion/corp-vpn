@@ -188,12 +188,20 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   - `domain_suffix`: `.tradesoft.ru`, `.tradesoft.pro`, `.tradesoft.corp`, `.prj`;
   - `domain`: `sup5.tradesoft.corp`, `www.projects.prj`, `projects.prj`,
     `servicedesk-report.office.tradesoft.ru`, `b24.tradesoft.ru`.
-  Механика: Karing перехватывает DNS (hijack-dns) и возвращает для этих доменов
+Механика: Karing перехватывает DNS (hijack-dns) и возвращает для этих доменов
   fake-IP (зона `198.20.0.0/24`); при соединении sing-box восстанавливает домен
   из правила и отправляет трафик через `direct_out` (не в прокси-узел). DNS для
   direct-доменов резолвится `local`/`dhcp://auto` — берёт DNS из настроек Wi-Fi,
   где первым стоит корп. `192.168.0.210`. С поднятым L2TP-туннелем не
   конфликтует: демон §3.6 всё равно возвращает корп. маршруты на ppp0.
+
+**ВАЖНО (проверено 09.09.2026):** живым источником правил является внутр. хранилище
+  приложения — `karing_routing_group.json` и `service_core.json` перегенерируются
+  Karing из него при каждом переподключении, ручные правки этих файлов на диске
+  **затираются** (внесённый `domain_suffix` пропал после reconnect). Правильный
+  путь — правка через UI Karing (то, что делается в группе «На прямую») либо
+  генератор `karing-rules.sh -i` (пишет в `karing_routing_group.json`, см. §3.7);
+  правки UI сохраняются и применяются при переподключении TUN.
 
 ### 3.5. Корпоративный VPN (система)
 - Сервисы: `vpn1-ts`, `vpn2-ts`, `vpn3-ts`, `vpn4-ts`; активен `vpn3-ts`.
@@ -309,6 +317,10 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
   `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`.
+- `SITE_DOMAINS` — сайты на корп. серверах, идут через ppp (см. 3.6.2) и
+  добавляются `karing-rules.sh` в direct-группу «На прямую». 09.09.2026 добавлены
+  `parts-catalogs.com parts-index.com` (каталоги автозапчастей: реальный трафик
+  идёт на `.parts-catalogs.com`, см. §9.8).
 - `DNS_HOSTS` — корп. DNS-серверы (`192.168.0.210 192.168.0.220`). Закрепляются
   `/32`-маршрутами через `ppp0` демоном `corp-vpn-routes.sh` (см. 3.6.2), чтобы
   корп. резолвинг не перехватывал Karing/en0, когда туннель поднят.
@@ -528,6 +540,8 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Корп. projects.prj (корп. Wi-Fi, без VPN) | `curl -s -o /dev/null -w '%{http_code}' http://www.projects.prj/schedule.html` | `401` (живой сервер) |
 | Корп. b24 (корп. Wi-Fi, без VPN, без hosts) | `curl -s -o /dev/null -w '%{http_code}' http://b24.tradesoft.ru` | `301` (жив) |
 | Автоподъём watchdog | `scutil --nc stop vpn3-ts` → через ≤60 с `scutil --nc status vpn3-ts` | `Connected` |
+| parts-catalogs.com → direct (09.09.2026) | clash API (secret из `service.json`) → `GET /connections`, фильтр по host `parts-catalogs.com` | `chains=[direct_out]` |
+| parts-catalogs.com /32 через ppp (при corp VPN) | `route -n get <IP parts-catalogs.com> \| grep interface` | `ppp0` |
 
 ---
 
@@ -788,3 +802,36 @@ aleksei) читает новые строки по байтовому указа
   `/Users/aleksei/corp-vpn/corp-wifi-routes.sh`; канонический репозиторий —
   `~/corp-vpn` (plist ссылается напрямую), `~/Work/scripts/corp-vpn` — рабочая
   копия.
+- После фикса parts-catalogs (§9.8): `api.parts-catalogs.com` через Karing →
+  `chains=[direct_out]` (clash API), доступ к сервису восстановлен.
+
+### 9.8. Диагностика 09.09.2026: «api.parts-catalogs.com определяется не-офисным IP»
+**Симптом:** внешний сервис автокаталогов при работе через Karing «видит» не
+офисный IP (US-прокси), несмотря на то что в direct-группу Karing уже были
+добавлены суффиксы `.parts-catalogs.ru` и `.parts-index.com`.
+
+**Корень:** реальный трафик сервиса идёт на домен **`.parts-catalogs.com`** (без
+`ru`), которого в direct-группе не было. Домен не совпал ни с одним эксплицитным
+правилом → пошёл в `route.final = urltest_out` (нод-туннель, VPS Казань) → IP узла,
+а не офиса. Суффиксы `.parts-catalogs.ru`/`.parts-index.com` на реальный домен не
+влияли. Подтверждено живыми соединениями Karing (clash API, `GET /connections`):
+`www.parts-catalogs.com`/`api.parts-catalogs.com` → `chains=[urltest_out]`.
+
+**Ключевой вывод (механика правок Karing):** правила Karing живут во внутреннем
+хранилище приложения и правятся только через UI (группа «На прямую» →
+`domain_suffix`). Файлы `karing_routing_group.json`/`service_core.json` — суть
+**генераты**: при переподключении Karing перезаписывает их из своего состояния,
+поэтому ручные правки файлов на диске затираются. Диагностика этого:
+1. внести суффикс в файлы руками → reconnect Karing → суффикс исчез;
+2. внести тот же суффикс через UI → reconnect → суффикс сохранён.
+
+**Фикс:**
+1. В UI Karing в группу «На прямую» добавлен суффикс `.parts-catalogs.com`
+   (реальный домен трафика), после reconnect доступ восстановлен, IP офисный;
+2. в `SITE_DOMAINS` конфига добавлены `parts-catalogs.com parts-index.com`
+   (коммит `618794f`) — закрепляют `/32`-маршруты через `ppp0` при поднятом
+   корп. L2TP (§3.6.2).
+
+**Проверка после фикса:** clash API `GET /connections`, фильтр host
+`parts-catalogs.com` → `chains=[direct_out]` (единственное активное соединение
+в момент диагностики).
