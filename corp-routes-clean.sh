@@ -23,6 +23,7 @@ CONF=${CORP_ROUTES_CLEAN_CONF:-/usr/local/etc/corp-networks.conf}
 LOG=${CORP_ROUTES_CLEAN_LOG:-/var/log/corp-routes-clean.log}
 PREV=${CORP_ROUTES_CLEAN_PREV:-/var/run/corp-routes-clean.prev}
 CUR=${CORP_ROUTES_CLEAN_CUR:-/var/run/corp-routes-clean.cur}
+SIGNALS=${CORP_SIGNALS:-/var/run/corp-vpn-signals}
 
 # Пулды fake-IP Karing (можно переопределить в corp-networks.conf: FAKEIP_ROUTES=...)
 FAKEIP_ROUTES="198.18.0.0/15 198.20.0.0/15"
@@ -49,6 +50,16 @@ log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
   if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt 1000 ]; then
     tail -500 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+  fi
+}
+
+# Сигнальная очередь для юзер-агента уведомлений (corp-notify.sh).
+# Строка: ts|event|message. Ротация: при >200 строк оставляем последние 100.
+signal() {
+  line="$(date '+%Y-%m-%d %H:%M:%S')|$1|$2"
+  echo "$line" >> "$SIGNALS"
+  if [ -f "$SIGNALS" ] && [ "$(wc -l < "$SIGNALS")" -gt 200 ]; then
+    tail -100 "$SIGNALS" > "$SIGNALS.tmp" && mv "$SIGNALS.tmp" "$SIGNALS"
   fi
 }
 
@@ -84,8 +95,10 @@ kill_route() {
   fi
   if route -n delete -host "$ip" >/dev/null 2>&1; then
     log "deleted $ip ($why)"
+    signal "routes-dead.del" "deleted $ip ($why)"
   else
     log "FAILED delete $ip ($why)"
+    signal "routes-dead.fail" "FAILED delete $ip ($why)"
   fi
 }
 

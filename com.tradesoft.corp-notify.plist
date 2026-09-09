@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradesoft.corp-notify</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/usr/local/sbin/corp-notify.sh</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>10</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/corp-notify.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/corp-notify.stderr.log</string>
+</dict>
+</plist>

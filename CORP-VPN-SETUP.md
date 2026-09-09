@@ -761,6 +761,21 @@ fake-IP (например `sup5 → 198.20.0.16`), они попадали в ST
 в host-маршруты через ppp0 — мёртвые (не через utun). Теперь такие адреса
 пропускаются на корню, в STATE не попадают.
 
+### 9.6.3. Уведомления (Notification Center) — `corp-notify.sh` (добавлен 09.09.2026)
+Сигнальная очередь: root-демоны пишут события в `/var/run/corp-vpn-signals`
+(строки `ts|event|message`, ротация при >200 строк), юзер-агент
+`corp-notify.sh` (LaunchAgent `com.tradesoft.corp-notify`, каждые 10 с, от
+aleksei) читает новые строки по байтовому указателю (`/tmp/corp-vpn-notify.pos`)
+и показывает баннеры через `osascript display notification` with
+`sound name "default"`. Дедупликация: одно событие `event|message` не чаще
+раза в 30 с (`/tmp/corp-vpn-notify.seen`). События:
+- `routes-dead.del` — мёртвый маршрут удалён (corp-routes-clean);
+- `routes-dead.fail` — не удалось удалить (corp-routes-clean);
+- `badroutes.on` / `badroutes.off` — появление/исчезновение битых fake-IP
+  (corp-vpn-diagd, только на переходе состояния);
+- `vpn.up` / `vpn.down` — корп VPN поднялся/отключился (corp-vpn-routes,
+  только на смене `last_iface`; маркер `/var/run/corp-vpn-signals.vpn`).
+
 ### 9.7. Проверено 09.09.2026 (зелёное)
 - Корп-сеть: DHCP, `defs=[en0 utun4]`, Karing Connected, `api.opencode.ai=200`,
   `198.20.0.x` только через `utun4`.

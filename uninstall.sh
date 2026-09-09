@@ -41,6 +41,11 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+NOTIFY_LABEL="com.tradesoft.corp-notify"
+NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
+NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
+NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
+SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -86,6 +91,14 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
 fi
 rm -f "$CLEAN_PLIST" "$CLEAN_SCRIPT"
 rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR"
+
+echo "==> Остановка и удаление юзер-агента уведомлений (corp-notify)..."
+if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$NOTIFY_PLIST" 2>/dev/null || true
+fi
+rm -f "$NOTIFY_PLIST" "$NOTIFY_SCRIPT"
+rm -f "$SIGNALS" /tmp/corp-vpn-notify.pos /tmp/corp-vpn-notify.seen
+rm -f /tmp/corp-notify.stdout.log /tmp/corp-notify.stderr.log
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -189,6 +202,20 @@ if [ -e "$CLEAN_SCRIPT" ] || [ -e "$CLEAN_PLIST" ] || [ -e "$CLEAN_LOG" ] || [ -
   fail=1
 else
   echo "  [OK]   файлы демона corp-routes-clean удалены"
+fi
+
+if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
+  echo "  [FAIL] юзер-агент $NOTIFY_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   юзер-агент $NOTIFY_LABEL удалён"
+fi
+
+if [ -e "$NOTIFY_SCRIPT" ] || [ -e "$NOTIFY_PLIST" ]; then
+  echo "  [FAIL] файлы юзер-агента corp-notify остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы юзер-агента corp-notify удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then

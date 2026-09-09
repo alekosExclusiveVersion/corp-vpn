@@ -23,6 +23,25 @@ if [ -f "$AUTO_CONF" ]; then
 fi
 STATE=/var/run/corp-vpn-routes.state
 LOCAL_STATE=/var/run/corp-vpn-local.state
+SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
+SIGNALED_VPN_STATE="${CORP_SIGNALS_VPN_STATE:-/var/run/corp-vpn-signals.vpn}"
+
+# Сигнальная очередь для юзер-агента уведомлений (corp-notify.sh).
+# Строка: ts|event|message.
+signal() { echo "$(date '+%Y-%m-%d %H:%M:%S')|$1|$2" >> "$SIGNALS"; }
+
+# Сигнал смены состояния корп. VPN: только при реальном переходе up<->down
+# (не при переподключении в рамках сессии и не при ложном Connected).
+signal_vpn_transition() {
+  state=$1
+  if [ "$(cat "$SIGNALED_VPN_STATE" 2>/dev/null)" != "$state" ]; then
+    echo "$state" > "$SIGNALED_VPN_STATE"
+    case "$state" in
+      up)   signal "vpn.up"   "корп VPN активен ($iface)" ;;
+      down) signal "vpn.down" "корп VPN отключился" ;;
+    esac
+  fi
+}
 
 find_iface() {
   for svc in $CORP_SERVICES; do
@@ -345,6 +364,13 @@ fail=0
 dead_until=0
 last_probe=0
 last_local_snap=0
+# Инициализируем маркер состояния VPN фактическим статусом при старте,
+# чтобы не слать лишний сигнал up/down в момент перезапуска демона.
+if find_iface >/dev/null 2>&1; then
+  echo "up" > "$SIGNALED_VPN_STATE"
+else
+  echo "down" > "$SIGNALED_VPN_STATE"
+fi
 while true; do
   now=$(date +%s)
   iface=$(find_iface)
@@ -383,6 +409,7 @@ while true; do
       last_session="$session"
       last_resolve=$now
       fail=0
+      signal_vpn_transition "up"
     else
       assert_routes
       # Подхват доменов автодетекта (corp-learn.sh): при изменении
@@ -398,6 +425,7 @@ while true; do
     del_routes
     last_iface=""
     fail=0
+    signal_vpn_transition "down"
   fi
 
   # Проверка живости: маршруты держим, только пока корп. трафик реально проходит.
@@ -412,6 +440,7 @@ while true; do
         last_iface=""
         fail=0
         dead_until=$((now + 60))
+        signal_vpn_transition "down"
       fi
     fi
   fi

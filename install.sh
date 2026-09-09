@@ -37,6 +37,11 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+NOTIFY_LABEL="com.tradesoft.corp-notify"
+NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
+NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
+NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
+SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -109,6 +114,18 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
   launchctl unload "$CLEAN_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$CLEAN_PLIST"
+
+echo "==> Установка юзер-агента уведомлений (corp-notify, LaunchAgent $NOTIFY_UID)..."
+cp "$DIR/corp-notify.sh" "$NOTIFY_SCRIPT"
+chmod 755 "$NOTIFY_SCRIPT"
+mkdir -p /Users/aleksei/Library/LaunchAgents
+cp "$DIR/com.tradesoft.corp-notify.plist" "$NOTIFY_PLIST"
+chown aleksei:staff "$NOTIFY_PLIST"
+rm -f "$SIGNALS" /tmp/corp-vpn-notify.pos /tmp/corp-vpn-notify.seen
+if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$NOTIFY_PLIST" 2>/dev/null || true
+fi
+launchctl bootstrap "gui/$NOTIFY_UID" "$NOTIFY_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -203,6 +220,20 @@ else
   fail=1
 fi
 
+if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
+  echo "  [OK]   юзер-агент $NOTIFY_LABEL загружен"
+else
+  echo "  [FAIL] юзер-агент $NOTIFY_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$NOTIFY_SCRIPT" ]; then
+  echo "  [OK]   скрипт $NOTIFY_SCRIPT"
+else
+  echo "  [FAIL] скрипт $NOTIFY_SCRIPT отсутствует"
+  fail=1
+fi
+
 if [ -r "$NETWORKS_CONF" ]; then
   echo "  [OK]   конфиг корп. сетей $NETWORKS_CONF"
 else
@@ -239,6 +270,7 @@ if [ "$fail" -eq 0 ]; then
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
   echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
   echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
+  echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
 else
   echo
   echo "Есть ошибки — проверьте вывод выше."

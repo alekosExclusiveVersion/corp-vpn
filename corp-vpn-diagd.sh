@@ -76,6 +76,24 @@ fp_badroutes=$(netstat -rn -f inet 2>/dev/null | awk '
   $1 ~ /^198\.20\./ && $4 !~ /^utun/ { printf "%s(%s) ", $1, $4 }
 ')
 
+# Сигнал о появлении/исчезновении битых fakeip-маршрутов (только на переходе).
+# Файл-очередь читает юзер-агент corp-notify.sh и показывает уведомление.
+SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
+signal() { echo "$(date '+%Y-%m-%d %H:%M:%S')|$1|$2" >> "$SIGNALS"; }
+BAD_LAST="$STATE_DIR/badroutes.last"
+bad_now=$(printf '%s' "$fp_badroutes" | sed 's/ $//')
+bad_last=$(cat "$BAD_LAST" 2>/dev/null)
+if [ "$bad_now" != "$bad_last" ]; then
+  if [ -n "$bad_now" ]; then
+    log "BADROUTES_ON $stamp {$bad_now}"
+    signal "badroutes.on" "битые fake-IP: {$bad_now}"
+  else
+    log "BADROUTES_OFF $stamp"
+    signal "badroutes.off" "битые fake-IP исчезли"
+  fi
+fi
+echo "$bad_now" > "$BAD_LAST"
+
 fp="ip=$en0_ip mac_en0=$en0_mac gw_mac=${gm:-?} defs=[$defs] $corp karing=$karing$vpn $ppp"
 [ -n "$fp_badroutes" ] && fp="$fp BADROUTES={$fp_badroutes}"
 last=$(cat "$LAST" 2>/dev/null)
