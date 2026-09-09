@@ -542,6 +542,7 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Автоподъём watchdog | `scutil --nc stop vpn3-ts` → через ≤60 с `scutil --nc status vpn3-ts` | `Connected` |
 | parts-catalogs.com → direct (09.09.2026) | clash API (secret из `service.json`) → `GET /connections`, фильтр по host `parts-catalogs.com` | `chains=[direct_out]` |
 | parts-catalogs.com /32 через ppp (при corp VPN) | `route -n get <IP parts-catalogs.com> \| grep interface` | `ppp0` |
+| corp-routes-clean реальное событие (09.09.2026) | `grep deleted /var/log/corp-routes-clean.log` | `deleted 192.168.128.123 (corp host через en* вне on-link)` |
 
 ---
 
@@ -768,6 +769,13 @@ http://192.168.128.123:4000/queues.html` работал полностью.
   ожидаем 200), DNS-маршруты корп. DNS (`192.168.0.210/220` — не host-lookup).
 Лог: `/var/log/corp-routes-clean.log` (ротация 1000 строк).
 
+**Проверено на реальном событии 09.09.2026 (корп Wi-Fi → дом):** при переходе
+на дом. Wi-Fi (`192.168.31.0/24`) демон сам, без sudo, удалил мёртвый маршрут
+`192.168.128.123 → en0` (остаток корп-сети):
+`2026-09-09 17:01:51 deleted 192.168.128.123 (corp host через en* вне on-link)`.
+После удаления маршрут ушёл на правильный `ppp0` (корп. VPN поднят, `10/8` +
+`192.168/16 → ppp0`). Ручной фикс из §9.6 больше не нужен.
+
 ### 9.6.2. Профилактика «родника» — фильтр fake-IP в `corp-vpn-routes.sh` (добавлен 09.09.2026)
 `host_ip()` теперь отбрасывает ответы из fake-IP пулов (`198.18.x/198.19.x`,
 `198.20.x/198.21.x`). Раньше, когда DNS шел через Karing, `dig` возвращал
@@ -804,6 +812,9 @@ aleksei) читает новые строки по байтовому указа
   копия.
 - После фикса parts-catalogs (§9.8): `api.parts-catalogs.com` через Karing →
   `chains=[direct_out]` (clash API), доступ к сервису восстановлен.
+- Реальное срабатывание `corp-routes-clean` (§9.6.1): корп Wi-Fi → дом,
+  мёртвый `192.168.128.123 → en0` удалён демоном автоматически (17:01:51),
+  маршрут затем через `ppp0`.
 
 ### 9.8. Диагностика 09.09.2026: «api.parts-catalogs.com определяется не-офисным IP»
 **Симптом:** внешний сервис автокаталогов при работе через Karing «видит» не
