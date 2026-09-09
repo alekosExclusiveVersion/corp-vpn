@@ -70,7 +70,14 @@ if ifconfig ppp0 >/dev/null 2>&1; then ppp="ppp=ON"; else ppp="ppp=off"; fi
 corp="not-corp"
 is_corp_ip && corp="corp"
 
+# Битые fakeip-маршруты Karing (когда пакеты к 198.20.0.x уходят в en0 вместо utun4)
+# = известный баг, симптом "домен через Karing = 000, а с реальным IP = 200".
+fp_badroutes=$(netstat -rn -f inet 2>/dev/null | awk '
+  $1 ~ /^198\.20\./ && $4 !~ /^utun/ { printf "%s(%s) ", $1, $4 }
+')
+
 fp="ip=$en0_ip mac_en0=$en0_mac gw_mac=${gm:-?} defs=[$defs] $corp karing=$karing$vpn $ppp"
+[ -n "$fp_badroutes" ] && fp="$fp BADROUTES={$fp_badroutes}"
 last=$(cat "$LAST" 2>/dev/null)
 
 c=0; [ -f "$CNT" ] && c=$(cat "$CNT" 2>/dev/null)
