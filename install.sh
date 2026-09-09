@@ -31,6 +31,12 @@ WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
 DIAG_LABEL="com.tradesoft.corp-vpn-diag"
 DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
 DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
+CLEAN_LABEL="com.tradesoft.corp-routes-clean"
+CLEAN_PLIST="/Library/LaunchDaemons/$CLEAN_LABEL.plist"
+CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
+CLEAN_LOG="/var/log/corp-routes-clean.log"
+CLEAN_PREV="/var/run/corp-routes-clean.prev"
+CLEAN_CUR="/var/run/corp-routes-clean.cur"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -92,6 +98,17 @@ if launchctl list | grep -q "$DIAG_LABEL"; then
   launchctl unload "$DIAG_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$DIAG_PLIST"
+
+echo "==> Установка демона очистки мёртвых маршрутов (corp-routes-clean)..."
+cp "$DIR/corp-routes-clean.sh" "$CLEAN_SCRIPT"
+chmod 755 "$CLEAN_SCRIPT"
+cp "$DIR/com.tradesoft.corp-routes-clean.plist" "$CLEAN_PLIST"
+rm -f "$CLEAN_PREV" "$CLEAN_CUR"
+: > "$CLEAN_LOG" 2>/dev/null || true
+if launchctl list | grep -q "$CLEAN_LABEL"; then
+  launchctl unload "$CLEAN_PLIST" 2>/dev/null || true
+fi
+launchctl load -w "$CLEAN_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -172,6 +189,20 @@ else
   fail=1
 fi
 
+if launchctl list | grep -q "$CLEAN_LABEL"; then
+  echo "  [OK]   демон $CLEAN_LABEL загружен"
+else
+  echo "  [FAIL] демон $CLEAN_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$CLEAN_SCRIPT" ]; then
+  echo "  [OK]   скрипт $CLEAN_SCRIPT"
+else
+  echo "  [FAIL] скрипт $CLEAN_SCRIPT отсутствует"
+  fail=1
+fi
+
 if [ -r "$NETWORKS_CONF" ]; then
   echo "  [OK]   конфиг корп. сетей $NETWORKS_CONF"
 else
@@ -207,6 +238,7 @@ if [ "$fail" -eq 0 ]; then
   echo "При корп. Wi-Fi маршруты добавляются автоматически (corp-wifi-routes)."
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
   echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
+  echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
 else
   echo
   echo "Есть ошибки — проверьте вывод выше."

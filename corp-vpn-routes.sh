@@ -41,7 +41,17 @@ find_iface() {
 }
 
 host_ip() {
-  dig +short +time=1 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+  # Резолвим корп. домены, отбрасывая fake-IP пулы Karing (198.18.0.0/15,
+  # 198.20.0.0/15 = 198.18-19.x, 198.20-21.x). Если DNS перехвачен Karing
+  # (fake-IP), такие адреса попадали в STATE и протаскивались host-маршрутами
+  # через ppp0 — мёртвые (не через utun). Проверено 09.09.2026.
+  dig +short +time=1 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+    while read -r ip; do
+      case "$ip" in
+        198.1[89].*|198.2[01].*) continue ;;
+      esac
+      printf '%s\n' "$ip"
+    done
 }
 
 ip2int() {

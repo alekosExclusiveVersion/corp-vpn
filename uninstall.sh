@@ -35,6 +35,12 @@ DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
 DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
 DIAG_LOG="/var/log/corp-vpn-diag.log"
 DIAG_STATE="/tmp/corp-vpn-diagd"
+CLEAN_LABEL="com.tradesoft.corp-routes-clean"
+CLEAN_PLIST="/Library/LaunchDaemons/$CLEAN_LABEL.plist"
+CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
+CLEAN_LOG="/var/log/corp-routes-clean.log"
+CLEAN_PREV="/var/run/corp-routes-clean.prev"
+CLEAN_CUR="/var/run/corp-routes-clean.cur"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
 fail=0
@@ -73,6 +79,13 @@ fi
 rm -f "$DIAG_PLIST" "$DIAG_SCRIPT"
 rm -f "$DIAG_LOG" "${DIAG_LOG}.tmp" "${DIAG_LOG}.stdout.log" "${DIAG_LOG}.stderr.log"
 rm -rf "$DIAG_STATE"
+
+echo "==> Остановка и удаление демона очистки мёртвых маршрутов (corp-routes-clean)..."
+if launchctl list | grep -q "$CLEAN_LABEL"; then
+  launchctl unload "$CLEAN_PLIST"
+fi
+rm -f "$CLEAN_PLIST" "$CLEAN_SCRIPT"
+rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR"
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -162,6 +175,20 @@ if [ -e "$DIAG_SCRIPT" ] || [ -e "$DIAG_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы демона corp-vpn-diag удалены"
+fi
+
+if launchctl list | grep -q "$CLEAN_LABEL"; then
+  echo "  [FAIL] демон $CLEAN_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $CLEAN_LABEL удалён"
+fi
+
+if [ -e "$CLEAN_SCRIPT" ] || [ -e "$CLEAN_PLIST" ] || [ -e "$CLEAN_LOG" ] || [ -e "$CLEAN_PREV" ] || [ -e "$CLEAN_CUR" ]; then
+  echo "  [FAIL] файлы демона corp-routes-clean остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона corp-routes-clean удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then
