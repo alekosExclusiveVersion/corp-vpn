@@ -30,6 +30,9 @@ notify() {
     badroutes.off)    title="corp-vpn: маршруты чисты" ;;
     vpn.up)           title="corp-vpn: VPN активен" ;;
     vpn.down)         title="corp-vpn: VPN отключился" ;;
+    db-clean.ok)      title="aisql: БД удалены" ;;
+    db-clean.dryrun)  title="aisql: кандидаты на удаление" ;;
+    db-clean.fail)    title="aisql: ошибка очистки" ;;
     *)                title="corp-vpn: $event" ;;
   esac
   osascript -e "display notification \"$msg\" with title \"$title\" sound name \"default\"" 2>/dev/null

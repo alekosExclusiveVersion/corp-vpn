@@ -41,6 +41,11 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+DB_CLEAN_LABEL="com.tradesoft.corp-db-clean"
+DB_CLEAN_PLIST="/Library/LaunchDaemons/$DB_CLEAN_LABEL.plist"
+DB_CLEAN_SCRIPT="/usr/local/sbin/corp-db-clean.sh"
+DB_CLEAN_PY="/usr/local/sbin/db-clean-aisql.py"
+DB_CLEAN_LOG="/var/log/corp-db-clean.log"
 NOTIFY_LABEL="com.tradesoft.corp-notify"
 NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
 NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
@@ -91,6 +96,13 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
 fi
 rm -f "$CLEAN_PLIST" "$CLEAN_SCRIPT"
 rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR"
+
+echo "==> Остановка и удаление демона очистки БД aisql (corp-db-clean)..."
+if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+  launchctl unload "$DB_CLEAN_PLIST"
+fi
+rm -f "$DB_CLEAN_PLIST" "$DB_CLEAN_SCRIPT" "$DB_CLEAN_PY"
+rm -f "$DB_CLEAN_LOG" "${DB_CLEAN_LOG}.stdout.log" "${DB_CLEAN_LOG}.stderr.log"
 
 echo "==> Остановка и удаление юзер-агента уведомлений (corp-notify)..."
 if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
@@ -202,6 +214,20 @@ if [ -e "$CLEAN_SCRIPT" ] || [ -e "$CLEAN_PLIST" ] || [ -e "$CLEAN_LOG" ] || [ -
   fail=1
 else
   echo "  [OK]   файлы демона corp-routes-clean удалены"
+fi
+
+if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+  echo "  [FAIL] демон $DB_CLEAN_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $DB_CLEAN_LABEL удалён"
+fi
+
+if [ -e "$DB_CLEAN_SCRIPT" ] || [ -e "$DB_CLEAN_PLIST" ] || [ -e "$DB_CLEAN_PY" ]; then
+  echo "  [FAIL] файлы демона corp-db-clean остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона corp-db-clean удалены"
 fi
 
 if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then

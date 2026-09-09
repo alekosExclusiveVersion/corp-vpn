@@ -37,6 +37,11 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+DB_CLEAN_LABEL="com.tradesoft.corp-db-clean"
+DB_CLEAN_PLIST="/Library/LaunchDaemons/$DB_CLEAN_LABEL.plist"
+DB_CLEAN_SCRIPT="/usr/local/sbin/corp-db-clean.sh"
+DB_CLEAN_PY="/usr/local/sbin/db-clean-aisql.py"
+DB_CLEAN_LOG="/var/log/corp-db-clean.log"
 NOTIFY_LABEL="com.tradesoft.corp-notify"
 NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
 NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
@@ -114,6 +119,18 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
   launchctl unload "$CLEAN_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$CLEAN_PLIST"
+
+echo "==> Установка демона очистки БД aisql (corp-db-clean)..."
+cp "$DIR/db-clean-aisql.sh" "$DB_CLEAN_SCRIPT"
+chmod 755 "$DB_CLEAN_SCRIPT"
+cp "$DIR/db-clean-aisql.py" "$DB_CLEAN_PY"
+chmod 755 "$DB_CLEAN_PY"
+cp "$DIR/com.tradesoft.corp-db-clean.plist" "$DB_CLEAN_PLIST"
+: > "$DB_CLEAN_LOG" 2>/dev/null || true
+if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+  launchctl unload "$DB_CLEAN_PLIST" 2>/dev/null || true
+fi
+launchctl load -w "$DB_CLEAN_PLIST"
 
 echo "==> Установка юзер-агента уведомлений (corp-notify, LaunchAgent $NOTIFY_UID)..."
 cp "$DIR/corp-notify.sh" "$NOTIFY_SCRIPT"
@@ -220,6 +237,20 @@ else
   fail=1
 fi
 
+if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+  echo "  [OK]   демон $DB_CLEAN_LABEL загружен"
+else
+  echo "  [FAIL] демон $DB_CLEAN_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$DB_CLEAN_SCRIPT" ] && [ -x "$DB_CLEAN_PY" ]; then
+  echo "  [OK]   скрипт $DB_CLEAN_SCRIPT"
+else
+  echo "  [FAIL] скрипт $DB_CLEAN_SCRIPT отсутствует"
+  fail=1
+fi
+
 if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
   echo "  [OK]   юзер-агент $NOTIFY_LABEL загружен"
 else
@@ -270,6 +301,7 @@ if [ "$fail" -eq 0 ]; then
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
   echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
   echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
+  echo "Очистка БД aisql по заявкам Б24 — corp-db-clean (ежедневно 03:00, /var/log/corp-db-clean.log)."
   echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
 else
   echo
