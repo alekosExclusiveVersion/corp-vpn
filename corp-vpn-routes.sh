@@ -64,13 +64,34 @@ host_ip() {
   # 198.20.0.0/15 = 198.18-19.x, 198.20-21.x). Если DNS перехвачен Karing
   # (fake-IP), такие адреса попадали в STATE и протаскивались host-маршрутами
   # через ppp0 — мёртвые (не через utun). Проверено 09.09.2026.
-  dig +short +time=1 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
+  #
+  # При активном туннеле (iface=ppp0) сначала опрашиваем корп. DNS напрямую с
+  # источника ppp (dig -b): такой запрос уходит через ppp0 и НЕ перехватывается
+  # Karing fake-IP, поэтому для доменов вида parts-opt.com получаем реальный IP
+  # и вешаем правильный /32 через ppp. Системный dig — только резерв.
+  pc_ips="$(corp_resolve "$1")"
+  { [ -n "$pc_ips" ] && printf '%s\n' "$pc_ips"; dig +short +time=1 +tries=1 "$1" A 2>/dev/null; } |
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' |
     while read -r ip; do
       case "$ip" in
         198.1[89].*|198.2[01].*) continue ;;
       esac
       printf '%s\n' "$ip"
     done
+}
+
+# Резолв через корп. DNS (DNS_HOSTS), исходящий адрес = адрес корп. интерфейса.
+# Работает только при поднятом туннеле и возвращает пустое значение иначе.
+corp_resolve() {
+  local src dns out
+  [ -n "$iface" ] || return 1
+  src=$(ifconfig "$iface" 2>/dev/null | awk '/^[[:space:]]*inet /{print $2; exit}')
+  [ -n "$src" ] || return 1
+  for dns in $DNS_HOSTS; do
+    out=$(dig -b "$src" +short +time=1 +tries=1 "@$dns" "$1" A 2>/dev/null)
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
 }
 
 ip2int() {
