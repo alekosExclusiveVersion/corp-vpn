@@ -12,6 +12,7 @@ LOCAL_ROUTES=""
 MYSQL_HOSTS="p7ru1.tradesoft.ru p7ru2.tradesoft.ru p7ru3.tradesoft.ru p7ru4.tradesoft.ru p7ru5.tradesoft.ru p7ru8.tradesoft.ru p5g21.tradesoft.ru p5g25.tradesoft.ru p5g29.tradesoft.ru ext4.tradesoft.ru"
 DNS_HOSTS="192.168.0.210 192.168.0.220"
 SITE_DOMAINS="www.amry.ru"
+SITE_CRITICAL=""
 PROBE_HOSTS="sup5.tradesoft.corp:4000 projects.prj:80 servicedesk-report.office.tradesoft.ru:443"
 AUTO_SITE_DOMAINS=""
 if [ -f "$CONF" ]; then
@@ -345,6 +346,16 @@ add_routes() {
   for ip in $DNS_HOSTS; do
     add_host_route "$ip"
     echo "$ip" >> "$STATE"
+  done
+  # Критичные бизнес-домены (в т.ч. админка parts-opt.com) — сразу после DNS.
+  # Их /32 должен быть пинован с первой секунды пересборки: иначе длинный
+  # последовательный резолв SITE_DOMAINS (~288 доменов, 40+с) держит админку
+  # без маршрута через ppp и трафик уходит на Karing.
+  for h in $SITE_CRITICAL; do
+    for ip in $(host_ip "$h"); do
+      add_host_route "$ip"
+      echo "$ip" >> "$STATE"
+    done
   done
   for h in $MYSQL_HOSTS; do
     for ip in $(host_ip "$h"); do
