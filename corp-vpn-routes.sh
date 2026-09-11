@@ -338,17 +338,19 @@ add_routes() {
     route -n add -net "$r" -interface "$iface" >/dev/null 2>&1
   done
   : > "$STATE"
+  # Корп. DNS-серверы строго через ppp ПЕРВЫМИ: закрепляем их раньше, чем
+  # начнём резолвить домены (MYSQL_SITE). Иначе при первом цикле после подъёма
+  # туннеля host_ip()/corp_resolve() не имеет маршрута через ppp до DNS и запрос
+  # уходит через Karing (fake-IP), а не в корп. DNS.
+  for ip in $DNS_HOSTS; do
+    add_host_route "$ip"
+    echo "$ip" >> "$STATE"
+  done
   for h in $MYSQL_HOSTS; do
     for ip in $(host_ip "$h"); do
       add_host_route "$ip"
       echo "$ip" >> "$STATE"
     done
-  done
-  # Корп. DNS-серверы строго через ppp: перебиваем устаревший /32 через en0,
-  # иначе резолвинг корп. доменов при активном VPN не работает.
-  for ip in $DNS_HOSTS; do
-    add_host_route "$ip"
-    echo "$ip" >> "$STATE"
   done
   for h in $SITE_DOMAINS $AUTO_SITE_DOMAINS; do
     for ip in $(host_ip "$h"); do
