@@ -18,7 +18,7 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 добавляются автоматически: по PTR-записи исходящих соединений он определяет
 сайты на корп. хостинге Tradesoft и **навсегда** дописывает их в строку
 `SITE_DOMAINS` установленного конфига (`/usr/local/etc/corp-networks.conf`)
-и его репозиторной копии (`~/corp-vpn/corp-networks.conf`). Для немедленного
+  и его репозиторной копии (`~/Work/scripts/corp-vpn/corp-networks.conf`). Для немедленного
 применения (не дожидаясь 300-сек цикла основного демона) домен параллельно
 попадает в `corp-networks-auto.conf` (AUTO_SITE_DOMAINS), который маршрутный
 демон подхватывает в течение секунд. Git-коммит найденных доменов остаётся
@@ -141,19 +141,18 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
 - Состояние: `launchctl list | grep corp-bridge` → PID процесса.
 
 ### 3.3. Управление корп. VPN — `corp-vpn.sh`
-Канонический репозиторий — `~/corp-vpn` (на него указывают все пути ниже).
-> Внимание: существует старый дубль репо `~/Work/scripts/corp-vpn` (отстал от
-> канонического, на него всё ещё указывает симлинк `~/bin/corp-vpn.sh`).
-> Синхронизировать при необходимости; в новых установках использовать `~/corp-vpn`.
+Канонический репозиторий — `~/Work/scripts/corp-vpn` (на него указывают все
+пути ниже). Симлинки `~/bin/corp-vpn.sh` и `~/bin/socks-bridge.py` ведут на
+него. Рантайм-копии демонов — строго `/usr/local/sbin` (грузит `install.sh`).
 
 Команды:
-- `~/corp-vpn/corp-vpn.sh status` — состояние: корп. туннель (по ppp0 + ping
-  корп. шлюза `192.168.160.1`), мост (порт 1082 — устаревший компонент), Karing,
-  маршруты 10/192.168.
-- `~/corp-vpn/corp-vpn.sh start [vpn]` — CLI-подключение
+- `~/Work/scripts/corp-vpn/corp-vpn.sh status` — состояние: корп. туннель
+  (по ppp0 + ping корп. шлюза `192.168.160.1`), мост (порт 1082 — устаревший
+  компонент), Karing, маршруты 10/192.168.
+- `~/Work/scripts/corp-vpn/corp-vpn.sh start [vpn]` — CLI-подключение
   (`scutil --nc start`). **Может не сработать**: keychain PSK; для L2TP
   работает `networksetup -connectpppoeservice` (см. §6 п. 2).
-- `~/corp-vpn/corp-vpn.sh stop [vpn]` — отключение.
+- `~/Work/scripts/corp-vpn/corp-vpn.sh stop [vpn]` — отключение.
 - VPN по умолчанию: `vpn3-ts` (допустимы vpn1-ts, vpn2-ts, vpn4-ts).
 
 ### 3.4. Конфигурация Karing
@@ -313,7 +312,7 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 
 ### 3.7. Единый конфиг — `corp-networks.conf`
-- Источник: `~/corp-vpn/corp-networks.conf`, устанавливается
+- Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
   `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`.
@@ -380,9 +379,8 @@ Wi-Fi не завершается (сеть глушит L2TP-в-ESP). На др
 ### 3.8.1. Демон маршрутизации при корп. Wi-Fi — `corp-wifi-routes.sh`
 - LaunchDaemon `com.tradesoft.corp-wifi-routes` (root, проверяет каждые 10–30 с).
 - Файлы: `/Library/LaunchDaemons/com.tradesoft.corp-wifi-routes.plist`,
-  `/Users/aleksei/corp-vpn/corp-wifi-routes.sh` — демон запускает КАНОНИЧЕСКИЙ
-  репо-файл, установка на машину не копирует. Дубль: `~/Work/scripts/corp-vpn/`.
-  `/usr/local/sbin/corp-wifi-routes.sh` — устаревшая копия, **не используется**.
+  `/usr/local/sbin/corp-wifi-routes.sh` (копируется из репо `install.sh`).
+  Источник: `~/Work/scripts/corp-vpn/corp-wifi-routes.sh`.
 - **Проблема**: при подключении к корп. Wi-Fi (`192.168.128.0/24`) Karing
   перехватывает DNS и возвращает fake-node IP (`198.20.x.x`) вместо реальных
   корп. IP, а виртуальные адреса корп. хостов, лежащих в той же `/24`, шлются
@@ -626,10 +624,10 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 ## 7. Операции
 
 - **Включить всё**: 1) корп. VPN через System Settings (или
-  `~/corp-vpn/corp-vpn.sh start`), 2) включить Karing,
+  `~/Work/scripts/corp-vpn/corp-vpn.sh start`), 2) включить Karing,
   3) маршруты до корп. ресурсов автоматически добавит демон (§3.6), проверить
   `route -n get 185.137.232.115 | grep interface` → `ppp0`.
-- **Статус**: `~/corp-vpn/corp-vpn.sh status`.
+- **Статус**: `~/Work/scripts/corp-vpn/corp-vpn.sh status`.
 - ~~**Перезапуск моста**~~ (устарело — мост выведен и удалён из launchd, §3.1).
 - **Перезапуск sleepwatcher**:
   `brew services restart sleepwatcher`
@@ -806,10 +804,9 @@ aleksei) читает новые строки по байтовому указа
   200 без туннеля; Karing восстановлен, маршруты чисты.
 - Корп VPN (`vpn2-ts`): пpp0 up, `10.0.0.0/8` и `192.168.0.0/16 → ppp0` есть
   (в netstat `10 → ppp0`), `projects.prj:80` 200, `192.168.0.210:53` 200.
-- Демоны работают из `/usr/local/sbin/` (корни, 08.09 15:14) и
-  `/Users/aleksei/corp-vpn/corp-wifi-routes.sh`; канонический репозиторий —
-  `~/corp-vpn` (plist ссылается напрямую), `~/Work/scripts/corp-vpn` — рабочая
-  копия.
+- Демоны работают из `/usr/local/sbin/` (корни, 08.09 15:14), включая
+  `corp-wifi-routes.sh`; канонический репозиторий — `~/Work/scripts/corp-vpn`,
+  plist ссылается на `/usr/local/sbin`.
 - После фикса parts-catalogs (§9.8): `api.parts-catalogs.com` через Karing →
   `chains=[direct_out]` (clash API), доступ к сервису восстановлен.
 - Реальное срабатывание `corp-routes-clean` (§9.6.1): корп Wi-Fi → дом,

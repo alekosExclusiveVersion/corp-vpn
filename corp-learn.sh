@@ -19,7 +19,7 @@
 
 CONF=/usr/local/etc/corp-networks.conf
 AUTO_CONF=/usr/local/etc/corp-networks-auto.conf
-REPO_CONF=/Users/aleksei/corp-vpn/corp-networks.conf
+REPO_CONF=/Users/aleksei/Work/scripts/corp-vpn/corp-networks.conf
 
 # Значения по умолчанию, если CONF не установлен
 DOMAIN_SUFFIX=".tradesoft.ru .tradesoft.pro .tradesoft.corp"

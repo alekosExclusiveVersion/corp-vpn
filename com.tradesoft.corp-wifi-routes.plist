@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
-        <string>/Users/aleksei/corp-vpn/corp-wifi-routes.sh</string>
+        <string>/usr/local/sbin/corp-wifi-routes.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -21,6 +21,6 @@
     <key>StandardErrorPath</key>
     <string>/var/log/corp-wifi-routes.stderr.log</string>
     <key>WorkingDirectory</key>
-    <string>/Users/aleksei/corp-vpn</string>
+    <string>/usr/local/sbin</string>
 </dict>
 </plist>
