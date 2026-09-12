@@ -14,6 +14,9 @@ DNS_HOSTS="192.168.0.210 192.168.0.220"
 SITE_DOMAINS="www.amry.ru"
 SITE_CRITICAL=""
 PROBE_HOSTS="sup5.tradesoft.corp:4000 projects.prj:80 servicedesk-report.office.tradesoft.ru:443"
+# Критичные корп. хосты (RDP/1С/рабочие станции), указываются IP: держим
+# /32-маршрут через корп. интерфейс всегда, не дожидаясь резолва доменов.
+PROTECT_HOSTS=""
 AUTO_SITE_DOMAINS=""
 if [ -f "$CONF" ]; then
   . "$CONF"
@@ -30,6 +33,25 @@ SIGNALED_VPN_STATE="${CORP_SIGNALS_VPN_STATE:-/var/run/corp-vpn-signals.vpn}"
 # Сигнальная очередь для юзер-агента уведомлений (corp-notify.sh).
 # Строка: ts|event|message.
 signal() { echo "$(date '+%Y-%m-%d %H:%M:%S')|$1|$2" >> "$SIGNALS"; }
+
+# Диагностический лог демона: причины решений (пересборки, кулдауны, DEAD),
+# действия sweep'а, периодический STATUS. Кольцевой (хранит последние DIAG_MAX
+# строк); из-за размера всегда доступен в /var/log/corp-vpn-routes.diag.log.
+DIAG_LOG=/var/log/corp-vpn-routes-diag.log
+DIAG_MAX=3000
+LOG_TAG="corp-vpn-routes"
+
+diag() {
+  ev=$1; shift
+  line="$(date '+%Y-%m-%d %H:%M:%S')|$ev|iface=${iface:-none}|session=${last_session:-none}|$*"
+  if [ -f "$DIAG_LOG" ] || touch "$DIAG_LOG" 2>/dev/null; then
+    echo "$line" >> "$DIAG_LOG"
+    if [ "$(wc -l < "$DIAG_LOG" 2>/dev/null || echo 0)" -gt "$DIAG_MAX" ]; then
+      tail -n "$DIAG_MAX" "$DIAG_LOG" > "$DIAG_LOG.tmp" 2>/dev/null && mv "$DIAG_LOG.tmp" "$DIAG_LOG" 2>/dev/null
+    fi
+  fi
+  logger -t "$LOG_TAG" "$ev $*"
+}
 
 # Сигнал смены состояния корп. VPN: только при реальном переходе up<->down
 # (не при переподключении в рамках сессии и не при ложном Connected).
@@ -232,7 +254,23 @@ EOF
   done < "$LOCAL_STATE"
 }
 
+# Живость корп. пути. Пробы по возрастанию надёжности:
+#  1) ICMP из-под ppp0 (src = IP туннеля) до корп. DNS со /32, уже
+#     пинованными через ppp — проходит даже если Karing перебил остальные
+#     маршруты/резолв; раньше именно такие ложные DEAD роняли туннель;
+#  2) TCP до IP из probe-записей STATE (пинованы через ppp);
+#  3) TCP до IP PROBE_HOSTS, резолв через корп. DNS (fallback).
 tunnel_alive() {
+  if [ -n "$iface" ]; then
+    srvip=$(ifconfig "$iface" 2>/dev/null | awk '/^[[:space:]]*inet /{print $2; exit}')
+    if [ -n "$srvip" ]; then
+      for h in $DNS_HOSTS; do
+        if ping -c 1 -t 2 -S "$srvip" "$h" >/dev/null 2>&1; then
+          return 0
+        fi
+      done
+    fi
+  fi
   if [ -f "$STATE" ]; then
     while IFS= read -r line; do
       case "$line" in
@@ -246,20 +284,72 @@ tunnel_alive() {
     done < "$STATE"
   fi
   for hp in $PROBE_HOSTS; do
-    h=${hp%:*}
-    p=${hp##*:}
-    if nc -z -G 3 "$h" "$p" >/dev/null 2>&1; then
-      return 0
-    fi
+    h=${hp%:*}; p=${hp##*:}
+    for ip in $(host_ip "$h" 2>/dev/null); do
+      [ -n "$ip" ] || continue
+      if nc -z -G 3 "$ip" "$p" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
   done
   return 1
+}
+
+# Троттлинг логов живости: пишем только при смене alive<->dead, чтобы не
+# заливать лог каждые 10с.
+report_alive() {
+  if [ "$1" = yes ] && [ "$_prev_alive" != yes ]; then
+    diag ALIVE "corp path restored (icmp/tcp probe ok)"
+  elif [ "$1" = no ] && [ "$_prev_alive" != no ]; then
+    diag DEAD "all corp probes failed"
+  fi
+  _prev_alive=$1
 }
 
 route_via_ppp() {
   route -n get "$1" 2>/dev/null | grep -q 'interface: ppp'
 }
 
+# Проверка IP внутри CIDR-подсети.
+in_subnet() {
+  ip=$1; cidr=$2
+  mask=$(cidr_mask "${cidr#*/}")
+  net=$(cidr_net "$cidr")
+  [ $(( $(ip2int "$ip") & $(ip2int "$mask") )) -eq $(( $(ip2int "$net") & $(ip2int "$mask") )) ]
+}
+
+in_any_subnet() {
+  ip=$1; space=$2
+  [ -n "$space" ] || return 1
+  for c in $space; do
+    in_subnet "$ip" "$c" && return 0
+  done
+  return 1
+}
+
+# Удаляет хост-маршруты (/32) внутри NET_ROUTES, которые сторонние
+# туннели (Karing, utun) привязали к utun*. Принцип: найти все корп. /32
+# в таблице с netif utun* и удалить — это снимает перехват Karing.
+# Далее assert_routes/add_routes вернут нужный /32 через ppp (или en0
+# при прямом подключении).
+sweep_corp_hijacks() {
+  rem=""
+  for dest in $(netstat -rn -f inet 2>/dev/null |
+                awk '$1!~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// &&
+                     $1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+                     $NF~/^utun/ {print $1}'); do
+    in_any_subnet "$dest" "$NET_ROUTES" || continue
+    in_any_subnet "$dest" "$LOCAL_ROUTES" && continue
+    if route -n delete -host "$dest" >/dev/null 2>&1; then
+      rem="$rem $dest"
+    fi
+  done
+  [ -n "$rem" ] && diag SWEEP "removed_utun32:$rem"
+}
+
 del_routes() {
+  reason=${1:-manual}
+  diag ROUTES_DEL "reason=$reason"
   if [ -f "$STATE" ]; then
     while IFS= read -r line; do
       case "$line" in
@@ -294,41 +384,61 @@ EOF
 # Удаляет чужой маршрут и добавляет свой.
 add_host_route() {
   ip="$1"
+  # Маршрут уже стоит через корп. интерфейс? Тогда "чинить" нечего.
+  # НЕЛЬЗЯ возвращать 0: демон посчитает это успешным ремонтом и заспамит
+  # ASSERT "repaired" всем STATE каждые 5с (EEXIST -> ложный успех if).
+  if route_via_ppp "$ip"; then
+    return 1
+  fi
   if route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1; then
     return 0
   fi
-  if ! route_via_ppp "$ip"; then
-    route -n delete -host "$ip" >/dev/null 2>&1
-    route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1
-  fi
+  # Ни через ppp, ни напрямую нет — переустанавливаем: удаляем чужой /32
+  # (утен-пин Karing/иных) и закрепляем свой.
+  route -n delete -host "$ip" >/dev/null 2>&1
+  route -n add -host "$ip" -interface "$iface" >/dev/null 2>&1
+  return $?
 }
 
 # Каждые 5с перепроверяет маршруты из STATE и возвращает на корп. интерфейс
-# всё, что Karing/иные туннели успели перебить.
+# всё, что Karing/иные туннели успели перебить. Плюс sweep: вычищает свежие
+# чужые utun-пины корп. /32 (Karing их ставит каждые ~секунды).
+#
+# Эффективность: один снапшот таблицы (netstat) вместо route -n get на каждый
+# из ~600 хостов STATE (в старом варианте цикл делал ~600 fork'ов каждые 5с).
 assert_routes() {
-  # Сетевые маршруты корп. зон всегда через ppp.
+  sweep_corp_hijacks
+  fixed=""
+  ppp_hosts=$(netstat -rn -f inet 2>/dev/null |
+              awk '$NF=="ppp0" && $1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ {print $1}' | sort -u)
   for r in $NET_ROUTES; do
     probe=$(cidr_net "$r")
     if ! route_via_ppp "$probe"; then
       route -n delete -net "$r" >/dev/null 2>&1
-      route -n add -net "$r" -interface "$iface" >/dev/null 2>&1
+      if route -n add -net "$r" -interface "$iface" >/dev/null 2>&1; then
+        fixed="$fixed net:$r"
+      fi
     fi
   done
-  [ -f "$STATE" ] || return 0
+  [ -f "$STATE" ] || { [ -n "$fixed" ] && diag ASSERT "repaired:$fixed"; return 0; }
   while IFS= read -r ip; do
     case "$ip" in
-      probe:*|local:*) continue ;;
-      "") continue ;;
-      \#*) continue ;;
+      ""|\#*|*:* ) continue ;;
+      *[!0-9.]* ) continue ;;
     esac
-    if ! route_via_ppp "$ip"; then
-      add_host_route "$ip"
+    case " $ppp_hosts " in
+      *" $ip "*) continue ;;
+    esac
+    if add_host_route "$ip"; then
+      fixed="$fixed $ip"
     fi
   done < "$STATE"
+  [ -n "$fixed" ] && diag ASSERT "repaired:$fixed"
 }
 
 add_routes() {
   iface="$1"
+  diag ROUTES_ADD "iface=$iface"
   # Восстанавливаем сетевые маршруты корп. зон через ppp: удаляем чужие
   # (en0/utun/Karing), затем добавляем свои. Приоритет у ppp0.
   for r in $NET_ROUTES; do
@@ -344,6 +454,12 @@ add_routes() {
   # туннеля host_ip()/corp_resolve() не имеет маршрута через ppp до DNS и запрос
   # уходит через Karing (fake-IP), а не в корп. DNS.
   for ip in $DNS_HOSTS; do
+    add_host_route "$ip"
+    echo "$ip" >> "$STATE"
+  done
+  # Критичные корп. хосты (RDP/1С/рабочие станции) — /32 сразу через ppp,
+  # не зависят от резолва и прокидываются до длинной пересборки доменов.
+  for ip in $PROTECT_HOSTS; do
     add_host_route "$ip"
     echo "$ip" >> "$STATE"
   done
@@ -372,7 +488,7 @@ add_routes() {
   for hp in $PROBE_HOSTS; do
     h=${hp%:*}
     p=${hp##*:}
-    ip=$(host_ip "$h")
+    ip=$(host_ip "$h" 2>/dev/null | head -1)
     [ -n "$ip" ] || continue
     echo "probe:$ip:$p" >> "$STATE"
   done
@@ -398,6 +514,8 @@ fail=0
 dead_until=0
 last_probe=0
 last_local_snap=0
+last_diag=0
+_prev_alive=""
 # Инициализируем маркер состояния VPN фактическим статусом при старте,
 # чтобы не слать лишний сигнал up/down в момент перезапуска демона.
 if find_iface >/dev/null 2>&1; then
@@ -410,15 +528,25 @@ while true; do
   iface=$(find_iface)
   session=$(vpn_session_id)
 
+  if [ $((now - last_diag)) -ge 60 ]; then
+    last_diag=$now
+    defs=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF}' | tr '\n' ',')
+    corps=$(netstat -rn -f inet 2>/dev/null | awk '$NF=="ppp0" && ($1 ~ /^192\.168\.0(\/16)?$/ || $1 ~ /^10(\/8)?$/) {n++} END{print n+0}')
+    hij=$(netstat -rn -f inet 2>/dev/null | awk '$1~/^(192\.168|10)\./ && $1!~/\// && $NF~/^utun/{n++} END{print n+0}')
+    diag STATUS "defaults=[$defs] net_routes_ppp=$corps utun_hijacks=$hij"
+  fi
+
   # Кулдаун после ложного Connected: не доверяем configd,
   # возвращаем маршруты только когда туннель снова отвечает на пробы.
   if [ "$now" -lt "$dead_until" ]; then
     if [ $((now - last_probe)) -ge 10 ]; then
       last_probe=$now
       if tunnel_alive; then
+        report_alive yes
         dead_until=0
         fail=0
       else
+        report_alive no
         iface=""
       fi
     else
@@ -437,7 +565,7 @@ while true; do
     # Пересобираем маршруты если: сменился интерфейс, сменился IP сессии
     # (VPN переподключился — даже если имя то же ppp0), либо прошло 300с.
     if [ "$iface" != "$last_iface" ] || [ "$session" != "$last_session" ] || [ $((now - last_resolve)) -ge 300 ]; then
-      del_routes
+      del_routes "reassembly"
       add_routes "$iface"
       last_iface="$iface"
       last_session="$session"
@@ -451,12 +579,12 @@ while true; do
       new_auto=$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" 2>/dev/null | tr '\n' ' ')
       if [ "$new_auto" != "$AUTO_SITE_DOMAINS" ]; then
         AUTO_SITE_DOMAINS=$new_auto
-        del_routes
+        del_routes "auto-config-changed"
         add_routes "$iface"
       fi
     fi
   elif [ -n "$last_iface" ] || [ -f "$STATE" ]; then
-    del_routes
+    del_routes "vpn-down"
     last_iface=""
     fail=0
     signal_vpn_transition "down"
@@ -466,11 +594,13 @@ while true; do
   if [ -n "$last_iface" ] && [ $((now - last_probe)) -ge 10 ]; then
     last_probe=$now
     if tunnel_alive; then
+      report_alive yes
       fail=0
     else
+      report_alive no
       fail=$((fail + 1))
       if [ "$fail" -ge 2 ]; then
-        del_routes
+        del_routes "probe-dead"
         last_iface=""
         fail=0
         dead_until=$((now + 60))

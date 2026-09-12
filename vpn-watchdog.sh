@@ -125,11 +125,22 @@ en0_ip() {
     ipconfig getifaddr en0 2>/dev/null
 }
 
-# "Туннель жив": оба корп. таргета отвечают (через ppp0). Корп Wi-Fi изолирован,
-# поэтому недоступность обоих = туннель мёртв, а не сеть.
+# "Туннель жив": ICMP-эхо из-под ppp0 (src = IP туннеля) до корп. DNS.
+# НЕ используем TCP:53/UDP:53 — корп. DNS фильтрует TCP-запросы на 53,
+# отчего старая проба всегда "взводила" ложный dead tunnel и watchdog
+# каждые 30с молотил перезапуск (рестарт -> флап маршрутов -> чёрная дыра
+# для RDP). ICMP по /32 через ppp0 — проверенный стабильный критерий.
 tunnel_alive() {
-    nc -z -G 3 "$PROBE_DNS_IP" "$PROBE_DNS_PORT" >/dev/null 2>&1 || return 1
-    nc -z -G 3 "$PROBE_HOST" "$PROBE_PORT" >/dev/null 2>&1
+    local srvip ok=""
+    srvip=$(ifconfig ppp0 2>/dev/null | awk '/^[[:space:]]*inet /{print $2; exit}')
+    [ -n "$srvip" ] || return 1
+    for d in 192.168.0.210 192.168.0.220; do
+        if ping -c 1 -t 3 -S "$srvip" "$d" >/dev/null 2>&1; then
+            ok=1
+            break
+        fi
+    done
+    [ -n "$ok" ]
 }
 
 # Принудительный перезапуск профиля (сброс stale-состояния + подъём заново).
