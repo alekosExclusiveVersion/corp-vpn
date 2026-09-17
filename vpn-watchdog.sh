@@ -93,6 +93,27 @@ is_corp_wifi() {
     [ "$verdict" = "corp" ]
 }
 
+# Подключены ли к корп. сети по LAN-кабелю (проводное соединение).
+# Ищем на НЕ-Wi-Fi интерфейсах (en0 = Wi-Fi) IP из корп. подсети 192.168.128.0/24.
+# Проводные интерфейсы на этой машине — en4/en5/en6 (Thunderbolt Dock) и bridge0.
+# Если любой не-Wi-Fi интерфейс получил корп. IP — LAN-кабель воткнут в корп. сеть,
+# корп. ресурсы доступны напрямую, VPN не нужен.
+is_corp_lan() {
+    local iface ip
+    for iface in $(ifconfig -lu 2>/dev/null); do
+        # Пропускаем Wi-Fi (en0), туннели и служебные интерфейсы macOS,
+        # чтобы ловить именно проводные Ethernet-интерфейсы.
+        case "$iface" in
+            en0|lo|utun*|gif*|stf*|anpi*|awdl*|llw*|ppp*|vnic*|ap*) continue ;;
+        esac
+        ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+        if [ -n "$ip" ] && printf '%s' "$ip" | grep -qE '^192\.168\.128\.'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Корп. DNS и первый host:port из PROBE_HOSTS (обязаны маршрутизироваться через ppp0).
 PROBE_DNS_IP="192.168.0.210"
 PROBE_DNS_PORT=53
@@ -162,9 +183,11 @@ restart_profile() {
     return 1
 }
 
-# --- Корп. Wi-Fi: VPN не поднимаем ---
-# На корп. Wi-Fi L2TP/IPSec не работает (сеть глушит L2TP-в-ESP). Если профиль там
-# числится Connected — это зомби/бесполезный туннель, гасим его и не пытаемся поднять.
+# --- Корп. Wi-Fi или LAN: VPN не поднимаем ---
+# На корп. Wi-Fi L2TP/IPSec не работает (сеть глушит L2TP-в-ESP). На корп. LAN
+# (проводное подключение) корп. ресурсы доступны напрямую — VPN не нужен.
+# В обоих случаях, если профиль числится Connected — это зомби/бесполезный
+# туннель, гасим его и не пытаемся поднять.
 if is_corp_wifi; then
     for p in $PROFILES; do
         if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
@@ -173,6 +196,17 @@ if is_corp_wifi; then
         fi
     done
     logger "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped"
+    exit 0
+fi
+
+if is_corp_lan; then
+    for p in $PROFILES; do
+        if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
+            scutil --nc stop "$p" 2>/dev/null
+            logger "corp-vpn: $p torn down on corp LAN (wired, resources accessible directly)"
+        fi
+    done
+    logger "corp-vpn: on corp LAN (wired) — VPN auto-connect skipped"
     exit 0
 fi
 

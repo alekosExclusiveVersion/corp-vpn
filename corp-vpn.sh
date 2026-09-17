@@ -57,6 +57,18 @@ start() {
         echo "Корп. туннель уже поднят."
         return 0
     fi
+    # Проводное подключение к корп. сети: VPN не нужен, ресурсы доступны напрямую.
+    for iface in $(ifconfig -lu 2>/dev/null); do
+        case "$iface" in
+            en0|lo|utun*|gif*|stf*|anpi*|awdl*|llw*|ppp*|vnic*|ap*) continue ;;
+        esac
+        ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+        if [ -n "$ip" ] && printf '%s' "$ip" | grep -qE '^192\.168\.128\.'; then
+            echo "Обнаружено проводное подключение к корп. сети ($iface: $ip)."
+            echo "VPN не требуется — корп. ресурсы доступны напрямую."
+            return 0
+        fi
+    done
     echo "Подключаю $VPN_NAME (CLI)..."
     scutil --nc start "$VPN_NAME" 2>/dev/null
     sleep 6
