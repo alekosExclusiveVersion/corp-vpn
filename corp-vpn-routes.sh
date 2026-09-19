@@ -18,6 +18,9 @@ PROBE_HOSTS="sup5.tradesoft.corp:4000 projects.prj:80 servicedesk-report.office.
 # /32-маршрут через корп. интерфейс всегда, не дожидаясь резолва доменов.
 PROTECT_HOSTS=""
 AUTO_SITE_DOMAINS=""
+# Хосты, разрешённые через параллельный туннель Tunnelblick (см. коммент в
+# corp-networks.conf). Заполняется там же; здесь пустая по умолчанию.
+PARALLEL_TUNNEL_HOSTS=""
 if [ -f "$CONF" ]; then
   . "$CONF"
 fi
@@ -340,6 +343,11 @@ sweep_corp_hijacks() {
                      $NF~/^utun/ {print $1}'); do
     in_any_subnet "$dest" "$NET_ROUTES" || continue
     in_any_subnet "$dest" "$LOCAL_ROUTES" && continue
+    # Хосты, разрешённые через параллельный туннель Tunnelblick (см.
+    # PARALLEL_TUNNEL_HOSTS в corp-networks.conf): их /32 через utun НЕ трогаем.
+    case " $PARALLEL_TUNNEL_HOSTS " in
+      *" $dest "*) continue ;;
+    esac
     if route -n delete -host "$dest" >/dev/null 2>&1; then
       rem="$rem $dest"
     fi
