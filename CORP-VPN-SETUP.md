@@ -202,6 +202,16 @@ SOCKS5-сервер на `127.0.0.1:1082` (Python 3, только stdlib).
   генератор `karing-rules.sh -i` (пишет в `karing_routing_group.json`, см. §3.7);
   правки UI сохраняются и применяются при переподключении TUN.
 
+**Уточнение 18.09.2026 (на полном рестарте Karing, не только reconnect):**
+  переживают перезапись только правки **групп** в `karing_routing_group.json`
+  (домены группы «🌏 GFW» сохранились) и `perapp.enable` в `karing_setting.json`.
+  Затираются: `dns.static_ips`/`dns.hosts` в обоих json и весь список-диверсия
+  `karing_subscribe_use.json` (кроме `select_default`). Полный рестарт =
+  `pkill` Karing + `scutil --nc stop "Karing (system)"` + `open -a Karing`; рестарт
+  только через `scutil --nc stop/start` конфиг не перечитывает. Ядро sing-box
+  работает внутри системного расширения `com.nebula.karing.karingServiceSE` —
+  перезапустить его отдельно нельзя. Подробности — §9.9.
+
 ### 3.5. Корпоративный VPN (система)
 - Сервисы: `vpn1-ts`, `vpn2-ts`, `vpn3-ts`, `vpn4-ts`; активен `vpn3-ts`.
 - Сервер: `vpn3.tradesoft.ru` (109.194.204.125), авторизация `a.koshkin`,
@@ -539,6 +549,8 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Корп. b24 (корп. Wi-Fi, без VPN, без hosts) | `curl -s -o /dev/null -w '%{http_code}' http://b24.tradesoft.ru` | `301` (жив) |
 | Автоподъём watchdog | `scutil --nc stop vpn3-ts` → через ≤60 с `scutil --nc status vpn3-ts` | `Connected` |
 | parts-catalogs.com → direct (09.09.2026) | clash API (secret из `service.json`) → `GET /connections`, фильтр по host `parts-catalogs.com` | `chains=[direct_out]` |
+| Ассистент подключён (18.09.2026) | clash API → `GET /connections`, фильтр host `id.xn--80akicokc0aablc…` | `chains=[🇬🇧 ⚡ Великобритания]` (нод) |
+| Durable-правки (18.09.2026) | «🌏 GFW» в `karing_routing_group.json` содержит `.service.ast`/`.xn--80akicokc0aablc…` и `karing_setting.json` `perapp.enable=false` | оба на месте после полного рестарта |
 | parts-catalogs.com /32 через ppp (при corp VPN) | `route -n get <IP parts-catalogs.com> \| grep interface` | `ppp0` |
 | corp-routes-clean реальное событие (09.09.2026) | `grep deleted /var/log/corp-routes-clean.log` | `deleted 192.168.128.123 (corp host через en* вне on-link)` |
 
@@ -843,3 +855,74 @@ aleksei) читает новые строки по байтовому указа
 **Проверка после фикса:** clash API `GET /connections`, фильтр host
 `parts-catalogs.com` → `chains=[direct_out]` (единственное активное соединение
 в момент диагностики).
+
+---
+
+## 10. Диагностика 18.09.2026: Ассистент «нет соединения» (ID-сервер `.service.ast` / fake-IP)
+
+**На чём воспроизводится:** Assistant.app (`ru.safib.assistant`, процессы
+`assistant`/`asts`/`astrct`) и Mango (`com.mangotele.mtalker.desktop`, процесс
+`M.TALKER`) теряют связь с серверами, когда включён Karing.
+
+### 10.1. Механика (что выяснено по логам приложения)
+
+- Ассистент ходит на ID-сервер двумя именами, в зависимости от кэшированного
+  состояния сеанса:
+  - `https://id.xn--80akicokc0aablc.xn--p1ai:443` — **публичный** домен,
+    A-запись `95.129.232.196` (запасной из кэша приложения `87.229.197.10`);
+  - `id-proxy.service.ast` — **непубличное** имя (публично NXDOMAIN), которое
+    в hijack-dns Karing получает fake-IP `198.20.0.x`.
+- Приложение коннектится с собственным кэшем `PriorIp=fake-IP` (`curl_slist =
+  id.xn–…:198.20.0.11`). fake-IP невозможно диа-лить напрямую: sing-box
+  восстанавливает домен, а для `id-proxy.service.ast` локальный резолв даёт
+  NXDOMAIN → «нет соединения» (лог `service_core.log`, 11:35: lookup failed for
+  id-proxy.service.ast: NXDOMAIN; dial через `direct_out`).
+- Когда трафик приложения идёт **через нод** (правило R11 «🌏 GFW»): sing-box
+  восстанавливает домен и передаёт его в нод; нод резолвит публичный punycode и
+  TLS проходит → регистрация успешна (`Registered in IdSrv=…:443`). Т.е.
+  «резолвит service.ast» не происходит — рабочий хост приложения —
+  публичный punycode-домен; `service.ast` через нод тоже отвечает TCP, но TLS по
+  нему отваливается по SNI.
+- **Главная причина прямого прохода в `direct_out`** — включённый **`perapp`**
+  (приложение было в списке `list_macos` при `is_include=false` → весь трафик
+  Ассистента/Mango уводился в direct). Как только `perapp.enable=false`,
+  трафик пошёл по правилам → R11 → нод → работает.
+
+### 10.2. Изменения (применены и пережили полный рестарт 14:05)
+
+- `karing_routing_group.json`, группа **«🌏 GFW»**: в `domain_suffix` добавлены
+  `.service.ast` и `.xn--80akicokc0aablc.xn--p1ai` → в сгенерированном
+  `service_core.json` правило R11 (`🌏 GFW[Самостоятельная настройка]`) уводит
+  их в выбранный нод (на 18.09.2026 — `🇬🇧 ⚡ Великобритания`).
+- `karing_setting.json`: `perapp.enable=false` (снято принудительное заворачивание
+  apps в direct).
+- Бэкапы: `karing_routing_group.json.bak.pre-idsrv.20260918-112904`,
+  `karing_setting.json.bak.pre-idsrv.20260918-112904`,
+  `service_core.json.bak.pre-staticips.*`.
+
+### 10.3. Что НЕ сработало (важно для будущих попыток)
+
+- `dns.static_ips`/`dns.hosts` — затираются Karing при каждом рестарте из
+  внутреннего хранилища (`cache.db`, бинарный; GUI пишет настройки сам);
+  инъекции в `service_core.json` ядро не перечитывает (конфиг приходит в
+  системное расширение через GUI, файл — только зеркало). Статические IP
+  ставятся **только через UI**: Настройки → DNS → «Прямой поток» → «Static IP»
+  (домен → IP). В текущем решении они **не нужны**.
+- Правки `karing_subscribe_use.json` (список-диверсия) — регенерируются и
+  затираются (переживает только `select_default`).
+
+### 10.4. Как проверить (регресс после любого рестарта Karing)
+
+```
+# 1) durable-правки на месте:
+grep -c 'service.ast' "~/Library/Group Containers/group.com.nebula.karing/karing_routing_group.json"   # >0
+python3 -c "import json;d=json.load(open('~/Library/Group Containers/group.com.nebula.karing/karing_setting.json',encoding='utf-8'));print(d['perapp']['enable'])"  # False
+# 2) живое соединение Ассистента идёт в нод, а не direct (пока Assistant открыт):
+#    clash API (secret в service_core.json → experimental.clash_api.secret),
+#    GET /connections, фильтр host id.xn--80akicokc0aablc… → chains=[🇬🇧 ⚡ Великобритания]
+```
+
+**Ограничение:** группа «🌏 GFW» уводит ID-трафик в выбранный нод. Если нод не
+резолвит/не достаёт ID-сервер — Ассистент снова «без соединения»; решение —
+выбрать в Karing нод, который достаёт сервер (Великобритания подтверждён), либо
+добавить домен → `95.129.232.196` через UI-статик IP (§3.4).
