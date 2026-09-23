@@ -52,6 +52,12 @@ if [ -f "$CONF" ]; then
   if [ -n "$cfg_vpn" ]; then
     VPN_SERVERS="$cfg_vpn"
   fi
+  # Корп. домены/серверы для sweep уten-пинов (refresh_corp_ips): их публичные
+  # IP после сна Karing перехватывает в utun, «На прямую» подхватывает поздно.
+  for v in SITE_DOMAINS SITE_CRITICAL MYSQL_HOSTS; do
+    val=$(grep -E "^$v=" "$CONF" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"')
+    [ -n "$val" ] && eval "$v=\"$val\""
+  done
 fi
 
 log() {
@@ -274,6 +280,54 @@ resolve_corp_dns() {
   dig @"$CORP_DNS" +short +time=2 +tries=1 "$1" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
 }
 
+# Кэш публичных IP корп. доменов (SITE_DOMAINS/SITE_CRITICAL/MYSQL_HOSTS,
+# резолв через корп. DNS). Используется sweep'ом, чтобы снимать utun-пины
+# Karing с этих адресов на корп. Wi-Fi (после сна правила Karing могут
+# перехватывать их, пока «На прямую» ещё не подхватил).
+CORP_IP_CACHE=/var/run/corp-wifi-corp-ip.state
+CORP_IP_REFRESH_SEC=300
+_corp_ip_last=0
+
+# Пересобирает кэш публичных IP корп. доменов. Только публичные адреса:
+# внутренние (10/8, 192.168/16) и VPN_SERVERS исключаем — их пины держит
+# корп. маршрутизация, а не Karing-direct.
+refresh_corp_ips() {
+  cache=""
+  for h in $SITE_DOMAINS $SITE_CRITICAL $MYSQL_HOSTS; do
+    for ip in $(resolve_corp_dns "$h"); do
+      is_corp_ip "$ip" && continue
+      cache="$cache $ip"
+    done
+  done
+  # Сохраняем уникальные IP (sort -u), чтобы sweep не гадал по вхождениям.
+  printf '%s\n' $cache | sort -u > "$CORP_IP_CACHE.tmp" 2>/dev/null
+  mv "$CORP_IP_CACHE.tmp" "$CORP_IP_CACHE" 2>/dev/null
+  log "refreshed corp-ip cache: $(wc -l < "$CORP_IP_CACHE" 2>/dev/null || echo 0) public IPs"
+}
+
+# Снимает utun-пины Karing с публичных IP корп. доменов (после сна/переинициализации
+# Karing они перехватываются в utun, «На прямую» может не подхватиться сразу).
+# Удаляем ТОЛЬКО те /32, чей адрес есть в кэше корп. доменов — чужие пины не трогаем.
+sweep_karing_pins() {
+  [ -f "$CORP_IP_CACHE" ] || return 0
+  corp_ips=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$CORP_IP_CACHE" 2>/dev/null | tr '\n' ' ')
+  rem=""
+  for dest in $(netstat -rn -f inet 2>/dev/null |
+                awk '$1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
+                     !/\/32/ && $NF~/^utun/ {print $1}'); do
+    case " $corp_ips " in
+      *" $dest "*) ;;
+      *) continue ;;
+    esac
+    # Не трогаем VPN_SERVERS и внутренние адреса (их пины ставим мы).
+    is_corp_ip "$dest" && continue
+    if route -n delete -host "$dest" >/dev/null 2>&1; then
+      rem="$rem $dest"
+    fi
+  done
+  [ -n "$rem" ] && log "swept karing utun-pins:$rem"
+}
+
 # Главный цикл
 log "Starting corp-wifi-routes.sh"
 : > "$STATE"
@@ -303,6 +357,17 @@ while true; do
 
     # Корп. серверы в той же /24 (sup5 192.168.128.123): через шлюз, не on-link
     add_gateway_host_routes
+
+    # Снимаем utun-пины Karing с публичных IP корп. доменов. После сна/переинициализации
+    # Karing перехватывает их в utun, а «На прямую» подхватывается не сразу — это даёт
+    # окно, когда корп. сайт/админка (например partpro.admin) идёт не через корп. сеть.
+    # Кэш пересобираем редко (раз в 5 мин), sweep — каждый цикл.
+    now_w=$(date +%s)
+    if [ $((now_w - _corp_ip_last)) -ge "$CORP_IP_REFRESH_SEC" ]; then
+      refresh_corp_ips
+      _corp_ip_last=$now_w
+    fi
+    sweep_karing_pins
 
     sleep 30
   else

@@ -330,24 +330,34 @@ in_any_subnet() {
   return 1
 }
 
-# Удаляет хост-маршруты (/32) внутри NET_ROUTES, которые сторонние
-# туннели (Karing, utun) привязали к utun*. Принцип: найти все корп. /32
-# в таблице с netif utun* и удалить — это снимает перехват Karing.
-# Далее assert_routes/add_routes вернут нужный /32 через ppp (или en0
-# при прямом подключении).
+# Удаляет хост-маршруты (/32), которые сторонние туннели (Karing, utun)
+# привязали к utun. Цель — корп. адреса: либо внутри NET_ROUTES, либо
+# закреплённые за корп. интерфейсом IP из STATE (в т.ч. публичные адреса
+# корп. доменов вроде partpro.ru — их Karing тоже перебивает). Удаляем чужой
+# utun-/32 — далее assert_routes/add_routes вернут нужный /32 через ppp
+# (или en0 при прямом подключении). IP из LOCAL_ROUTES и PARALLEL_TUNNEL_HOSTS
+# не трогаем.
 sweep_corp_hijacks() {
   rem=""
+  # Плоские IP из STATE (corp-хосты, распиненные через корп. интерфейс).
+  # При VPN up STATE содержит эти строки; см. add_routes.
+  state_ips=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$STATE" 2>/dev/null | tr '\n' ' ')
   for dest in $(netstat -rn -f inet 2>/dev/null |
                 awk '$1!~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// &&
                      $1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
                      $NF~/^utun/ {print $1}'); do
-    in_any_subnet "$dest" "$NET_ROUTES" || continue
     in_any_subnet "$dest" "$LOCAL_ROUTES" && continue
     # Хосты, разрешённые через параллельный туннель Tunnelblick (см.
     # PARALLEL_TUNNEL_HOSTS в corp-networks.conf): их /32 через utun НЕ трогаем.
     case " $PARALLEL_TUNNEL_HOSTS " in
       *" $dest "*) continue ;;
     esac
+    in_corp=0
+    in_any_subnet "$dest" "$NET_ROUTES" && in_corp=1
+    case " $state_ips " in
+      *" $dest "*) in_corp=1 ;;
+    esac
+    [ "$in_corp" -eq 1 ] || continue
     if route -n delete -host "$dest" >/dev/null 2>&1; then
       rem="$rem $dest"
     fi
