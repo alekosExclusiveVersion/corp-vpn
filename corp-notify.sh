@@ -19,6 +19,7 @@ SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
 POS="${CORP_NOTIFY_POS:-/tmp/corp-vpn-notify.pos}"
 SEEN="${CORP_NOTIFY_SEEN:-/tmp/corp-vpn-notify.seen}"
 MIN_GAP=30
+NOTIFY_PY="${MONITORING_NOTIFY:-$HOME/Work/scripts/monitoring/notify.py}"
 
 notify() {
   event=$1
@@ -36,6 +37,15 @@ notify() {
     *)                title="corp-vpn: $event" ;;
   esac
   osascript -e "display notification \"$msg\" with title \"$title\" sound name \"default\"" 2>/dev/null
+
+  # Дублируем события очистки БД aisql в B24 и Telegram (секреты — Keychain).
+  case "$event" in
+    db-clean.*)
+      if [ -x "/opt/homebrew/bin/python3" ] && [ -f "$NOTIFY_PY" ]; then
+        /opt/homebrew/bin/python3 "$NOTIFY_PY" "$title: $msg" "$title" >/dev/null 2>&1
+      fi
+      ;;
+  esac
 }
 
 recently_shown() {

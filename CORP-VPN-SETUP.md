@@ -851,6 +851,15 @@ aleksei) читает новые строки по байтовому указа
   (corp-vpn-diagd, только на переходе состояния);
 - `vpn.up` / `vpn.down` — корп VPN поднялся/отключился (corp-vpn-routes,
   только на смене `last_iface`; маркер `/var/run/corp-vpn-signals.vpn`).
+- `db-clean.ok` / `db-clean.dryrun` / `db-clean.fail` — результаты автоочистки
+  БД aisql (corp-db-clean, ежедневно 03:00; см. §9.9).
+
+События `db-clean.*`, помимо баннера, **дублируются в B24-чат и Telegram**:
+`corp-notify.sh` (работает от пользователя, поэтому доступен Keychain) вызывает
+`~/Work/scripts/monitoring/notify.py` (`db-clean.ok` → заголовок «aisql: БД
+удалены» и т.д.). Секреты каналов — Keychain (`opencode.tg-alert-*`; вебхук
+ts-b24), значения в скрипты не вшиты. Тот же `notify.py` использует сторож
+веб-проценки (`monitoring/pricing_alert.py`) — единая точка отправки.
 
 ### 9.7. Проверено 09.09.2026 (зелёное)
 - Корп-сеть: DHCP, `defs=[en0 utun4]`, Karing Connected, `api.opencode.ai=200`,
