@@ -27,7 +27,7 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 27.08.2026: найден и устранён корень провала корп. VPN на корп. Wi-Fi — публичные
 IP L2TP/IPSec серверов уходили в нод-туннель Karing (не было в direct-группе),
 теперь `VPN_SERVERS` закрепляются в Karing-direct (`karing-rules.sh`, репо
-`tradesoft-vpn-setup`) и `/32 → en0` (`corp-wifi-routes.sh`); корп. DNS
+`karing-rules.sh`) и `/32 → en0` (`corp-wifi-routes.sh`); корп. DNS
 `DNS_HOSTS` закрепляется `/32 → ppp0` (см. §3.7). Watchdog `vpn-watchdog.sh`
 переведён на рабочий метод `networksetup -connectpppoeservice` (scutil для L2TP
 не подключает) и проверен end-to-end через LaunchDaemon.
@@ -36,7 +36,7 @@ IP L2TP/IPSec серверов уходили в нод-туннель Karing (�
 без файла `/etc/hosts` (см. §3.4, §6.10). Из `corp-wifi-routes.sh` убран hosts-пин
 `b24.tradesoft.ru` в `/etc/hosts` (заменён Karing-direct, §3.8.1).
 22.09.2026: MySQL-хосты `MYSQL_HOSTS` добавлены в `ip_cidr` Karing-группы
-«На прямую» (`karing-rules.sh`, репо `tradesoft-vpn-setup`) — на корп. WiFi без
+«На прямую» (`karing-rules.sh`, репо `corp-vpn`) — на корп. WiFi без
 L2TP их трафик идёт в direct_out (иначе нод Karing, MySQL отвергает авторизацию
 по external IP); см. §3.4.
 23.09.2026: устранён сбой авторизации админки partpro.ru на корп. VPN:
@@ -380,7 +380,7 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   - демон маршрутов (ppp-маршруты, п. 3.6.2);
   - демон корп. Wi-Fi `corp-wifi-routes.sh` (маршруты через en0, п. 3.8.1;
     читает `VPN_SERVERS`);
-  - генератор правил Karing `karing-rules.sh` (репо `tradesoft-vpn-setup`);
+  - генератор правил Karing `karing-rules.sh` (репо `corp-vpn`);
     конфиг ищется в `/usr/local/etc`, затем `../corp-vpn/corp-networks.conf`.
 
 ### 3.7.1. Маршрутизация VPN-серверов (корп VPN на изолированной Wi-Fi)
@@ -396,7 +396,7 @@ IPSec-трафик (UDP 500/4500, ESP) через нод не проходит �
 VPN не устанавливается. Метод подключения тут ни при чём.
 
 **Решение (два уровня, оба определяются `VPN_SERVERS` в конфиге):**
-1. **Karing direct** — `karing-rules.sh` (репо `tradesoft-vpn-setup`) добавляет
+1. **Karing direct** — `karing-rules.sh` (репо `corp-vpn`) добавляет
    `VPN_SERVERS` в `ip_cidr` группы «На прямую» (direct_out). После применения
    (`./karing-rules.sh -i`) и reload'а Karing его IPSec-пакеты выпускаются
    напрямую через `en0`, а не в нод. Это устраняет гонку маршрутов.
@@ -524,7 +524,7 @@ default → ppp0  (VPN)       — корп.
   `sudo launchctl kickstart -k system/com.tradesoft.corp-wifi-routes`.
 
 ### 3.9. Сбор сайтов — `collect-sites.py` и пароль из Keychain
-`collect-sites.py` (репо `tradesoft-vpn-setup`) собирает домены сайтов из корп.
+`collect-sites.py` (репо `corp-vpn`) собирает домены сайтов из корп.
 MySQL-серверов (реестр `servers.json` приложения `parallels-sql-admins`;
 запускать через его venv) и подставляет результат в `SITE_DOMAINS`
 файла `corp-networks.conf`.

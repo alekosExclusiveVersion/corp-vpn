@@ -4,3 +4,7 @@ __pycache__/
 *.bak
 *.ccache
 logs/
+
+# Результаты сбора доменов сайтов (collect-sites.py)
+sites.txt
+sites-*.txt

@@ -1,0 +1,86 @@
+# Tradesoft VPN: правила Karing из корпоративной сети
+
+Генератор групп/правил для Karing (sing-box) из единого файла корпоративных
+сетей. Инфраструктура маршрутизации (демон `corp-vpn-routes.sh`, установщик)
+находится в репозитории **corp-vpn** (`~/Work/scripts/corp-vpn`) — смотрите там
+`CORP-VPN-SETUP.md`.
+
+## Что делает
+
+Из `corp-networks.conf` строит группы Karing (профиль «Самостоятельная
+настройка»):
+
+| Группа | Outbound | Назначение |
+|---|---|---|
+| `ts-network` | `direct_out` | вся корп. зона: домены (`DOMAINS`, `SITE_DOMAINS`, `MYSQL_HOSTS`), суффиксы `DOMAIN_SUFFIX`, IP (`NET_ROUTES`, `VPN_SERVERS`, MySQL) |
+| `На прямую` | `direct_out` | только личные правки пользователя (напр. `.yandex.ru`) |
+
+На корп. Wi-Fi группы намеренно нужны: L2TP там не поднимается (§3.6.1 в
+CORP-VPN-SETUP.md), поэтому корп. ресурсы идут в direct_out.
+
+Маршрутизация сайтов `SITE_DOMAINS` (сайты на корп. серверах):
+
+- **корп. VPN включён** — `/32`-маршрут через ppp добавляет демон
+  `corp-vpn-routes.sh`, трафик остаётся внутри L2TP;
+- **корп. VPN выключен** (в т.ч. корп. Wi-Fi) — сайт уходит в `direct_out`
+  (открывается напрямую).
+
+MySQL:
+
+- соединения идут **по IP без SNI**, поэтому domain-правило их не матчит —
+  нужен `ip_cidr`. Генератор резолвит `MYSQL_HOSTS` в IPv4 при каждом запуске
+  и добавляет их в `ip_cidr` группы `ts-network`;
+- при включённом корп. VPN ppp-маршруты демона специфичнее TUN, правило не
+  применяется (трафик идёт внутри L2TP);
+- на корп. Wi-Fi (без L2TP) MySQL выходит через `direct_out` с egress корп.
+  сети — сервер видит корп. IP и пропускает авторизацию.
+
+## Источник данных
+
+Все сети описаны в `corp-networks.conf` (исходник — в репо `corp-vpn`,
+устанавливается в `/usr/local/etc/corp-networks.conf`). Генератор ищет конфиг
+в `/usr/local/etc`, затем в `../corp-vpn/corp-networks.conf`.
+
+## Использование
+
+```bash
+./karing-rules.sh             # показать группы (JSON)
+./karing-rules.sh -i          # применить в конфиг Karing (с бэкапом)
+./karing-rules.sh --singbox   # правила в формате sing-box
+```
+
+Проверка текущих правил Karing — `./karing-rules.sh --singbox`.
+
+### collect-sites.py — сбор сайтов в `SITE_DOMAINS`
+
+Пароль MySQL рекомендуется брать из macOS Keychain (не передавать в
+`--password` — пароль светится в истории команд):
+
+```bash
+security add-generic-password -a koshkin -s collect-sites -w   # один раз; пароль из stdin
+./collect-sites.py --password-keychain --hosts p7ru4.tradesoft.ru --out sites-p7ru4.txt
+```
+
+Порядок выбора пароля: `--password` → `--password-keychain [SERVICE]`
+(по умолчанию `collect-sites`) → интерактивный ввод.
+
+## Восстановление на новом Mac
+
+```bash
+git clone git@github.com:alekosExclusiveVersion/corp-vpn
+cd corp-vpn
+sudo ./install.sh             # демон маршрутов + corp-networks.conf (split-режим)
+./karing-rules.sh -i          # группы Karing (ts-network / На прямую)
+```
+
+Затем в приложении Karing: добавить подписку (ссылку брать у провайдера) и
+выбрать сервер. Конфиги Karing (`~/Library/Group Containers/group.com.nebula.karing`)
+в репозитории не хранятся намеренно — там URL подписок с токенами доступа.
+
+## Структура папки
+
+| Файл | Назначение |
+|---|---|
+| `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `-i` — применить с бэкапом |
+| `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; пароль — из Keychain (`--password-keychain`) |
+| `README.md` | Документация |
