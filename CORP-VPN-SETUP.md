@@ -23,6 +23,15 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 попадает в `corp-networks-auto.conf` (AUTO_SITE_DOMAINS), который маршрутный
 демон подхватывает в течение секунд. Git-коммит найденных доменов остаётся
 за пользователем.
+24.09.2026: группа Karing `ts-network` (direct_out) выделена как единая корп.
+зона — в неё перенесены все корп. домены/суффиксы/ip_cidr (собирается из
+`DOMAINS`, `SITE_DOMAINS`, `DOMAIN_SUFFIX`, `NET_ROUTES`, `VPN_SERVERS`,
+`MYSQL_HOSTS`), а «На прямую» оставлена под личные правки. По данным
+`csSiteDomain` корп. MySQL добавлены www-варианты сайтов и новые ресурсы
+(parts-*.ru/.com, api.*, parts-opt.com); суффиксы пополнены (.auto-vision.ru,
+.parts-*, .bitrix24.ru/.com — B24 корп.). Репозитории объединены:
+`tradesoft-vpn-setup` (karing-rules.sh, collect-sites.py) влит в `corp-vpn`
+и удалён (локально и на GitHub); документация перенесена в README.md.
 20.08.2026: добавлено автовосстановление VPN после сна через sleepwatcher (п. 3.6).
 27.08.2026: найден и устранён корень провала корп. VPN на корп. Wi-Fi — публичные
 IP L2TP/IPSec серверов уходили в нод-туннель Karing (не было в direct-группе),
