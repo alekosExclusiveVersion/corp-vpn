@@ -852,7 +852,8 @@ aleksei) читает новые строки по байтовому указа
 - `vpn.up` / `vpn.down` — корп VPN поднялся/отключился (corp-vpn-routes,
   только на смене `last_iface`; маркер `/var/run/corp-vpn-signals.vpn`).
 - `db-clean.ok` / `db-clean.dryrun` / `db-clean.fail` — результаты автоочистки
-  БД aisql (corp-db-clean, ежедневно 03:00; см. §9.9).
+  БД aisql (corp-db-clean, ежедневно 03:00; отдельный проект
+  `~/Work/scripts/db-clean/` — см. его README.md).
 
 События `db-clean.*`, помимо баннера, **дублируются в B24-чат и Telegram**:
 `corp-notify.sh` (работает от пользователя, поэтому доступен Keychain) вызывает

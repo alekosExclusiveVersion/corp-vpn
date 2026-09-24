@@ -53,6 +53,8 @@ NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
+DB_CLEAN_REPO="${DB_CLEAN_REPO:-$HOME/Work/scripts/db-clean}"
+
 fail=0
 
 echo "==> Остановка и удаление демона..."
@@ -97,12 +99,17 @@ fi
 rm -f "$CLEAN_PLIST" "$CLEAN_SCRIPT"
 rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR"
 
-echo "==> Остановка и удаление демона очистки БД aisql (corp-db-clean)..."
-if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
-  launchctl unload "$DB_CLEAN_PLIST"
+echo "==> Удаление демона очистки БД aisql (db-clean) из $DB_CLEAN_REPO..."
+if [ -x "$DB_CLEAN_REPO/uninstall.sh" ]; then
+  (cd "$DB_CLEAN_REPO" && ./uninstall.sh)
+else
+  echo "  [WARN] $DB_CLEAN_REPO/uninstall.sh не найден — пробуем вручную"
+  if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+    launchctl unload "$DB_CLEAN_PLIST"
+  fi
+  rm -f "$DB_CLEAN_PLIST" "$DB_CLEAN_SCRIPT" "$DB_CLEAN_PY"
+  rm -f "$DB_CLEAN_LOG" "${DB_CLEAN_LOG}.stdout.log" "${DB_CLEAN_LOG}.stderr.log"
 fi
-rm -f "$DB_CLEAN_PLIST" "$DB_CLEAN_SCRIPT" "$DB_CLEAN_PY"
-rm -f "$DB_CLEAN_LOG" "${DB_CLEAN_LOG}.stdout.log" "${DB_CLEAN_LOG}.stderr.log"
 
 echo "==> Остановка и удаление юзер-агента уведомлений (corp-notify)..."
 if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then

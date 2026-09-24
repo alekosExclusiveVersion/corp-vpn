@@ -49,6 +49,8 @@ NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
+DB_CLEAN_REPO="${DB_CLEAN_REPO:-$HOME/Work/scripts/db-clean}"
+
 fail=0
 
 echo "==> Установка файлов демона..."
@@ -120,17 +122,12 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
 fi
 launchctl load -w "$CLEAN_PLIST"
 
-echo "==> Установка демона очистки БД aisql (corp-db-clean)..."
-cp "$DIR/db-clean-aisql.sh" "$DB_CLEAN_SCRIPT"
-chmod 755 "$DB_CLEAN_SCRIPT"
-cp "$DIR/db-clean-aisql.py" "$DB_CLEAN_PY"
-chmod 755 "$DB_CLEAN_PY"
-cp "$DIR/com.tradesoft.corp-db-clean.plist" "$DB_CLEAN_PLIST"
-: > "$DB_CLEAN_LOG" 2>/dev/null || true
-if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
-  launchctl unload "$DB_CLEAN_PLIST" 2>/dev/null || true
+echo "==> Установка демона очистки БД aisql (db-clean) из $DB_CLEAN_REPO..."
+if [ -x "$DB_CLEAN_REPO/install.sh" ]; then
+  (cd "$DB_CLEAN_REPO" && ./install.sh)
+else
+  echo "  [WARN] $DB_CLEAN_REPO/install.sh не найден — db-clean не устанавливается"
 fi
-launchctl load -w "$DB_CLEAN_PLIST"
 
 echo "==> Установка юзер-агента уведомлений (corp-notify, LaunchAgent $NOTIFY_UID)..."
 cp "$DIR/corp-notify.sh" "$NOTIFY_SCRIPT"
