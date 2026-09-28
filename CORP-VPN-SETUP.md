@@ -361,7 +361,6 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   возвращает «не подходит» — иначе пустой/битый CIDR дал бы `mask=0`,
   `in_subnet` подтвердил бы любой адрес, и фильтр исключил бы **все** маршруты,
   отключив sweep целиком (корп. трафик ушёл бы в Karing).
-- Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 - **Защита локальных сетей от захвата корп. туннелем**: широкие `NET_ROUTES`
   (`10/8`, `192.168/16`) перекрывают в т.ч. домашние подсети. Демон после
   добавления корп. маршрутов переустанавливает пути до локальных сетей через
@@ -375,6 +374,19 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   - При добавлении: `route add -net <local> -netmask <mask> -interface en0`.
   - Добавленные маршруты сносятся при отключении туннеля вместе с корп.
     маршрутами.
+- **Selftest демона.** `sh corp-vpn-routes.sh --selftest` — 41 проверка чистых
+  функций без root и без сети, без обращения к живым маршрутам. Гоняет
+  `in_subnet`/`in_any_subnet`/`cidr_*`/`get_tunnel_subnets` на подставленных
+  фикстурах и кейсы `sweep_corp_hijacks`. Проверки подобраны так, чтобы ловить
+  именно те баги, что уже проскакивали в прод:
+  - разбор POINTOPOINT-маски (`inet A --> B netmask`) — брать маску по `$4`
+    нельзя, только по третьему полю;
+  - обрезку регулярки кандидатов в три октета;
+  - потерю фильтра on-link подсетей `utun*` в sweep;
+  - снятую защиту `in_subnet` на некорректном CIDR (иначе `mask=0` подтвердил
+    бы любой адрес и фильтр отключил sweep целиком).
+  Проверка мутационная: каждая из четырёх правок выше роняет тесты. Гейт
+  установки на selftest описан в §3.8.
 - Перезапуск: `sudo launchctl kickstart -k system/com.tradesoft.corp-vpn-routes`.
 
 ### 3.7. Единый конфиг — `corp-networks.conf`
@@ -545,6 +557,16 @@ default → ppp0  (VPN)       — корп.
   `com.tradesoft.corp-learn`, `com.tradesoft.corp-wifi-routes`,
   `com.tradesoft.corp-vpn-watchdog`), применяет split-режим
   (`split_fix.swift`), проверяет результат.
+- **Гейт selftest.** Перед копированием `corp-vpn-routes.sh` в
+  `/usr/local/sbin` установщик прогоняет `sh corp-vpn-routes.sh --selftest`
+  (41 проверка чистых функций, без root и без сети). При провале демон **не
+  обновляется**: остальные шаги установки выполняются, но скрипт завершается
+  с кодом 1. Так сломанная правка маршрутизации не попадает на машину, а
+  инцидент не маскируется сообщением «Готово».
+- Демон очистки БД aisql ставится из отдельного репозитория
+  `~/Work/scripts/db-clean` (`DB_CLEAN_REPO`, переопределяется переменной).
+  Если там нет `install.sh`, печатается `[FAIL]`, `db-clean` не устанавливается
+  и общий код выхода равен 1 — предупреждение не считается успехом.
 - `sudo ./uninstall.sh` — останавливает и удаляет демоны (в т.ч.
   vpn-watchdog), чистит маршруты, возвращает `OverridePrimary`
   (`split_restore.swift`).
@@ -627,6 +649,7 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Durable-правки (18.09.2026) | «🌏 GFW» в `karing_routing_group.json` содержит `.service.ast`/`.xn--80akicokc0aablc…` и `karing_setting.json` `perapp.enable=false` | оба на месте после полного рестарта |
 | parts-catalogs.com /32 через ppp (при corp VPN) | `route -n get <IP parts-catalogs.com> \| grep interface` | `ppp0` |
 | corp-routes-clean реальное событие (09.09.2026) | `grep deleted /var/log/corp-routes-clean.log` | `deleted 192.168.128.123 (corp host через en* вне on-link)` |
+| Selftest демона маршрутов | `sh corp-vpn-routes.sh --selftest` | `41 passed, 0 failed` |
 
 ---
 

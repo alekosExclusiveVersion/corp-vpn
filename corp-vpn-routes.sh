@@ -388,6 +388,14 @@ in_any_subnet() {
 # utun-/32 — далее assert_routes/add_routes вернут нужный /32 через ppp
 # (или en0 при прямом подключении). IP из LOCAL_ROUTES и PARALLEL_TUNNEL_HOSTS
 # не трогаем.
+# TODO(perf, не срочно): фильтр подсетей в sweep — самая дорогая часть цикла.
+# Измерено 28.09.2026 на 36 маршрутах utun: ~0.87 с форков на итерацию, цикл
+# каждые 5 с, т.е. ~10 000 fork'ов в минуту на одни только сравнения. Причина —
+# in_subnet на каждый CIDR делает cidr_mask, cidr_net и ip2int, а они все
+# реализованы через $(...) / $(( $(...) )), то есть каждый форкает. Нулевая
+# цена варианта: один раз за итерацию перевести $LOCAL_ROUTES/$tun_nets/$NET_ROUTES
+# в целочисленные диапазоны (start,end) и сравнивать чистым арифметическим
+# шеллом без подобрёвываний. Проверяется существующим selftest (кейсы sweep).
 sweep_corp_hijacks() {
   rem=""
   # Плоские IP из STATE (corp-хосты, распиненные через корп. интерфейс).
@@ -589,6 +597,178 @@ last_probe=0
 last_local_snap=0
 last_diag=0
 _prev_alive=""
+
+# --- selftest: регрессия чистых функций (без root, без сети, без правок) -------
+# Заглушки затеняют одноимённые команды (вызовы в скрипте без абсолютных путей),
+# поэтому исполняется настоящий код на подставленных данных, а не копия логики.
+selftest() {
+  local self_path=$1
+  local st_pass=0 st_fail=0 st_tmp st_out st_i st_n st_s st_e
+  st_tmp=$(mktemp -d 2>/dev/null) || st_tmp="/tmp/corp-vpn-selftest.$$"
+  mkdir -p "$st_tmp" 2>/dev/null
+
+  t() { # t <описание> <0=ok/иное=fail>
+    if [ "$2" = "0" ]; then
+      printf '[PASS] %s\n' "$1"; st_pass=$((st_pass + 1))
+    else
+      printf '[FAIL] %s\n' "$1"; st_fail=$((st_fail + 1))
+    fi
+  }
+  teq() { # teq <описание> <ожидаемое> <фактическое>
+    if [ "$2" = "$3" ]; then t "$1" 0
+    else t "$1 — ожидалось [$2], получено [$3]" 1; fi
+  }
+
+  logger() { return 0; }
+  route()  { return 0; } # снос считаем успешным; реальную таблицу не трогаем
+  ifconfig() {
+    if [ -n "$1" ]; then
+      printf '%s\n' "$ST_IF_ALL" | awk -v want="$1" '
+        /^[A-Za-z0-9]+:/ { cur=$1; sub(/:$/,"",cur); next }
+        cur==want { print }'
+    else
+      printf '%s\n' "$ST_IF_ALL"
+    fi
+  }
+  netstat() { printf '%s\n' "$ST_NETSTAT"; }
+
+  ST_IF_ALL=""
+  ST_NETSTAT=""
+
+  # --- фикстуры ---
+  # POINTOPOINT-интерфейсы: маска берётся по имени ("netmask 0x.."), а не по
+  # позиции. Именно этот формат ломал get_tunnel_subnets при разборе маски как $4.
+  ST_IF_FULL="utun7: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	inet 10.20.0.1 --> 10.20.0.2 netmask 0xfffffffc
+	inet6 fe80::1%utun7 prefixlen 64 secured scopeid 0x7
+utun8: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
+	inet 10.30.5.9 netmask 0xffffff00
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 3e:e9:15:74:f3:be
+	inet 10.34.174.97 netmask 0xffffff00 broadcast 10.34.174.255
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000"
+  # Тот же набор без единого utun — для проверки fail-open.
+  ST_IF_NOTUN="en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	ether 3e:e9:15:74:f3:be
+	inet 10.34.174.97 netmask 0xffffff00 broadcast 10.34.174.255
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000"
+  ST_NETSTAT="10.20.0.1          10.20.0.2         UH          utun7
+10.20.0.2          link#7            UH          utun7
+192.168.128.5      192.168.128.1     UHS         utun7
+192.168.0.77       192.168.128.55    UHS         utun7
+8.8.8.8            link#7            UHS         utun7
+192.168.0.33       192.168.128.55    UHS         utun7
+192.168.0.232      192.168.128.55    UHS         utun7
+203.0.113.9        192.168.128.55    UHS         utun7"
+  LOCAL_ROUTES="192.168.128.0/24 10.34.0.0/16"
+  NET_ROUTES="10.0.0.0/8 192.168.0.0/16"
+  PARALLEL_TUNNEL_HOSTS="192.168.0.77"
+
+  # 1. синтаксис
+  sh -n "$self_path" 2>/dev/null; t "syntax: sh -n" "$?"
+
+  # 2. арифметика адресов
+  teq "ip2int/int2ip round-trip" "10.20.0.1" "$(int2ip "$(ip2int 10.20.0.1)")"
+  teq "ip2int 192.168.0.33" "$(((192 << 24) + (168 << 16) + 33))" "$(ip2int 192.168.0.33)"
+  teq "cidr_mask 30" "255.255.255.252" "$(cidr_mask 30)"
+  teq "cidr_mask 24" "255.255.255.0" "$(cidr_mask 24)"
+  teq "cidr_mask 16" "255.255.0.0" "$(cidr_mask 16)"
+  teq "cidr_net 10.20.0.1/30" "10.20.0.0" "$(cidr_net 10.20.0.1/30)"
+  teq "cidr_net 192.168.0.33/16" "192.168.0.0" "$(cidr_net 192.168.0.33/16)"
+  teq "net_of 10.34.174.97 0xffffff00" "10.34.174.0" "$(net_of 10.34.174.97 0xffffff00)"
+  teq "mask_to_cidr 0xfffffffc" "30" "$(mask_to_cidr 0xfffffffc)"
+  teq "mask_to_cidr 0xffffff00" "24" "$(mask_to_cidr 0xffffff00)"
+
+  # 3. in_subnet: мусор обязан отвергаться. Инвариант fail-open — при
+  #    подтверждении мусора фильтр исключил бы ВСЕ адреса и отключил sweep,
+  #    т.е. корп. трафик ушёл бы в Karing мимо туннеля.
+  for st_out in '/' '[/]' 'abc' '0/0' '10.20.0.0/' '/xx' '10.20.0.0/33' \
+               '10.20.0.0/1x' '10.20.0.0/32/8' '' 'x/30'; do
+    in_subnet 192.168.0.33 "$st_out"
+    [ $? -ne 0 ]; t "in_subnet отвергает [$st_out]" "$?"
+  done
+  in_subnet 192.168.0.33 192.168.0.0/16; t "in_subnet: 192.168.0.33 ⊂ 192.168.0.0/16" "$?"
+  in_subnet 10.20.0.1 10.20.0.0/30;       t "in_subnet: 10.20.0.1 ⊂ 10.20.0.0/30" "$?"
+  in_subnet 10.20.0.4 10.20.0.0/30; [ $? -ne 0 ]; t "in_subnet: 10.20.0.4 вне /30" "$?"
+  in_any_subnet 192.168.0.33 ""; [ $? -ne 0 ]; t "in_any_subnet с пустым списком = не подходит" "$?"
+  in_any_subnet 10.20.0.1 "10.30.0.0/16 10.20.0.0/30"; t "in_any_subnet: 2-я запись списка" "$?"
+
+  # 4. get_tunnel_subnets
+  ST_IF_ALL="$ST_IF_FULL"
+  teq "get_tunnel_subnets: POINTOPOINT utun7" "10.20.0.0/30" \
+    "$(get_tunnel_subnets | grep '^10\.20\.0\.')"
+  teq "get_tunnel_subnets: utun без peer-адреса" "10.30.5.0/24" \
+    "$(get_tunnel_subnets | grep '^10\.30\.')"
+  teq "get_tunnel_subnets: физический en0 не попадает" "" \
+    "$(get_tunnel_subnets | grep '10\.34\.' | tr -d '\n')"
+  ST_IF_ALL="$ST_IF_NOTUN"
+  teq "get_tunnel_subnets: без utun — пусто (fail-open)" "" "$(get_tunnel_subnets | tr -d '\n')"
+  ST_IF_ALL="$ST_IF_FULL"
+
+  # 5. get_local_subnets: loopback и туннели отсекаются, en0 попадает.
+  #    Порядок не сравниваем: LOCAL_ROUTES выводятся как объявлены, а
+  #    интерфейсные — уже отсортированы внутри функции; важен состав.
+  teq "get_local_subnets: без туннелей и loopback" \
+    "10.34.0.0/16 10.34.174.0/24 192.168.128.0/24" \
+    "$(get_local_subnets | sort | tr '\n' ' ' | sed 's/ *$//')"
+
+  # 6. is_tunnel_iface / is_physical_iface
+  is_tunnel_iface utun7; t "is_tunnel_iface utun7" "$?"
+  is_tunnel_iface ppp0;  t "is_tunnel_iface ppp0" "$?"
+  is_tunnel_iface lo0;   t "is_tunnel_iface lo0" "$?"
+  is_tunnel_iface en0;   [ $? -ne 0 ]; t "is_tunnel_iface en0 = нет" "$?"
+  is_physical_iface en0; t "is_physical_iface en0" "$?"
+  is_physical_iface utun7; [ $? -ne 0 ]; t "is_physical_iface utun7 = нет" "$?"
+
+  # 7. sweep целиком на фикстуре: снимает корп. /32, бережёт on-link адрес TUN,
+  #    локальную сеть, параллельный туннель и не-корп. адреса.
+  sweep_removed() { # <содержимое STATE>
+    printf '%s\n' "$1" > "$st_tmp/state"
+    STATE="$st_tmp/state"; DIAG_LOG="$st_tmp/diag"; : > "$st_tmp/diag"
+    sweep_corp_hijacks 2>/dev/null
+    grep 'SWEEP' "$st_tmp/diag" 2>/dev/null | sed -n 's/.*removed_utun32://p' |
+      tr -s ' \t' ' ' | sed 's/^ *//; s/ *$//'
+  }
+  teq "sweep: снимает только корп. /32 (on-link адрес TUN сохранён)" \
+    "192.168.0.33 192.168.0.232" "$(sweep_removed '')"
+  teq "sweep: хост из STATE тоже снимается" \
+    "192.168.0.33 192.168.0.232 203.0.113.9" "$(sweep_removed '203.0.113.9')"
+
+  # 8. fail-open: без списка подсетей TUN фильтр снят и on-link адреса TUN
+  #    попадают под снос — цена отказа get_tunnel_subnets, фиксируем явно.
+  ST_IF_ALL="$ST_IF_NOTUN"
+  teq "sweep без tun_nets: on-link адреса TUN сносятся (документированный риск)" \
+    "10.20.0.1 10.20.0.2 192.168.0.33 192.168.0.232" "$(sweep_removed '')"
+  ST_IF_ALL="$ST_IF_FULL"
+
+  # информационно (не проверка): стоимость in_any_subnet на реальном списке.
+  st_n=$(printf '%s\n' $LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24 | wc -l | tr -d ' ')
+  st_s=$(date +%s); st_i=0
+  while [ "$st_i" -lt 300 ]; do
+    in_any_subnet 192.168.0.33 "$LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24" >/dev/null 2>&1
+    st_i=$((st_i + 1))
+  done
+  st_e=$(date +%s)
+  printf '[INFO] 300 вызовов in_any_subnet на %s подсетях: %s с (%.3f с/вызов)\n' \
+    "$st_n" "$((st_e - st_s))" \
+    "$(awk -v d="$((st_e - st_s))" 'BEGIN { printf "%.3f", d / 300 }')"
+
+  rm -rf "$st_tmp"
+  printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
+    "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
+  [ "$st_fail" -gt 0 ] && return 1
+  return 0
+}
+
+case "${1:-}" in
+  --selftest|--self-test)
+    selftest "$0"
+    exit $?
+    ;;
+esac
+
 # Инициализируем маркер состояния VPN фактическим статусом при старте,
 # чтобы не слать лишний сигнал up/down в момент перезапуска демона.
 if find_iface >/dev/null 2>&1; then

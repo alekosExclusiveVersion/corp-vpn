@@ -53,9 +53,32 @@ DB_CLEAN_REPO="${DB_CLEAN_REPO:-$HOME/Work/scripts/db-clean}"
 
 fail=0
 
+echo "==> Самопроверка демона маршрутов (без root и без сети)..."
+# Гейт перед установкой. selftest гоняет чистые функции на подставленных данных
+# и ловит именно тот класс багов, что уже проскакивал в прод: неверный разбор
+# POINTOPOINT-маски, обрезанная регулярка кандидатов, потерянный фильтр
+# on-link подсетей TUN, потерявшийся fail-open в in_subnet. Провал означает,
+# что арифметическое ядро демона неверно, а на нём стоят add_routes,
+# assert_routes, del_routes, sweep и определение сессии.
+# При провале демон НЕ устанавливается: в системе остаётся последняя рабочая
+# версия, остальная установка доходит до конца и завершается exit 1.
+ROUTES_SELFTEST_OK=1
+if ! sh "$DIR/corp-vpn-routes.sh" --selftest; then
+  ROUTES_SELFTEST_OK=0
+  fail=1
+fi
+echo
+
 echo "==> Установка файлов демона..."
-cp "$DIR/corp-vpn-routes.sh" "$DAEMON_SCRIPT"
-chmod 755 "$DAEMON_SCRIPT"
+if [ "$ROUTES_SELFTEST_OK" -eq 1 ]; then
+  cp "$DIR/corp-vpn-routes.sh" "$DAEMON_SCRIPT"
+  chmod 755 "$DAEMON_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $DAEMON_SCRIPT НЕ обновлён."
+  echo "!! Осталась предыдущая версия (если демон был установлен ранее)."
+  echo "!! У остальных компонентов неверная логика маршрутов может уводить"
+  echo "!! корп. трафик в Karing мимо туннеля — проверь вывод selftest выше."
+fi
 cp "$DIR/com.tradesoft.corp-vpn-routes.plist" "$DAEMON_PLIST"
 mkdir -p /usr/local/etc
 cp "$DIR/corp-networks.conf" "$NETWORKS_CONF"
@@ -126,7 +149,8 @@ echo "==> Установка демона очистки БД aisql (db-clean) �
 if [ -x "$DB_CLEAN_REPO/install.sh" ]; then
   (cd "$DB_CLEAN_REPO" && ./install.sh)
 else
-  echo "  [WARN] $DB_CLEAN_REPO/install.sh не найден — db-clean не устанавливается"
+  echo "  [FAIL] $DB_CLEAN_REPO/install.sh не найден — db-clean не устанавливается"
+  fail=1
 fi
 
 echo "==> Установка юзер-агента уведомлений (corp-notify, LaunchAgent $NOTIFY_UID)..."
@@ -302,6 +326,12 @@ if [ "$fail" -eq 0 ]; then
   echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
 else
   echo
-  echo "Есть ошибки — проверьте вывод выше."
+  if [ "$ROUTES_SELFTEST_OK" -eq 0 ]; then
+    echo "Есть ошибки. Главная: провалена самопроверка демона маршрутов"
+    echo "(--selftest) — демон не обновлён, в системе предыдущая версия."
+    echo "Правьте скрипт, пока selftest не станет зелёным, и запустите install.sh снова."
+  else
+    echo "Есть ошибки — проверьте вывод выше."
+  fi
   exit 1
 fi
