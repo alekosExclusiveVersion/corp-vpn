@@ -200,6 +200,43 @@ get_local_subnets() {
   done | sort -u
 }
 
+# Подсети адресов самих utun-туннелей. Нужны, чтобы не считать on-link адрес
+# TUN чужим перехватом: Karing держит TUN в 10.20.0.1/30, а этот адрес попадает
+# в NET_ROUTES 10/8 и без фильтра демон сносит его маршрут (см. sweep_corp_hijacks).
+# ВАЖНО fail-open: наружу отдаём ТОЛЬКО валидные CIDR. Если разбор не удался —
+# пустой список, in_any_subnet ничего не исключит и поведение останется прежним.
+# При мусоре в списке in_any_subnet начал бы подтверждать всё подряд и фильтр
+# отключил бы sweep целиком, поэтому валидация тут обязательна.
+get_tunnel_subnets() {
+  ifconfig 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      [A-Za-z0-9]*:* ) iface=${line%%:*} ;;
+    esac
+    case "$line" in
+      *[[:space:]]inet[[:space:]]*) ;;
+      *) continue ;;
+    esac
+    case "$iface" in
+      utun*) ;;
+      *) continue ;;
+    esac
+    # У POINTOPOINT-интерфейсов (utun/ppp) формат "inet A --> B netmask 0x..",
+    # поэтому маску берём по имени, а не по позиции.
+    ip=$(echo "$line" | awk '{print $2}')
+    mask=$(echo "$line" | awk '{for (i = 1; i <= NF; i++) if ($i == "netmask") { print $(i + 1); exit }}')
+    echo "$ip $mask"
+  done | while read -r ip mask; do
+    case "$ip" in
+      *[!0-9.]*|'') continue ;;
+    esac
+    case "$mask" in
+      0x*) ;;
+      *) continue ;;
+    esac
+    echo "$(net_of "$ip" "$mask")/$(mask_to_cidr "$mask")"
+  done | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$/ {print}' | sort -u
+}
+
 # Путь до локальной сети: "-interface en0" или "-gateway 192.168.31.1".
 local_path() {
   out=$(route -n get "$1" 2>/dev/null) || return 1
@@ -314,8 +351,22 @@ route_via_ppp() {
 }
 
 # Проверка IP внутри CIDR-подсети.
+# Некорректный вход = "не подходит" (return 1), а не "подходит": иначе мусор в
+# списке подсетей (например пустой cidr) дал бы mask=0 и in_subnet подтвердил
+# бы ЛЮБОЙ адрес — фильтр исключил бы все маршруты и отключил sweep.
 in_subnet() {
   ip=$1; cidr=$2
+  case "$ip" in
+    *[!0-9.]*|'') return 1 ;;
+  esac
+  case "$cidr" in
+    [0-9]*.[0-9]*.[0-9]*.[0-9]*/*) ;;
+    *) return 1 ;;
+  esac
+  case "${cidr#*/}" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "${cidr#*/}" -le 32 ] || return 1
   mask=$(cidr_mask "${cidr#*/}")
   net=$(cidr_net "$cidr")
   [ $(( $(ip2int "$ip") & $(ip2int "$mask") )) -eq $(( $(ip2int "$net") & $(ip2int "$mask") )) ]
@@ -342,11 +393,15 @@ sweep_corp_hijacks() {
   # Плоские IP из STATE (corp-хосты, распиненные через корп. интерфейс).
   # При VPN up STATE содержит эти строки; см. add_routes.
   state_ips=$(grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' "$STATE" 2>/dev/null | tr '\n' ' ')
+  tun_nets=$(get_tunnel_subnets)
   for dest in $(netstat -rn -f inet 2>/dev/null |
                 awk '$1!~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\// &&
                      $1~/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ &&
                      $NF~/^utun/ {print $1}'); do
     in_any_subnet "$dest" "$LOCAL_ROUTES" && continue
+    # On-link адреса самих utun-туннелей (у Karing TUN 10.20.0.1/30, он же
+    # входит в NET_ROUTES 10/8) — это не корп. хосты, их сносить нельзя.
+    in_any_subnet "$dest" "$tun_nets" && continue
     # Хосты, разрешённые через параллельный туннель Tunnelblick (см.
     # PARALLEL_TUNNEL_HOSTS в corp-networks.conf): их /32 через utun НЕ трогаем.
     case " $PARALLEL_TUNNEL_HOSTS " in
@@ -548,10 +603,26 @@ while true; do
 
   if [ $((now - last_diag)) -ge 60 ]; then
     last_diag=$now
-    defs=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF}' | tr '\n' ',')
-    corps=$(netstat -rn -f inet 2>/dev/null | awk '$NF=="ppp0" && ($1 ~ /^192\.168\.0(\/16)?$/ || $1 ~ /^10(\/8)?$/) {n++} END{print n+0}')
-    hij=$(netstat -rn -f inet 2>/dev/null | awk '$1~/^(192\.168|10)\./ && $1!~/\// && $NF~/^utun/{n++} END{print n+0}')
-    diag STATUS "defaults=[$defs] net_routes_ppp=$corps utun_hijacks=$hij"
+    # При выключенном VPN маршрутов ppp0 не бывает by design, а хайджеки utun
+    # остаются от Karing direct_out — печатать их как признак аварии вводит
+    # в заблуждение (выглядит как «туннель поднят, маршрутов 0»).
+    if [ -z "$iface" ]; then
+      diag STATUS "vpn=down"
+    else
+      defs=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print $NF}' | tr '\n' ',')
+      corps=$(netstat -rn -f inet 2>/dev/null | awk '$NF=="ppp0" && ($1 ~ /^192\.168\.0(\/16)?$/ || $1 ~ /^10(\/8)?$/) {n++} END{print n+0}')
+      tun_nets=$(get_tunnel_subnets)
+      hij=0
+      # Счётчик намеренно ограничен корп. диапазонами 192.168.*/10.*: на utun
+      # висит ~81 адрес, из них в счётчик попадают только единицы, иначе
+      # vpn=up всегда читался бы как авария из-за обычных адресов Karing.
+      for d in $(netstat -rn -f inet 2>/dev/null |
+                awk '$1~/^(192\.168|10)\./ && $1!~/\// && $NF~/^utun/ {print $1}'); do
+        in_any_subnet "$d" "$tun_nets" && continue
+        hij=$((hij + 1))
+      done
+      diag STATUS "vpn=up defaults=[$defs] net_routes_ppp=$corps utun_hijacks=$hij"
+    fi
   fi
 
   # Кулдаун после ложного Connected: не доверяем configd,
@@ -604,6 +675,7 @@ while true; do
   elif [ -n "$last_iface" ] || [ -f "$STATE" ]; then
     del_routes "vpn-down"
     last_iface=""
+    last_session=""
     fail=0
     signal_vpn_transition "down"
   fi
@@ -620,6 +692,7 @@ while true; do
       if [ "$fail" -ge 2 ]; then
         del_routes "probe-dead"
         last_iface=""
+        last_session=""
         fail=0
         dead_until=$((now + 60))
         signal_vpn_transition "down"
