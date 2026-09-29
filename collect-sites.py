@@ -302,11 +302,53 @@ def keychain_password(service: str, user: str) -> str | None:
     return password or None
 
 
+def app_servers(app_path: str) -> list[dict]:
+    """Хосты и учётки из реестра приложения Parallels SQL Admin.
+
+    Путь тот же, что у GUI: config.ini и servers.json из каталога данных
+    приложения, расшифровка паролей — Fernet-ключом из Keychain. Репошные
+    servers.json/config.ini содержат пустые пароли, поэтому читать их нельзя
+    (получим "Access denied ... using password: NO"). Пароль наружу не
+    выводится и не попадает в argv.
+    """
+    sys.path.insert(0, app_path)
+    import common.config as C
+    from common.paths import app_data_dir
+
+    data = app_data_dir()
+    cfg = C.load_config(data / "config.ini")
+    object.__setattr__(cfg.advanced, "servers_file", str(data / "servers.json"))
+    C.config = cfg
+
+    from common.server_registry import ServerRegistry
+
+    sr = ServerRegistry()
+    sr.ensure_key()
+
+    out: list[dict] = []
+    for spec in sr.load():
+        if spec.engine != "mysql":
+            continue
+        user, password, host, port = sr.credentials_for(spec.host_key())
+        if not password:
+            continue
+        out.append({"host": host, "port": port, "user": user,
+                    "password": password})
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Сбор доменов сайтов с MySQL-серверов")
     ap.add_argument("--servers", default="",
-                    help="JSON с серверами (формат servers.json приложения); "
-                         "по умолчанию ../parallels-sql-admins/servers.json")
+                    help="JSON с серверами (формат servers.json приложения). "
+                         "Внимание: репошный servers.json содержит пустые пароли — "
+                         "нужен внешний --password. Проще --from-app")
+    ap.add_argument("--from-app", action="store_true",
+                    help="хосты и пароли из реестра Parallels SQL Admin "
+                         "(обход Keychain и интерактивного ввода)")
+    ap.add_argument("--app-path", default="",
+                    help="репозиторий parallels-sql-admins для импорта common "
+                         "(по умолчанию ../parallels-sql-admins)")
     ap.add_argument("--user", default="koshkin")
     ap.add_argument("--password", default="", help="пусто — из Keychain или интерактивно")
     ap.add_argument("--password-keychain", nargs="?", const="collect-sites",
@@ -331,21 +373,53 @@ def main() -> None:
         clean_file(Path(args.clean))
         return
 
+    if args.from_app and args.servers:
+        sys.exit("Нельзя совмещать --from-app и --servers")
+
     password = args.password
-    if not password and args.password_keychain:
-        password = keychain_password(args.password_keychain, args.user)
-        if not password:
-            sys.exit(
-                f"Пароль не найден в Keychain (service={args.password_keychain!r}, "
-                f"account={args.user!r}). Настрой: "
-                f"security add-generic-password -a {args.user} -s {args.password_keychain} -w"
-            )
-    password = password or getpass.getpass(f"Пароль MySQL ({args.user}): ")
+    servers: list[dict] = []
+
+    if args.from_app:
+        app_path = args.app_path or str(
+            Path(__file__).resolve().parent.parent / "parallels-sql-admins")
+        try:
+            servers = app_servers(app_path)
+        except Exception as ex:
+            sys.exit(f"Не удалось прочитать реестр приложения ({app_path}): "
+                     f"{type(ex).__name__}: {ex}")
+        print(f"Из реестра приложения: {len(servers)} MySQL-сервер(ов) с паролем")
+    else:
+        if not password and args.password_keychain:
+            password = keychain_password(args.password_keychain, args.user)
+            if not password:
+                sys.exit(
+                    f"Пароль не найден в Keychain (service={args.password_keychain!r}, "
+                    f"account={args.user!r}). Настрой: "
+                    f"security add-generic-password -a {args.user} -s {args.password_keychain} -w"
+                )
+        password = password or getpass.getpass(f"Пароль MySQL ({args.user}): ")
+
+        servers_path = Path(args.servers) if args.servers else (
+            Path(__file__).resolve().parent.parent
+            / "parallels-sql-admins" / "servers.json"
+        )
+        try:
+            with open(servers_path, encoding="utf-8") as f:
+                servers = json.load(f)
+        except OSError:
+            sys.exit(f"Не удалось прочитать {servers_path}")
 
     if args.probe:
         host = args.probe[0]
         db = args.probe[1] if len(args.probe) > 1 else None
-        conn = make_conn(host, args.port, args.user, password, args.timeout)
+        # При --from-app берём учётку сервера из реестра, иначе — общие значения
+        spec = next((s for s in servers if s.get("host") == host), None)
+        p_port = int(spec.get("port") or args.port) if spec else args.port
+        p_user = (spec.get("user") or args.user) if spec else args.user
+        p_pass = (spec.get("password") or password) if spec else password
+        if not p_pass:
+            sys.exit(f"Нет пароля для {host}")
+        conn = make_conn(host, p_port, p_user, p_pass, args.timeout)
         try:
             if db:
                 probe_db(conn, db)
@@ -354,16 +428,6 @@ def main() -> None:
         finally:
             conn.close()
         return
-
-    servers_path = Path(args.servers) if args.servers else (
-        Path(__file__).resolve().parent.parent
-        / "parallels-sql-admins" / "servers.json"
-    )
-    try:
-        with open(servers_path, encoding="utf-8") as f:
-            servers = json.load(f)
-    except OSError:
-        sys.exit(f"Не удалось прочитать {servers_path}")
 
     hosts = {h.strip() for h in args.hosts.split(",") if h.strip()}
 
@@ -379,12 +443,17 @@ def main() -> None:
             continue
         if hosts and host not in hosts:
             continue
+        # При --from-app у каждого сервера своя учётка, иначе — общий пароль
+        s_port = int(spec.get("port") or args.port)
+        s_user = spec.get("user") or args.user
+        s_pass = spec.get("password") or password
+        if not s_pass:
+            print(f"{host}: нет пароля, пропущен", file=sys.stderr)
+            continue
         server_domains: set[str] = set()
         no_domain_dbs: list[str] = []
         try:
-            conn = make_conn(host, int(spec.get("port") or args.port),
-                             spec.get("user") or args.user,
-                             password, args.timeout)
+            conn = make_conn(host, s_port, s_user, s_pass, args.timeout)
         except Exception as ex:
             print(f"{host}: ошибка: {ex}", file=sys.stderr)
             continue
@@ -407,9 +476,8 @@ def main() -> None:
                     cur.close()
                     conn.close()
                     try:
-                        conn = make_conn(host, int(spec.get("port") or args.port),
-                                         spec.get("user") or args.user,
-                                         password, args.timeout)
+                        conn = make_conn(host, s_port, s_user, s_pass,
+                                         args.timeout)
                         cur = conn.cursor()
                     except Exception as rex:
                         print(f"{host}: ошибка переподключения: {rex}",
