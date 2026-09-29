@@ -91,7 +91,7 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 
 ```bash
 sh corp-vpn-routes.sh --selftest              # демон маршрутов, 41 проверка
-sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 14
+sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 16
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ```
