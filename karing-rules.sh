@@ -62,8 +62,13 @@ MYSQL_HOSTS="${MYSQL_HOSTS:-}"
 VPN_SERVERS="${VPN_SERVERS:-}"
 
 to_json_array() {
-  local first=1
+  # Повторы убираются с сохранением порядка: SITE_DOMAINS и MYSQL_HOSTS
+  # пересекаются (хост БД одновременно является сайтом), и без дедупа
+  # один и тот же домен попадал в группу дважды.
+  local first=1 v seen=" "
   for v in $1; do
+    case "$seen" in *" $v "*) continue ;; esac
+    seen="$seen$v "
     [ "$first" -eq 1 ] || printf ', '
     printf '"%s"' "$v"
     first=0
@@ -183,6 +188,14 @@ def upsert_group(name, build):
 # (домены SITE_DOMAINS/DOMAINS/MYSQL_HOSTS, суффиксы DOMAIN_SUFFIX, IP
 # NET_ROUTES/VPN_SERVERS/MYSQL_HOSTS). Существующая группа сохраняет
 # личные правки; корп. элементы добавляются в неё.
+def dedup(seq):
+    out, seen = [], set()
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
 def network_build(g):
     if g is None:
         return dict(direct_group)
@@ -190,16 +203,20 @@ def network_build(g):
     for d in corp_domains:
         if d not in doms:
             doms.append(d)
-    g['domain'] = doms
+    # Список чистится целиком: перекрытие SITE_DOMAINS и MYSQL_HOSTS даёт
+    # повторы, а apply() сохраняет существующие элементы, поэтому старые
+    # дубли иначе остались бы навсегда.
+    g['domain'] = dedup(doms)
     suffixes = list(g.get('domain_suffix', []))
     for s in domain_suffixes:
         if s not in suffixes:
             suffixes.append(s)
-    g['domain_suffix'] = suffixes
+    g['domain_suffix'] = dedup(suffixes)
     existing = set(g.get('ip_cidr', []))
     for c in direct_group.get('ip_cidr', []):
         if c not in existing:
             g.setdefault('ip_cidr', []).append(c)
+    g['ip_cidr'] = dedup(g['ip_cidr'])
 
 upsert_group('ts-network', network_build)
 
@@ -275,6 +292,16 @@ for host in MYSQL_HOSTS:
     except socket.gaierror:
         unresolved.append(host)
 
+def uniq(seq):
+    out, seen = [], set()
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+managed = {k: uniq(v) for k, v in managed.items()}
+
 try:
     with open(routing_path, encoding='utf-8') as f:
         routing = json.load(f)
@@ -316,7 +343,8 @@ for key in ('domain', 'domain_suffix', 'ip_cidr'):
     dups = sorted(x for x in uniq if live.count(x) > 1)
     line = f"  {key:15} управляется {len(want):3}, в live {len(uniq):3} уникальных"
     if dups:
-        line += f" (дублей: {len(dups)})"
+        drift += len(dups)
+        line += f" (дублей: {len(dups)} — требует -i)"
     print(line)
     if key == 'ip_cidr' and unresolved:
         print(f"  {'':15} MySQL-хосты не резолвятся: {', '.join(unresolved)}"
@@ -387,6 +415,10 @@ selftest() {
   ck "to_json_array: пусто" "" "$(to_json_array '')"
   ck "to_json_array: один" '"a.ru"' "$(to_json_array 'a.ru')"
   ck "to_json_array: список" '"a.ru", "b.ru"' "$(to_json_array 'a.ru b.ru')"
+  ck "to_json_array: дедуп с сохранением порядка" '"a.ru", "b.ru"' \
+    "$(to_json_array 'a.ru b.ru a.ru b.ru a.ru')"
+  ck "to_json_array: дедуп не теряет разные значения" '"a.ru", "b.ru", "c.ru"' \
+    "$(to_json_array 'a.ru b.ru a.ru c.ru b.ru')"
 
   # --- фикстура конфига и live-конфига ---
   conf="$tmp/net.conf"
@@ -488,13 +520,25 @@ PY
   real_conf="$DIR/corp-networks.conf"
   if [ -f "$real_conf" ]; then
     CORP_NETWORKS_CONF="$real_conf" "$DIR/karing-rules.sh" \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="ts-network"; assert d.get("domain"); print("ok")' \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert d["name"]=="ts-network" and d.get("domain")
+for k in ("domain","domain_suffix","ip_cidr"):
+    v=d.get(k,[])
+    assert len(v)==len(set(v)), k+" содержит дубли"
+print("ok")' \
       >/dev/null 2>&1
-    ck "group_json: валидный JSON ts-network" "0" "$?"
+    ck "group_json: валидный JSON ts-network без дублей" "0" "$?"
     CORP_NETWORKS_CONF="$real_conf" "$DIR/karing-rules.sh" --singbox \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outbound"]=="direct_out"; assert d.get("rules"); print("ok")' \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert d["outbound"]=="direct_out" and d.get("rules")
+for r in d["rules"]:
+    for k,v in r.items():
+        assert len(v)==len(set(v)), k+" содержит дубли"
+print("ok")' \
       >/dev/null 2>&1
-    ck "singbox: валидный JSON direct_out" "0" "$?"
+    ck "singbox: валидный JSON direct_out без дублей" "0" "$?"
   fi
 
   printf 'selftest: %d passed, %d failed\n' "$pass" "$fail"
