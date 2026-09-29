@@ -170,6 +170,19 @@ is_corp_ip() {
   return 1
 }
 
+# Fake-IP зона Karing (198.20.0.0/15, см. CORP-VPN-SETUP §3.4). На корп. Wi-Fi
+# запрос resolve_corp_dns уходит на 192.168.0.210 через utun, Karing перехватывает
+# его и отвечает fake-IP. Такие адреса — не публичные IP корп. сайтов: в кэш они
+# попадать не должны, иначе sweep_karing_pins сносит пин самого Karing, который
+# тот немедленно ставит обратно (бесконечный churn раз в 30 с) и рвёт активные
+# соединения к этому корп. сайту.
+is_fake_ip() {
+  case "$1" in
+    198.2[01].*.*) return 0 ;;
+  esac
+  return 1
+}
+
 # Добавляет host-маршрут через en0, даже если уже есть маршрут через utun
 # Добавляет ТОЛЬКО внутренние корп. IP (10/8, 192.168/16)
 add_host_route_en0() {
@@ -202,6 +215,16 @@ wifi_gateway() {
   netstat -rn -f inet | awk '$1=="default" && $NF!~/^utun/{print $2; exit}'
 }
 
+# Добавляет IP в STATE, если его там ещё нет. Без проверки файл пухнет дублями:
+# add_vpn_server_routes вызывается каждый цикл (30 с), и каждый вызов дописывал
+# по строке на каждый VPN-сервер. С уникальностью del_routes остаётся
+# предсказуемым (было +720 строк/час).
+state_add() {
+  local ip="$1"
+  [ -f "$STATE" ] || : > "$STATE"
+  grep -qxF "$ip" "$STATE" 2>/dev/null || echo "$ip" >> "$STATE"
+}
+
 # Добавляет host-маршрут до VPN-сервера через шлюз корп. Wi-Fi (внешний публичный IP,
 # минуя is_corp_ip). Публичный IP не лежит на локальном линке, поэтому его НЕЛЬЗЯ
 # привязывать через "-interface en0" (on-link -> ARP на чужой IP -> пакеты гаснут).
@@ -220,11 +243,18 @@ add_vpn_server_route_en0() {
     gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
   fi
   [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
+  # Уже через нужный шлюз — НЕ переустанавливаем: безусловный delete+add на
+  # каждом цикле создавал окно без маршрута (мигание) и раздувал STATE.
+  # В STATE IP всё равно вносим, иначе del_routes не уберёт его при смене сети.
+  if route -n get "$ip" 2>/dev/null | grep -q "gateway: $gw"; then
+    state_add "$ip"
+    return 0
+  fi
   # Удаляем конфликтующий маршрут через utun/Karing или on-link, если есть
   route -n delete -host "$ip" >/dev/null 2>&1
   if route -n add -host "$ip" -gateway "$gw" >/dev/null 2>&1; then
     log "Added VPN server route $ip via gateway $gw"
-    echo "$ip" >> "$STATE"
+    state_add "$ip"
     return 0
   fi
   log "Failed to add VPN server route $ip via gateway $gw"
@@ -248,15 +278,17 @@ add_gateway_host_routes() {
   local ip
   for ip in $CORP_GATEWAY_HOSTS; do
     [ -z "$ip" ] && continue
-    # Уже через нужный шлюз — не трогаем
+    # Уже через нужный шлюз — не трогаем, но IP вносим в STATE, иначе
+    # del_routes не уберёт этот маршрут при уходе с корп. Wi-Fi.
     if route -n get "$ip" 2>/dev/null | grep -q "gateway: $gw"; then
+      state_add "$ip"
       continue
     fi
     # Удаляем on-link/utun-маршрут и ставим через шлюз
     route -n delete -host "$ip" >/dev/null 2>&1
     if route -n add -host "$ip" -gateway "$gw" >/dev/null 2>&1; then
       log "Added corp gw-host route $ip via gateway $gw"
-      echo "$ip" >> "$STATE"
+      state_add "$ip"
     else
       log "Failed to add corp gw-host route $ip via gateway $gw"
     fi
@@ -290,19 +322,26 @@ _corp_ip_last=0
 
 # Пересобирает кэш публичных IP корп. доменов. Только публичные адреса:
 # внутренние (10/8, 192.168/16) и VPN_SERVERS исключаем — их пины держит
-# корп. маршрутизация, а не Karing-direct.
+# корп. маршрутизация, а не Karing-direct. Fake-IP Karing (198.20.0.0/15)
+# тоже исключаем: на корп. Wi-Fi корп. DNS резолвится через Karing и отдаёт
+# именно их (см. is_fake_ip).
 refresh_corp_ips() {
   cache=""
+  dropped=0
   for h in $SITE_DOMAINS $SITE_CRITICAL $MYSQL_HOSTS; do
     for ip in $(resolve_corp_dns "$h"); do
       is_corp_ip "$ip" && continue
+      if is_fake_ip "$ip"; then
+        dropped=$((dropped + 1))
+        continue
+      fi
       cache="$cache $ip"
     done
   done
   # Сохраняем уникальные IP (sort -u), чтобы sweep не гадал по вхождениям.
   printf '%s\n' $cache | sort -u > "$CORP_IP_CACHE.tmp" 2>/dev/null
   mv "$CORP_IP_CACHE.tmp" "$CORP_IP_CACHE" 2>/dev/null
-  log "refreshed corp-ip cache: $(wc -l < "$CORP_IP_CACHE" 2>/dev/null || echo 0) public IPs"
+  log "refreshed corp-ip cache: $(wc -l < "$CORP_IP_CACHE" 2>/dev/null || echo 0) public IPs, dropped fake-IP: $dropped"
 }
 
 # Снимает utun-пины Karing с публичных IP корп. доменов (после сна/переинициализации
@@ -321,6 +360,9 @@ sweep_karing_pins() {
     esac
     # Не трогаем VPN_SERVERS и внутренние адреса (их пины ставим мы).
     is_corp_ip "$dest" && continue
+    # Страховка от кэша, собранного старой версией (в нём могли остаться
+    # fake-IP Karing — их пины удалять нельзя, см. is_fake_ip).
+    is_fake_ip "$dest" && continue
     if route -n delete -host "$dest" >/dev/null 2>&1; then
       rem="$rem $dest"
     fi
