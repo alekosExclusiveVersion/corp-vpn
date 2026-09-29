@@ -45,15 +45,37 @@ MySQL:
 
 ```bash
 ./karing-rules.sh             # показать группы (JSON)
+./karing-rules.sh --check     # сверить live-конфиг Karing с corp-networks.conf
 ./karing-rules.sh -i          # применить в конфиг Karing (с бэкапом)
 ./karing-rules.sh --singbox   # правила в формате sing-box
 ```
 
 Проверка текущих правил Karing — `./karing-rules.sh --singbox`.
 
+### `-i` и работающий Karing
+
+Karing держит конфигурацию в памяти и перезаписывает ею
+`karing_routing_group.json` при каждом сохранении, поэтому правки, сделанные
+`-i` на живом приложении, пропадают без следа. Перед `-i` Karing нужно
+закрыть, после — запустить обратно. `--check` ничего не меняет, только
+докладывает о расхождениях (код возврата 0 — чисто, 1 — дрейф, 2 — конфиг
+не прочитан) и предупреждает, если приложение запущено.
+
 ### collect-sites.py — сбор сайтов в `SITE_DOMAINS`
 
-Пароль MySQL рекомендуется брать из macOS Keychain (не передавать в
+Проще всего брать хосты и пароли прямо из реестра Parallels SQL Admin —
+секрет не появляется ни в `argv`, ни в истории:
+
+```bash
+./collect-sites.py --from-app --hosts p7ru1.tradesoft.ru --out sites-p7ru1.txt
+```
+
+`--from-app` читает `config.ini` и `servers.json` из каталога данных
+приложения и расшифровывает пароли тем же Fernet-ключом из Keychain, что и
+GUI. Репозиторный `servers.json` содержит только хосты с пустыми паролями,
+поэтому для работы с БД нужен либо `--from-app`, либо внешний пароль.
+
+Пароль MySQL можно также брать из macOS Keychain (не передавать в
 `--password` — пароль светится в истории команд):
 
 ```bash
@@ -61,8 +83,9 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 ./collect-sites.py --password-keychain --hosts p7ru4.tradesoft.ru --out sites-p7ru4.txt
 ```
 
-Порядок выбора пароля: `--password` → `--password-keychain [SERVICE]`
-(по умолчанию `collect-sites`) → интерактивный ввод.
+Порядок выбора пароля без `--from-app`: `--password` →
+`--password-keychain [SERVICE]` (по умолчанию `collect-sites`) →
+интерактивный ввод.
 
 ## Восстановление на новом Mac
 
@@ -70,7 +93,9 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 git clone git@github.com:alekosExclusiveVersion/corp-vpn
 cd corp-vpn
 sudo ./install.sh             # демон маршрутов + corp-networks.conf (split-режим)
+osascript -e 'quit app "Karing"'   # -i не закрепится, пока Karing запущен
 ./karing-rules.sh -i          # группы Karing (ts-network / На прямую)
+open -a Karing                # вернуть приложение
 ```
 
 Затем в приложении Karing: добавить подписку (ссылку брать у провайдера) и
@@ -81,6 +106,6 @@ sudo ./install.sh             # демон маршрутов + corp-networks.co
 
 | Файл | Назначение |
 |---|---|
-| `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `-i` — применить с бэкапом |
-| `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; пароль — из Keychain (`--password-keychain`) |
+| `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `--check` — сверка live-конфига с дрейфом, `-i` — применить с бэкапом (Karing должен быть закрыт) |
+| `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`) |
 | `README.md` | Документация |

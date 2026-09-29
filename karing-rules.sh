@@ -6,7 +6,13 @@
 # Запуск:
 #   ./karing-rules.sh            # JSON-группы для вставки в Karing
 #   ./karing-rules.sh --singbox  # правила в формате sing-box
+#   ./karing-rules.sh --check    # сверять live-конфиг Karing с corp-networks.conf
 #   ./karing-rules.sh -i         # применить в конфиг Karing (с бэкапом)
+#
+# ВАЖНО про -i: работающий Karing держит конфигурацию в памяти и периодически
+# перезаписывает ею файл, поэтому правки, сделанные -i, пропадают. Перед -i
+# приложение нужно закрыть; --check показывает расхождения и предупреждает,
+# что Karing запущен.
 #
 # Группы:
 #   "ts-network" — вся корпоративная зона из corp-networks.conf
@@ -240,8 +246,129 @@ PY
   rm -rf "$tmpdir"
 }
 
+check() {
+  # Только читает live-конфиг Karing и сверяет его с corp-networks.conf.
+  # Ничего не изменяет. Код возврата: 0 — расхождений нет, 1 — есть дрейф,
+  # 2 — конфиг не прочитан (пригодно как гейт в мониторинге).
+  python3 - "$0" "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$DOMAINS" "$SITE_DOMAINS" \
+      "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" <<'PY'
+import json, sys, os, socket, subprocess
+
+self_name = sys.argv[1]
+routing_path, subscribe_path = sys.argv[2:4]
+DOMAINS, SITE_DOMAINS, MYSQL_HOSTS, DOMAIN_SUFFIX, NET_ROUTES, VPN_SERVERS = \
+    (sys.argv[i].split() for i in range(4, 10))
+
+managed = {
+    'domain': DOMAINS + SITE_DOMAINS + MYSQL_HOSTS,
+    'domain_suffix': DOMAIN_SUFFIX,
+    'ip_cidr': NET_ROUTES + VPN_SERVERS,
+}
+
+unresolved = []
+for host in MYSQL_HOSTS:
+    try:
+        for r in socket.getaddrinfo(host, None, socket.AF_INET):
+            ip = r[4][0]
+            if ip not in managed['ip_cidr']:
+                managed['ip_cidr'].append(ip)
+    except socket.gaierror:
+        unresolved.append(host)
+
+try:
+    with open(routing_path, encoding='utf-8') as f:
+        routing = json.load(f)
+except Exception as ex:
+    print(f"Не удалось прочитать {routing_path}: {ex}", file=sys.stderr)
+    sys.exit(2)
+
+groups = []
+for item in routing.get('items', []):
+    groups.extend(item.get('groups', []))
+ts = next((g for g in groups if g.get('name') == 'ts-network'), None)
+
+print("Проверка дрейфа ts-network")
+print("  конфиг: " + routing_path)
+
+try:
+    p = subprocess.run(['pgrep', '-f', 'Karing.app/Contents/MacOS/Karing'],
+                       capture_output=True, text=True, check=False)
+    pids = p.stdout.split()
+except OSError:
+    pids = []
+if pids:
+    print("  Karing: ЗАПУЩЕН (PID " + ", ".join(pids) + ") — он держит конфиг в памяти"
+          " и перезапишет файл при следующем сохранении, поэтому -i не закрепится")
+else:
+    print("  Karing: не запущен — -i закрепится")
+
+if ts is None:
+    print("  группа ts-network: ОТСУТСТВУЕТ в live-конфиге")
+    sys.exit(1)
+
+drift = 0
+for key in ('domain', 'domain_suffix', 'ip_cidr'):
+    want = managed[key]
+    live = ts.get(key, [])
+    uniq = set(live)
+    missing = [x for x in want if x not in uniq]
+    extra = sorted(x for x in uniq if x not in set(want))
+    dups = sorted(x for x in uniq if live.count(x) > 1)
+    line = f"  {key:15} управляется {len(want):3}, в live {len(uniq):3} уникальных"
+    if dups:
+        line += f" (дублей: {len(dups)})"
+    print(line)
+    if key == 'ip_cidr' and unresolved:
+        print(f"  {'':15} MySQL-хосты не резолвятся: {', '.join(unresolved)}"
+              " — ip_cidr проверен не полностью")
+    if missing:
+        drift += len(missing)
+        print(f"  {'':15} ОТСУТСТВУЮТ ({len(missing)}): {', '.join(sorted(missing))}")
+    if extra:
+        shown = ', '.join(extra[:10])
+        more = f" и ещё {len(extra) - 10}" if len(extra) > 10 else ""
+        print(f"  {'':15} лишние ({len(extra)}, личные правки — норма): {shown}{more}")
+
+corp = set(managed['domain']) | set(managed['domain_suffix']) | set(managed['ip_cidr'])
+direct = next((g for g in groups if g.get('name') == 'На прямую'), None)
+if direct is None:
+    print('  "На прямую"      группы нет (норма)')
+else:
+    leftover = [x for k in ('domain', 'domain_suffix', 'ip_cidr')
+                for x in (direct.get(k) or []) if x in corp]
+    if leftover:
+        drift += len(leftover)
+        print(f'  "На прямую"      корп. элементов не перенесено: '
+              f"{len(leftover)}: {', '.join(sorted(leftover)[:10])}")
+    else:
+        print('  "На прямую"      корп. элементов не осталось')
+
+try:
+    with open(subscribe_path, encoding='utf-8') as f:
+        sub = json.load(f)
+    div = next((e for e in sub.get('diversion_group', [])
+                if e.get('diversion_name') == 'ts-network'), None)
+    if div and div.get('server_name') == 'direct_out':
+        print("  diversion_group  ts-network -> direct_out: ок")
+    else:
+        drift += 1
+        got = div.get('server_name') if div else 'нет записи'
+        print(f"  diversion_group  ts-network -> НЕ direct_out ({got})")
+except Exception as ex:
+    print(f"  diversion_group  не прочитан: {ex}")
+
+print()
+if drift:
+    print(f"ДРЕЙФ: {drift} расхождений — применить: {self_name} -i "
+          "(при выключенном Karing)")
+    sys.exit(1)
+print("Дрейфа нет: live-конфиг совпадает с corp-networks.conf")
+PY
+}
+
 case "${1:-}" in
-  -i|--apply) apply ;;
-  --singbox)  singbox_rule ;;
-  *)          group_json ;;
+  -i|--apply)  apply ;;
+  --check)     check ;;
+  --singbox)   singbox_rule ;;
+  *)           group_json ;;
 esac
