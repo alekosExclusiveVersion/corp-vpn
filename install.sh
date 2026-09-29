@@ -69,6 +69,50 @@ if ! sh "$DIR/corp-vpn-routes.sh" --selftest; then
 fi
 echo
 
+echo "==> Самопроверка генератора Karing (без сети)..."
+# karing-rules.sh -i пишет прямо в конфиг Karing, поэтому ошибка в нём
+# молча уводит корп. трафик мимо туннеля, а откат виден только в UI Karing.
+# Проверяем на подставленных фикстурах с подменёнными HOME/CORP_NETWORKS_CONF
+# (живой конфиг не читается и не меняется).
+if sh "$DIR/karing-rules.sh" --selftest; then
+  KARING_SELFTEST_OK=1
+else
+  KARING_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки karing-rules.sh — правила для Karing"
+  echo "!! могут быть неверны. Синхронизацию пока не выполняйте."
+fi
+echo
+
+echo "==> Самопроверка сборщика доменов (без MySQL)..."
+# collect-sites.py кормит SITE_DOMAINS, из которых karing-rules.sh строит
+# direct-группу: ошибка в фильтре мусора заводит в Karing почтовые хосты
+# и тестовые инстансы. Нужен интерпретатор с pymysql — берём venv приложения
+# SQL Admin, иначе проверку пропускаем.
+PY_SELFTEST=""
+for cand in "$(dirname "$DIR")/parallels-sql-admins/.venv/bin/python" \
+            /usr/local/bin/python3 python3; do
+  if command -v "$cand" >/dev/null 2>&1 && \
+     "$cand" -c 'import pymysql' >/dev/null 2>&1; then
+    PY_SELFTEST="$cand"
+    break
+  fi
+done
+if [ -n "$PY_SELFTEST" ]; then
+  if "$PY_SELFTEST" "$DIR/collect-sites.py" --selftest; then
+    COLLECT_SELFTEST_OK=1
+  else
+    COLLECT_SELFTEST_OK=0
+    fail=1
+    echo "!! ПРОВАЛ самопроверки collect-sites.py — список SITE_DOMAINS"
+    echo "!! может содержать мусор."
+  fi
+else
+  COLLECT_SELFTEST_OK=0
+  echo "-- интерпретатор с pymysql не найден, проверка пропущена"
+fi
+echo
+
 echo "==> Установка файлов демона..."
 if [ "$ROUTES_SELFTEST_OK" -eq 1 ]; then
   cp "$DIR/corp-vpn-routes.sh" "$DAEMON_SCRIPT"

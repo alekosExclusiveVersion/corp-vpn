@@ -21,11 +21,14 @@ MySQL-серверах. Собранный список подставляетс
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
+import io
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -269,7 +272,9 @@ def clean_file(path: Path) -> None:
     })
     keep = clean_list(set(raw))
     junk = sorted(set(raw) - set(keep))
-    print(f"Всего: {len(raw)}, удалено мусора: {len(junk)}, осталось: {len(keep)}")
+    path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+    print(f"{path}: всего {len(raw)}, удалено мусора: {len(junk)}, "
+          f"осталось: {len(keep)}")
     if junk:
         print("Удалено:")
         for d in junk:
@@ -300,6 +305,88 @@ def keychain_password(service: str, user: str) -> str | None:
         return None
     password = r.stdout.strip()
     return password or None
+
+
+def selftest() -> int:
+    """Проверка чистых функций: регулярки доменов, фильтр мусора, clean_list.
+    Сеть и MySQL не нужны."""
+    failed = 0
+    total = 0
+
+    def eq(name, got, want):
+        nonlocal failed, total
+        total += 1
+        if got == want:
+            return True
+        failed += 1
+        print(f"  FAIL {name}\n       получено: {got!r}\n       ожидалось: {want!r}")
+        return False
+
+    def ok(name, cond):
+        return eq(name, bool(cond), True)
+
+    # extract_domain: принимаем URL, голый домен, порт, путь, кавычки
+    eq("extract: голый домен", extract_domain("zap14.pro"), "zap14.pro")
+    eq("extract: www", extract_domain("www.client-auto.ru"), "client-auto.ru")
+    eq("extract: https", extract_domain("https://avizone.ru/catalog"),
+       "avizone.ru")
+    eq("extract: с портом", extract_domain("b24.tradesoft.ru:443"),
+       "b24.tradesoft.ru")
+    eq("extract: в кавычках", extract_domain('"repart.su"'), "repart.su")
+    eq("extract: регистр", extract_domain("NEWAutoRu.RU"), "newautoru.ru")
+    eq("extract: без домена", extract_domain("localhost"), None)
+    eq("extract: пусто", extract_domain(""), None)
+    eq("extract: не домен", extract_domain("12345"), None)
+
+    # is_junk_domain: почта и служебные префиксы
+    ok("junk: smtp.", is_junk_domain("smtp.gmail.com"))
+    ok("junk: smtp. внутри", is_junk_domain("smtp.yandex.ru"))
+    ok("junk: mail.", is_junk_domain("mail.example.ru"))
+    ok("junk: demo-префикс", is_junk_domain("demo203.auto-vision.ru"))
+    ok("junk: test-префикс", is_junk_domain("test-site1.ru"))
+    ok("junk: debug в начале", is_junk_domain("debug.example.ru"))
+    ok("junk: war-префикс", is_junk_domain("war.example.ru"))
+
+    # is_junk_domain: суффиксы платформы и тестовые инстансы
+    ok("junk: .tradesoft.pro", is_junk_domain("site.tradesoft.pro"))
+    ok("junk: .azure-api.net", is_junk_domain("x.azure-api.net"))
+    ok("junk: .auto-vision.ru", is_junk_domain("a.auto-vision.ru"))
+    ok("junk: инстанс .t171", is_junk_domain("dev.t171"))
+    ok("junk: инстанс .php7", is_junk_domain("site.php7"))
+    ok("junk: JUNK_EXACT", is_junk_domain("3dsec.sberbank.ru"))
+
+    # is_junk_domain: настоящие домены клиентов не должны попасть под фильтр
+    ok("keep: zap14.pro", not is_junk_domain("zap14.pro"))
+    ok("keep: client-auto.ru", not is_junk_domain("client-auto.ru"))
+    ok("keep: tradesoft.ru (не суффикс .pro)",
+       not is_junk_domain("b24.tradesoft.ru"))
+    ok("keep: debug НЕ в начале", not is_junk_domain("autoprice_debugp5g4.ru"))
+    ok("keep: test НЕ в начале", not is_junk_domain("contest-parts.ru"))
+    ok("keep: auto-tron.ru.ru (не JUNK_EXACT-подобно)",
+       not is_junk_domain("my-auto-tron.ru.ru"))
+
+    # clean_list: сортировка, дедуп, отсев мусора
+    eq("clean_list: сортировка и дедуп",
+       clean_list({"b.ru", "a.ru", "b.ru"}), ["a.ru", "b.ru"])
+    eq("clean_list: мусор выброшен",
+       clean_list({"a.ru", "smtp.gmail.com", "dev.t171"}), ["a.ru"])
+    eq("clean_list: пустое множество", clean_list(set()), [])
+
+    # clean_file: файл на диске (вывод функции заглушаем)
+    with tempfile.TemporaryDirectory() as td, contextlib.redirect_stdout(
+            io.StringIO()):
+        p = Path(td) / "s.txt"
+        p.write_text("zz.ru\nsmtp.gmail.com\naa.ru\ndev.t171\nzz.ru\n",
+                     encoding="utf-8")
+        clean_file(p)
+        eq("clean_file: результат", p.read_text(encoding="utf-8"),
+           "aa.ru\nzz.ru\n")
+        p.write_text("", encoding="utf-8")
+        clean_file(p)
+        eq("clean_file: пустой файл", p.read_text(encoding="utf-8"), "")
+
+    print(f"selftest: {total - failed} passed, {failed} failed")
+    return 1 if failed else 0
 
 
 def app_servers(app_path: str) -> list[dict]:
@@ -367,7 +454,12 @@ def main() -> None:
                     help="отфильтровать служебные/тестовые домены в файле (без MySQL)")
     ap.add_argument("--probe", nargs="*", metavar="HOST [DB]",
                     help="показать настройки одной БД (исследование схемы)")
+    ap.add_argument("--selftest", action="store_true",
+                    help="проверка чистых функций (без MySQL и сети)")
     args = ap.parse_args()
+
+    if args.selftest:
+        sys.exit(selftest())
 
     if args.clean:
         clean_file(Path(args.clean))

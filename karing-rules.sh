@@ -31,7 +31,7 @@
 set -uo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CONF=/usr/local/etc/corp-networks.conf
+CONF="${CORP_NETWORKS_CONF:-/usr/local/etc/corp-networks.conf}"
 [ -f "$CONF" ] || CONF="$DIR/corp-networks.conf"
 [ -f "$CONF" ] || CONF="$(dirname "$DIR")/corp-vpn/corp-networks.conf"
 
@@ -366,9 +366,145 @@ print("Дрейфа нет: live-конфиг совпадает с corp-network
 PY
 }
 
+selftest() {
+  # Проверка генератора и сверки дрейфа на фикстурах. Живой конфиг Karing
+  # не читается и не меняется: подменяются HOME и CORP_NETWORKS_CONF.
+  local pass=0 fail=0 tmp home conf kg
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  ck() {  # ck <имя> <ожидаемое> <фактическое>
+    if [ "$2" = "$3" ]; then
+      pass=$((pass + 1))
+    else
+      fail=$((fail + 1))
+      printf '  FAIL %s\n       ожидалось: %s\n       получено: %s\n' \
+        "$1" "$2" "$3"
+    fi
+  }
+
+  # --- to_json_array ---
+  ck "to_json_array: пусто" "" "$(to_json_array '')"
+  ck "to_json_array: один" '"a.ru"' "$(to_json_array 'a.ru')"
+  ck "to_json_array: список" '"a.ru", "b.ru"' "$(to_json_array 'a.ru b.ru')"
+
+  # --- фикстура конфига и live-конфига ---
+  conf="$tmp/net.conf"
+  cat > "$conf" <<'CONF'
+SITE_DOMAINS="a.ru b.ru"
+MYSQL_HOSTS=""
+DOMAINS="m.ru"
+DOMAIN_SUFFIX=".tradesoft.ru"
+NET_ROUTES="192.168.0.0/16"
+VPN_SERVERS="203.0.113.7"
+CONF
+  home="$tmp/home"
+  kg="$home/Library/Group Containers/group.com.nebula.karing"
+  mkdir -p "$kg"
+
+  # live-конфиг, полностью совпадающий с conf
+  python3 - "$kg/karing_routing_group.json" <<'PY'
+import json, sys
+doc = {
+  "items": [{
+    "groupid": "custom", "urlOrPath": "", "remark": "Самостоятельная настройка",
+    "editAble": True,
+    "groups": [
+      {"groupid": "custom", "name": "ts-network", "type": "", "or": True,
+       "domain": ["a.ru", "b.ru", "m.ru"],
+       "domain_suffix": [".tradesoft.ru"],
+       "ip_cidr": ["192.168.0.0/16", "203.0.113.7"]},
+      {"groupid": "custom", "name": "На прямую", "type": "", "or": True,
+       "domain": [".yandex.ru"]}
+    ]
+  }],
+  "rule_set_items": []
+}
+with open(sys.argv[1], 'w', encoding='utf-8') as f:
+    json.dump(doc, f, ensure_ascii=False, indent=2)
+with open(sys.argv[1].replace('routing_group', 'subscribe_use'), 'w',
+          encoding='utf-8') as f:
+    json.dump({"diversion_group": [
+        {"diversion_groupid": "custom", "diversion_name": "ts-network",
+         "server_groupid": "direct", "server_name": "direct_out",
+         "dns_servers": []}]}, f, ensure_ascii=False, indent=2)
+PY
+
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: без дрейфа, код 0" "0" "$?"
+  ck "check: без дрейфа, нет расхождений" "0" \
+    "$(printf '%s' "$out" | grep -c '^ДРЕЙФ')"
+  ck "check: чистая группа, дубли не отмечены" "0" \
+    "$(printf '%s' "$out" | grep -c 'дублей')"
+
+  # корп. домен, оставшийся в «На прямую», — дрейф
+  python3 - "$kg/karing_routing_group.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+doc = json.load(open(p, encoding='utf-8'))
+for g in doc['items'][0]['groups']:
+    if g['name'] == 'На прямую':
+        g['domain'] = [".yandex.ru", "a.ru"]
+json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: остаток в «На прямую», код 1" "1" "$?"
+  ck "check: назван унесённый домен" "1" \
+    "$(printf '%s' "$out" | grep -c 'корп. элементов не перенесено.*a\.ru')"
+
+  # подменяем «На прямую» на чистую и убираем домен из ts-network
+  python3 - "$kg/karing_routing_group.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+doc = json.load(open(p, encoding='utf-8'))
+groups = doc['items'][0]['groups']
+for g in groups:
+    if g['name'] == 'ts-network':
+        g['domain'] = ["a.ru", "m.ru", "a.ru"]   # пропущен b.ru + дубль
+    if g['name'] == 'На прямую':
+        g['domain'] = [".yandex.ru"]
+json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: дрейф, код 1" "1" "$?"
+  ck "check: назван отсутствующий домен" "1" \
+    "$(printf '%s' "$out" | grep -c 'ОТСУТСТВУЮТ (1): b\.ru')"
+  ck "check: дубль замечен" "1" \
+    "$(printf '%s' "$out" | grep -c 'дублей: 1')"
+
+  # неверный outbound в diversion_group
+  python3 - "$kg/karing_subscribe_use.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+doc = json.load(open(p, encoding='utf-8'))
+doc['diversion_group'][0]['server_name'] = 'proxy'
+json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check >/dev/null 2>&1
+  ck "check: неверный outbound, код 1" "1" "$?"
+
+  # --- генераторы отдают валидный JSON на боевом conf ---
+  real_conf="$DIR/corp-networks.conf"
+  if [ -f "$real_conf" ]; then
+    CORP_NETWORKS_CONF="$real_conf" "$DIR/karing-rules.sh" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="ts-network"; assert d.get("domain"); print("ok")' \
+      >/dev/null 2>&1
+    ck "group_json: валидный JSON ts-network" "0" "$?"
+    CORP_NETWORKS_CONF="$real_conf" "$DIR/karing-rules.sh" --singbox \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["outbound"]=="direct_out"; assert d.get("rules"); print("ok")' \
+      >/dev/null 2>&1
+    ck "singbox: валидный JSON direct_out" "0" "$?"
+  fi
+
+  printf 'selftest: %d passed, %d failed\n' "$pass" "$fail"
+  [ "$fail" -eq 0 ]
+}
+
 case "${1:-}" in
   -i|--apply)  apply ;;
   --check)     check ;;
+  --selftest)  selftest ;;
   --singbox)   singbox_rule ;;
   *)           group_json ;;
 esac

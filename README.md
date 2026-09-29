@@ -87,6 +87,26 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 `--password-keychain [SERVICE]` (по умолчанию `collect-sites`) →
 интерактивный ввод.
 
+## Самопроверки
+
+```bash
+sh corp-vpn-routes.sh --selftest              # демон маршрутов, 41 проверка
+sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 14
+../parallels-sql-admins/.venv/bin/python \
+    collect-sites.py --selftest                # фильтр доменов, 33
+```
+
+Все три работают без root, без сети и без MySQL. `install.sh` прогоняет их
+гейтом до установки: провал `corp-vpn-routes.sh` оставляет прежнюю версию
+демона, провал остальных прерывает установку с `exit 1`. Проверки
+`karing-rules.sh --selftest` подменяют `HOME` и `CORP_NETWORKS_CONF`, поэтому
+живой конфиг Karing не читается и не меняется.
+
+Что они ловят: разбор POINTOPOINT-маски и фильтры подсетей в демоне
+маршрутов, детект дрейфа и остатков корп. элементов в сверке Karing, а также
+ошибки разбора домена и фильтрации мусора в сборщике (`smtp.*`, `*.tradesoft.pro`,
+инстансы `.tNNN`).
+
 ## Восстановление на новом Mac
 
 ```bash
@@ -106,6 +126,6 @@ open -a Karing                # вернуть приложение
 
 | Файл | Назначение |
 |---|---|
-| `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `--check` — сверка live-конфига с дрейфом, `-i` — применить с бэкапом (Karing должен быть закрыт) |
-| `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`) |
+| `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `--check` — сверка live-конфига с дрейфом, `--selftest` — проверки на фикстурах, `-i` — применить с бэкапом (Karing должен быть закрыт) |
+| `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
 | `README.md` | Документация |
