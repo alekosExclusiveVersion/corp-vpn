@@ -87,25 +87,58 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 `--password-keychain [SERVICE]` (по умолчанию `collect-sites`) →
 интерактивный ввод.
 
+### clean-sites.py — чистка `SITE_DOMAINS` от протухших доменов
+
+Сверяет конфиг со свежим полным сканом и показывает домены, которых
+больше нет в живых БД. Работает только с текстом конфигов, MySQL не
+трогает никак:
+
+```bash
+./collect-sites.py --from-app --out sites-fresh.txt   # сначала полный скан (не --hosts!)
+./clean-sites.py --fresh sites-fresh.txt              # dry-run: показать протухшие
+./clean-sites.py --fresh sites-fresh.txt --apply      # удалить с бэкапом .bak.*
+```
+
+Скан обязан быть полным: частичный (`--hosts`, флап MySQL-маршрутов)
+даст ложные срабатывания. Предохранитель отказывается удалять больше
+30% списка без `--force`. `SITE_CRITICAL`, `DOMAINS`, `MYSQL_HOSTS` и
+покрытые `DOMAIN_SUFFIX` не трогаются; осознанно добавленные алиасы,
+которых нет в `csSiteDomain` (напр. `www.`-варианты), держать в `--keep`:
+
+```bash
+./clean-sites.py --fresh sites-fresh.txt --keep opt-ms.com,www.opt-ms.com --apply
+```
+
+После чистки: `karing-rules.sh -i` при закрытом Karing (убрать домены из
+`ts-network`), демон маршрутов сам снимет `/32` в течение цикла.
+
 ## Самопроверки
 
 ```bash
 sh corp-vpn-routes.sh --selftest              # демон маршрутов, 41 проверка
 sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 16
+sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 88
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
+./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
 ```
 
-Все три работают без root, без сети и без MySQL. `install.sh` прогоняет их
-гейтом до установки: провал `corp-vpn-routes.sh` оставляет прежнюю версию
-демона, провал остальных прерывает установку с `exit 1`. Проверки
-`karing-rules.sh --selftest` подменяют `HOME` и `CORP_NETWORKS_CONF`, поэтому
-живой конфиг Karing не читается и не меняется.
+Все пять работают без root, без сети и без MySQL. `install.sh` прогоняет их
+гейтом до установки: провал `corp-vpn-routes.sh` или `corp-routes-clean.sh`
+оставляет прежнюю версию соответствующего демона, провал остальных прерывает
+установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME` и
+`CORP_NETWORKS_CONF`, поэтому живой конфиг Karing не читается и не меняется.
+`corp-routes-clean.sh --selftest` подменяет `netstat`, `route`, `ipconfig`, а
+логи и состояние уводит во временный каталог: живая таблица маршрутов не
+читается на запись и не меняется.
 
 Что они ловят: разбор POINTOPOINT-маски и фильтры подсетей в демоне
-маршрутов, детект дрейфа и остатков корп. элементов в сверке Karing, а также
-ошибки разбора домена и фильтрации мусора в сборщике (`smtp.*`, `*.tradesoft.pro`,
-инстансы `.tNNN`).
+маршрутов, детект дрейфа и остатков корп. элементов в сверке Karing, ошибки
+разбора домена и фильтрации мусора в сборщике (`smtp.*`, `*.tradesoft.pro`,
+инстансы `.tNNN`), порог протухших и защиту `SITE_CRITICAL`/`--keep` в
+чистке списка, а также неверную классификацию битых маршрутов в очистке
+(фантомный шлюз из fake-IP, настоящий шлюз, `utun*`, `lo0`, `default`,
+границы `/15`, двухснимковый гейт).
 
 ## Восстановление на новом Mac
 
@@ -127,5 +160,8 @@ open -a Karing                # вернуть приложение
 | Файл | Назначение |
 |---|---|
 | `karing-rules.sh` | Генератор правил Karing из corp-networks.conf: группы `ts-network` (direct_out, вся корп. зона) и «На прямую» (личные правки); `--check` — сверка live-конфига с дрейфом, `--selftest` — проверки на фикстурах, `-i` — применить с бэкапом (Karing должен быть закрыт) |
+| `corp-routes-clean.sh` | Демон очистки мёртвых маршрутов (сценарии A/B удаляют, сценарий C — фантомный шлюз из fake-IP — по умолчанию только наблюдает); `--selftest` — 88 проверок на фикстурах, `--check` — один проход только на чтение, `--dry-run` — без root и без удалений |
+| `corp-routes-check.sh` | Детектор битых маршрутов Karing, только чтение: fake-IP в назначении и фантомный шлюз из fake-IP; `--sudo-cmd` печатает готовые команды, не выполняя их |
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
+| `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: dry-run по умолчанию, `--apply` с бэкапом, предохранитель от частичного скана (порог 30%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 13 проверок |
 | `README.md` | Документация |
