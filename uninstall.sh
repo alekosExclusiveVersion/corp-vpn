@@ -41,6 +41,8 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+CLEAN_PGPREV="/var/run/corp-routes-clean.phantom.prev"
+CLEAN_PGCUR="/var/run/corp-routes-clean.phantom.cur"
 DB_CLEAN_LABEL="com.tradesoft.corp-db-clean"
 DB_CLEAN_PLIST="/Library/LaunchDaemons/$DB_CLEAN_LABEL.plist"
 DB_CLEAN_SCRIPT="/usr/local/sbin/corp-db-clean.sh"
@@ -97,7 +99,7 @@ if launchctl list | grep -q "$CLEAN_LABEL"; then
   launchctl unload "$CLEAN_PLIST"
 fi
 rm -f "$CLEAN_PLIST" "$CLEAN_SCRIPT"
-rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR"
+rm -f "$CLEAN_LOG" "$CLEAN_PREV" "$CLEAN_CUR" "$CLEAN_PGPREV" "$CLEAN_PGCUR"
 
 echo "==> Удаление демона очистки БД aisql (db-clean) из $DB_CLEAN_REPO..."
 if [ -x "$DB_CLEAN_REPO/uninstall.sh" ]; then
@@ -216,7 +218,7 @@ else
   echo "  [OK]   демон $CLEAN_LABEL удалён"
 fi
 
-if [ -e "$CLEAN_SCRIPT" ] || [ -e "$CLEAN_PLIST" ] || [ -e "$CLEAN_LOG" ] || [ -e "$CLEAN_PREV" ] || [ -e "$CLEAN_CUR" ]; then
+if [ -e "$CLEAN_SCRIPT" ] || [ -e "$CLEAN_PLIST" ] || [ -e "$CLEAN_LOG" ] || [ -e "$CLEAN_PREV" ] || [ -e "$CLEAN_CUR" ] || [ -e "$CLEAN_PGPREV" ] || [ -e "$CLEAN_PGCUR" ]; then
   echo "  [FAIL] файлы демона corp-routes-clean остались на диске"
   fail=1
 else
