@@ -37,6 +37,8 @@ CLEAN_SCRIPT="/usr/local/sbin/corp-routes-clean.sh"
 CLEAN_LOG="/var/log/corp-routes-clean.log"
 CLEAN_PREV="/var/run/corp-routes-clean.prev"
 CLEAN_CUR="/var/run/corp-routes-clean.cur"
+CLEAN_PGPREV="/var/run/corp-routes-clean.phantom.prev"
+CLEAN_PGCUR="/var/run/corp-routes-clean.phantom.cur"
 DB_CLEAN_LABEL="com.tradesoft.corp-db-clean"
 DB_CLEAN_PLIST="/Library/LaunchDaemons/$DB_CLEAN_LABEL.plist"
 DB_CLEAN_SCRIPT="/usr/local/sbin/corp-db-clean.sh"
@@ -46,6 +48,11 @@ NOTIFY_LABEL="com.tradesoft.corp-notify"
 NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
 NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
 NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
+SYNC_LABEL="com.tradesoft.corp-sites-sync"
+SYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$SYNC_LABEL.plist"
+SYNC_SCRIPT="/usr/local/sbin/corp-sites-sync.sh"
+SYNC_KEEP="/usr/local/etc/sites-keep.txt"
+SYNC_LOGDIR="/Users/aleksei/Library/Logs/corp-sites-sync"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
@@ -110,6 +117,35 @@ if [ -n "$PY_SELFTEST" ]; then
 else
   COLLECT_SELFTEST_OK=0
   echo "-- интерпретатор с pymysql не найден, проверка пропущена"
+fi
+echo
+
+echo "==> Самопроверка чистки доменов (только stdlib)..."
+# clean-sites.py удаляет из SITE_DOMAINS (при --apply), поэтому ошибка
+# в нём — это потерянные корп. маршруты. Selftest на фикстурах, без сети.
+if python3 "$DIR/clean-sites.py" --selftest; then
+  CLEANSITES_SELFTEST_OK=1
+else
+  CLEANSITES_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки clean-sites.py — чистка списка доменов"
+  echo "!! может снести лишнее."
+fi
+echo
+
+echo "==> Самопроверка демона очистки мёртвых маршрутов (без root и без сети)..."
+# corp-routes-clean.sh мутирует таблицу маршрутов от имени root, поэтому
+# ошибка в нём — это отрезанный корп. трафик, а не косметика. Selftest гоняет
+# сценарии A/B/C на подставных фикстурах с заглушками netstat/route и проверяет,
+# что сценарий C по умолчанию только наблюдает (удаление выключено), а хост
+# с настоящим шлюзом, utun-маршрут и on-link адрес не трогаются.
+if sh "$DIR/corp-routes-clean.sh" --selftest; then
+  CLEAN_SELFTEST_OK=1
+else
+  CLEAN_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки corp-routes-clean.sh — демон очистки"
+  echo "!! маршрутов не обновлён, осталась предыдущая версия."
 fi
 echo
 
@@ -179,10 +215,15 @@ fi
 launchctl load -w "$DIAG_PLIST"
 
 echo "==> Установка демона очистки мёртвых маршрутов (corp-routes-clean)..."
-cp "$DIR/corp-routes-clean.sh" "$CLEAN_SCRIPT"
-chmod 755 "$CLEAN_SCRIPT"
+if [ "$CLEAN_SELFTEST_OK" -eq 1 ]; then
+  cp "$DIR/corp-routes-clean.sh" "$CLEAN_SCRIPT"
+  chmod 755 "$CLEAN_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $CLEAN_SCRIPT НЕ обновлён."
+  echo "!! (осталась предыдущая версия, если демон ставился ранее)"
+fi
 cp "$DIR/com.tradesoft.corp-routes-clean.plist" "$CLEAN_PLIST"
-rm -f "$CLEAN_PREV" "$CLEAN_CUR"
+rm -f "$CLEAN_PREV" "$CLEAN_CUR" "$CLEAN_PGPREV" "$CLEAN_PGCUR"
 : > "$CLEAN_LOG" 2>/dev/null || true
 if launchctl list | grep -q "$CLEAN_LABEL"; then
   launchctl unload "$CLEAN_PLIST" 2>/dev/null || true
@@ -208,6 +249,34 @@ if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$NOTIFY_PLIST" 2>/dev/null || true
 fi
 launchctl bootstrap "gui/$NOTIFY_UID" "$NOTIFY_PLIST"
+
+echo "==> Установка юзер-агента актуализации доменов (sites-sync, LaunchAgent $NOTIFY_UID)..."
+# Контекст пользователя обязателен: Fernet-ключ servers.json лежит в его
+# Keychain (root-демону недоступен). Привилегии — через ~/bin/sudo внутри.
+if [ "${CLEANSITES_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/sites-sync.sh" "$SYNC_SCRIPT"
+  chmod 755 "$SYNC_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $SYNC_SCRIPT НЕ обновлён."
+  echo "!! (осталась предыдущая версия, если агент ставился ранее)"
+fi
+if [ ! -f "$SYNC_KEEP" ]; then
+  cp "$DIR/sites-keep.txt" "$SYNC_KEEP"
+  chmod 644 "$SYNC_KEEP"
+else
+  echo "  (keep-файл уже есть, не перезаписываю: $SYNC_KEEP)"
+fi
+mkdir -p /Users/aleksei/Library/LaunchAgents
+cp "$DIR/com.tradesoft.corp-sites-sync.plist" "$SYNC_PLIST"
+chown aleksei:staff "$SYNC_PLIST"
+mkdir -p "$SYNC_LOGDIR"
+chown aleksei:staff "$SYNC_LOGDIR"
+date +%s > "$SYNC_LOGDIR/last-ok"
+chown aleksei:staff "$SYNC_LOGDIR/last-ok"
+if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$SYNC_PLIST" 2>/dev/null || true
+fi
+launchctl bootstrap "gui/$NOTIFY_UID" "$SYNC_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -330,6 +399,20 @@ else
   fail=1
 fi
 
+if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
+  echo "  [OK]   юзер-агент $SYNC_LABEL загружен"
+else
+  echo "  [FAIL] юзер-агент $SYNC_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$SYNC_SCRIPT" ]; then
+  echo "  [OK]   скрипт $SYNC_SCRIPT"
+else
+  echo "  [FAIL] скрипт $SYNC_SCRIPT отсутствует"
+  fail=1
+fi
+
 if [ -r "$NETWORKS_CONF" ]; then
   echo "  [OK]   конфиг корп. сетей $NETWORKS_CONF"
 else
@@ -368,6 +451,7 @@ if [ "$fail" -eq 0 ]; then
   echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
   echo "Очистка БД aisql по заявкам Б24 — corp-db-clean (ежедневно 03:00, /var/log/corp-db-clean.log)."
   echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
+echo "Актуализация доменов — corp-sites-sync (LaunchAgent, 08:00/14:00/20:00 + догон)."
 else
   echo
   if [ "$ROUTES_SELFTEST_OK" -eq 0 ]; then

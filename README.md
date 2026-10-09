@@ -112,6 +112,28 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 После чистки: `karing-rules.sh -i` при закрытом Karing (убрать домены из
 `ts-network`), демон маршрутов сам снимет `/32` в течение цикла.
 
+### sites-sync.sh — автоматическая актуализация списков (3 раза в день)
+
+Юзер-агент `com.tradesoft.corp-sites-sync` (08:00/14:00/20:00 + догон
+пропущенного при сне/выключенном Mac): проверка `vpn=up`, полный скан
+`collect-sites.py --from-app` с ретраями до 6 попыток на хост (частичный
+скан = пропуск чистки), `clean-sites.py --apply` (keep = `sites-keep.txt`
++ `corp-networks-auto.conf`), `karing-rules.sh -i` с авто-рестартом Karing
+при дрейфе. Контекст пользователя обязателен (Fernet-ключ в его Keychain),
+привилегии — через `~/bin/sudo` внутри скрипта.
+
+```bash
+./sites-sync.sh --dry-run    # проверка без изменений
+./sites-sync.sh --force      # цикл безусловно
+./sites-sync.sh --rollback   # откат конфигов на последний .bak + kickstart
+./sites-sync.sh --selftest   # проверки, 6
+```
+
+Уведомления о фактическом статусе — события `sites-sync.*` (баннер macOS
+всегда; `fail`/`rollback` ещё и в B24+Telegram). Лог-кольцо
+`~/Library/Logs/corp-sites-sync/`, артефакты старше 30 дней удаляются
+(3 последних бэкапа каждого конфига хранятся).
+
 ## Самопроверки
 
 ```bash
@@ -121,9 +143,10 @@ sh corp-routes-clean.sh --selftest              # очистка мёртвых 
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
+./sites-sync.sh --selftest                     # цикл актуализации, 6
 ```
 
-Все пять работают без root, без сети и без MySQL. `install.sh` прогоняет их
+Все шесть работают без root, без сети и без MySQL. `install.sh` прогоняет их
 гейтом до установки: провал `corp-vpn-routes.sh` или `corp-routes-clean.sh`
 оставляет прежнюю версию соответствующего демона, провал остальных прерывает
 установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME` и
@@ -164,4 +187,6 @@ open -a Karing                # вернуть приложение
 | `corp-routes-check.sh` | Детектор битых маршрутов Karing, только чтение: fake-IP в назначении и фантомный шлюз из fake-IP; `--sudo-cmd` печатает готовые команды, не выполняя их |
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
 | `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: dry-run по умолчанию, `--apply` с бэкапом, предохранитель от частичного скана (порог 30%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 13 проверок |
+| `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): VPN-гейт, скан с ретраями, чистка, Karing `-i` с рестартом; события `sites-sync.*`, лог-кольцо, `--rollback`; `--selftest` — 6 проверок |
+| `sites-keep.txt` | Ручные исключения для чистки (осознанные алиасы вне `csSiteDomain`); устанавливается в `/usr/local/etc/sites-keep.txt` один раз, дальше не перезаписывается |
 | `README.md` | Документация |
