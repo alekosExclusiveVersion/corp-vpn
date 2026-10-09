@@ -10,6 +10,10 @@
 #   badroutes.on      появились битые fake-IP маршруты (corp-vpn-diagd)
 #   badroutes.off     битые fake-IP исчезли
 #   vpn.up / vpn.down корп VPN поднялся/отключился (corp-vpn-routes)
+#   sites-sync.ok / skip / fail / rollback актуализация доменов
+#     (corp-sites-sync): ok/skip — только баннер, fail/rollback — ещё
+#     и в B24+Telegram
+#   sites-learn.add новый домен в ts-network (corp-learn) — только баннер
 #
 # Обработка: байтовый указатель читает только НОВЫЕ строки файла (POS-файл).
 # Дедупликация: одно и то же событие (event|message) не чаще раза в 30 сек
@@ -34,13 +38,20 @@ notify() {
     db-clean.ok)      title="aisql: БД удалены" ;;
     db-clean.dryrun)  title="aisql: кандидаты на удаление" ;;
     db-clean.fail)    title="aisql: ошибка очистки" ;;
+    sites-sync.ok)    title="домены: списки синхронизированы" ;;
+    sites-sync.skip)  title="домены: прогоны пропущены" ;;
+    sites-sync.fail)  title="домены: ошибка синхронизации" ;;
+    sites-sync.rollback) title="домены: откат на бэкап" ;;
+    sites-learn.add)  title="ts-network: новый домен" ;;
     *)                title="corp-vpn: $event" ;;
   esac
   osascript -e "display notification \"$msg\" with title \"$title\" sound name \"default\"" 2>/dev/null
 
   # Дублируем события очистки БД aisql в B24 и Telegram (секреты — Keychain).
+  # Из sites-sync дублируем только аварии (fail/rollback): ok приходит
+  # 3 раза в день и заспамит тему алертов.
   case "$event" in
-    db-clean.*)
+    db-clean.*|sites-sync.fail|sites-sync.rollback)
       if [ -x "/opt/homebrew/bin/python3" ] && [ -f "$NOTIFY_PY" ]; then
         /opt/homebrew/bin/python3 "$NOTIFY_PY" "$title: $msg" "$title" >/dev/null 2>&1
       fi
@@ -51,7 +62,10 @@ notify() {
 recently_shown() {
   key=$1
   [ -f "$SEEN" ] || return 1
-  last=$(grep -F "$key " "$SEEN" 2>/dev/null | tail -1 | awk '{print $2}')
+  # Метка времени — ПОСЛЕДНЕЕ поле строки ($NF): сообщение может содержать
+  # пробелы (напр. IP в routes-dead.del), $2 тогда не метка, а мусор,
+  # и арифметика падала с "syntax error: invalid arithmetic operator".
+  last=$(grep -F "$key " "$SEEN" 2>/dev/null | tail -1 | awk '{print $NF}')
   [ -n "$last" ] || return 1
   now=$(date +%s)
   [ $(( now - last )) -lt "$MIN_GAP" ]

@@ -20,6 +20,7 @@
 CONF=/usr/local/etc/corp-networks.conf
 AUTO_CONF=/usr/local/etc/corp-networks-auto.conf
 REPO_CONF=/Users/aleksei/Work/scripts/corp-vpn/corp-networks.conf
+SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
 
 # Значения по умолчанию, если CONF не установлен
 DOMAIN_SUFFIX=".tradesoft.ru .tradesoft.pro .tradesoft.corp"
@@ -95,6 +96,13 @@ add_permanent() {
   echo "learn: $d -> SITE_DOMAINS (навсегда)"
 }
 
+# Сигнал для macOS-баннера через corp-notify (sites-learn.add).
+# Демон бежит root'ом — пишем в очередь напрямую, без sudo.
+learn_signal() {
+  printf '%s|%s|%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "sites-learn.add" "новый домен в ts-network: $1" >> "$SIGNALS" 2>/dev/null || true
+}
+
 while true; do
   now=$(date +%s)
 
@@ -116,7 +124,14 @@ while true; do
     [ -n "$ptr" ] || continue
     ptr=${ptr%.}
     if in_zone "$ptr" && ! known_domain "$ptr"; then
-      add_auto "$ptr"
+      # add_auto печатает строку только при фактическом добавлении —
+      # по ней шлём однократный сигнал (повторы в пределах 60-сек
+      # кэша отсекаются grep-стражем внутри add_auto).
+      added=$(add_auto "$ptr")
+      if [ -n "$added" ]; then
+        echo "$added"
+        learn_signal "$ptr"
+      fi
       add_permanent "$ptr"
     fi
   done

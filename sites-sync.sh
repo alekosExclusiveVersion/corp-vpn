@@ -1,0 +1,348 @@
+#!/bin/bash
+# ==========================================================
+# sites-sync.sh — автоматическая актуализация списков доменов.
+#
+# Цикл (LaunchAgent com.tradesoft.corp-sites-sync, 3 раза в день
+# 08:00/14:00/20:00 + догон пропущенного прогона при старте):
+#   1) тихий выход, если корп. VPN опущен (MySQL недоступны);
+#      3 пропуска подряд = уведомление (VPN лежит весь день);
+#   2) полный скан collect-sites.py --from-app с ретраями на хост
+#      (флап MySQL-маршрутов доказан: Access denied с домашнего IP);
+#      любой неоспрошенный хост после ретраев = пропуск фазы чистки;
+#   3) clean-sites.py --apply (dry-run сначала): предохранитель 30%,
+#      keep = sites-keep.txt + corp-networks-auto.conf (находки corp-learn
+#      сносить нельзя);
+#   4) karing-rules.sh --check: при дрейфе quit Karing -> -i -> open;
+#   5) уведомления о ФАКТИЧЕСКОМ статусе: события sites-sync.* в сигнальную
+#      очередь (баннер macOS через corp-notify: ok/skip×3/fail/rollback
+#      с числами, а не молчание);
+#   6) лог ~/Library/Logs/corp-sites-sync/corp-sites-sync.log
+#      (кольцо 2000 строк), чистка снапшотов/бэкапов старше 30 дней
+#      (кроме 3 последних бэкапов каждого конфига).
+#
+# MySQL только SELECT через collect-sites.py. Удалений баз нет.
+# Секреты в лог не пишутся (только домены/счётчики).
+#
+# Режимы:
+#   (без флагов)   цикл, если с последнего успеха прошло >CATCHUP_HOURS.
+#                  Порог (5ч) меньше минимального интервала расписания
+#                  (6ч: 08:00/14:00/20:00), поэтому плановые прогоны идут
+#                  всегда, а пропуск при сне/выключенном Mac догоняется
+#                  на ближайшем срабатывании (сон покрывает и сам launchd
+#                  coalescing-ом пропущенных StartCalendarInterval).
+#   --force        цикл безусловно (для отладки и ручного догона);
+#   --dry-run      скан + чистка без --apply + karing --check, без изменений;
+#   --rollback     откат обоих конфигов на последний .bak + kickstart демона;
+#   --selftest     проверки на фикстурах (без сети, без MySQL, без root).
+# ==========================================================
+set -uo pipefail
+
+REPO="${SITES_SYNC_REPO:-$HOME/Work/scripts/corp-vpn}"
+INSTALLED_CONF="${SITES_SYNC_CONF:-/usr/local/etc/corp-networks.conf}"
+REPO_CONF="$REPO/corp-networks.conf"
+AUTO_CONF="${SITES_SYNC_AUTO:-/usr/local/etc/corp-networks-auto.conf}"
+MANUAL_KEEP="${SITES_SYNC_KEEP:-/usr/local/etc/sites-keep.txt}"
+SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
+LOGDIR="${SITES_SYNC_LOGDIR:-$HOME/Library/Logs/corp-sites-sync}"
+LOG="$LOGDIR/corp-sites-sync.log"
+LAST_OK="$LOGDIR/last-ok"
+SKIP_COUNT="$LOGDIR/skip-count"
+LOG_KEEP_LINES=2000
+KEEP_DAYS=30
+MAX_TRIES=6
+RETRY_SLEEP=8
+CATCHUP_HOURS=5
+SUDO="$HOME/bin/sudo"
+
+VENV_PY=""
+for cand in "$HOME/Work/scripts/parallels-sql-admins/.venv/bin/python" \
+            /opt/homebrew/bin/python3 /usr/local/bin/python3 python3; do
+  if command -v "$cand" >/dev/null 2>&1; then VENV_PY="$cand"; break; fi
+done
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+# Кольцевая обрезка лога (конвенция DIAG_MAX демона маршрутов).
+trim_log() {
+  local f="$1" max="$2" n
+  n=$(wc -l < "$f" 2>/dev/null || echo 0)
+  if [ "$n" -gt "$max" ]; then
+    tail -n "$max" "$f" > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f"
+  fi
+}
+
+# Строка сигнального события: ts|event|message. Через неё corp-notify
+# показывает баннер macOS о фактическом статусе прогона.
+signal_line() { printf '%s|%s|%s\n' "$(date +%s)" "$1" "$2"; }
+
+emit() {
+  # Сигнал передаётся строкой-аргументом через sh -c, а НЕ пайпом в tee:
+  # обёртка ~/bin/sudo подаёт пароль в stdin дочернего `sudo -S` и не
+  # пробрасывает свой stdin дальше, поэтому `... | $SUDO tee -a`
+  # молча теряло данные (tee получал EOF при rc=0, сигналов не было).
+  local line
+  line=$(signal_line "$1" "$2")
+  $SUDO /bin/sh -c 'printf "%s\n" "$1" >> "$0"' "$SIGNALS" "$line" >/dev/null 2>&1 ||
+    log "WARN: не записал сигнал $1 (sudo?)"
+}
+
+vpn_up() { ifconfig ppp0 2>/dev/null | grep -q 'inet '; }
+
+# conf_mtime <60с назад менял corp-learn? Не драться с автодетектом.
+learn_recent() {
+  local f now mt
+  now=$(date +%s)
+  for f in "$INSTALLED_CONF" "$AUTO_CONF"; do
+    [ -f "$f" ] || continue
+    mt=$(stat -f %m "$f" 2>/dev/null || echo 0)
+    if [ $(( now - mt )) -lt 60 ]; then return 0; fi
+  done
+  return 1
+}
+
+# Сбор keep: ручной файл + auto-конфиг (комментарии/# и пустые мимо).
+build_keep() {
+  local manual="$1" auto="$2"
+  {
+    [ -f "$manual" ] && grep -vE '^[[:space:]]*(#|$)' "$manual"
+    [ -f "$auto" ] && grep -vE '^[[:space:]]*(#|$)' "$auto"
+  } 2>/dev/null | tr 'A-Z' 'a-z' | sort -u
+}
+
+collect_once() {
+  local hosts="$1" out="$2" err
+  if [ -n "$hosts" ]; then
+    err=$("$VENV_PY" "$REPO/collect-sites.py" --from-app \
+          --hosts "$hosts" --out "$out" 2>&1)
+  else
+    err=$("$VENV_PY" "$REPO/collect-sites.py" --from-app \
+          --out "$out" 2>&1)
+  fi
+  printf '%s' "$err" | grep -E 'ошибка|error|ERROR' || true
+}
+
+# Полный скан с ретраями по каждому упавшему хосту.
+# Результат: union-файл в $dir/union.txt; неуспешные хосты — в $dir/failhosts.
+do_collect() {
+  local dir="$1" err hosts h i ok
+  : > "$dir/union.txt"; : > "$dir/failhosts"
+  err=$(collect_once "" "$dir/full.txt")
+  cat "$dir/full.txt" 2>/dev/null >> "$dir/union.txt"
+  hosts=$(printf '%s' "$err" | grep -oE '^[a-z0-9][a-z0-9.-]*\.ru' | sort -u)
+  for h in $hosts; do
+    ok=0
+    for i in $(seq 1 $MAX_TRIES); do
+      sleep "$RETRY_SLEEP"
+      err=$(collect_once "$h" "$dir/host-$h.txt")
+      if [ -z "$err" ]; then ok=1; break; fi
+    done
+    if [ "$ok" -eq 1 ]; then
+      cat "$dir/host-$h.txt" 2>/dev/null >> "$dir/union.txt"
+    else
+      printf '%s\n' "$h" >> "$dir/failhosts"
+    fi
+  done
+  sort -u "$dir/union.txt" -o "$dir/union.txt"
+}
+
+run_cycle() {
+  local dry="$1" dir union failhosts stale removed
+  mkdir -p "$LOGDIR"
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/sites-sync.XXXXXX")
+  log "===== START dry=$dry ====="
+
+  if ! vpn_up; then
+    skip_tick "vpn=down"
+    return 0
+  fi
+  if [ -z "$VENV_PY" ]; then
+    log "FAIL: нет python"
+    emit sites-sync.fail "нет интерпретатора python"
+    return 1
+  fi
+  if learn_recent; then
+    log "SKIP: corp-learn только что писал конфиг, перенос на след. прогон"
+    return 0
+  fi
+
+  do_collect "$dir"
+  union="$dir/union.txt"
+  failhosts=$(tr '\n' ' ' < "$dir/failhosts")
+  log "collect: union=$(wc -l < "$union" | tr -d ' ') доменов"
+  if [ -n "$failhosts" ]; then
+    log "FAIL: неоспрошены: $failhosts"
+    emit sites-sync.fail "частичный скан, хосты: $failhosts — чистка пропущена"
+    return 1
+  fi
+
+  cp "$union" "$LOGDIR/fresh-$(date +%Y%m%d-%H%M).txt"
+  build_keep "$MANUAL_KEEP" "$AUTO_CONF" > "$dir/keep.txt"
+
+  stale=$("$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
+    --keep-file "$dir/keep.txt" 2>&1)
+  removed=$(printf '%s' "$stale" | grep -c '^  - ' || true)
+  log "clean dry-run: протухших $removed"
+  if [ "$dry" -eq 1 ]; then
+    log "dry-run: изменений нет"
+    kar_check
+    return 0
+  fi
+
+  if [ "$removed" -gt 0 ]; then
+    if "$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
+        --keep-file "$dir/keep.txt" --apply >> "$LOG" 2>&1; then
+      log "clean --apply ok, удалено $removed"
+      $SUDO launchctl kickstart -k system/com.tradesoft.corp-vpn-routes \
+        >/dev/null 2>&1 || log "WARN: kickstart демона"
+    else
+      log "FAIL: clean --apply (предохранитель?)"
+      emit sites-sync.fail "clean-sites отказался применяться — конфиги не тронуты"
+      return 1
+    fi
+  else
+    log "clean: протухших нет"
+  fi
+
+  kar_check || return 1
+  mark_ok
+  prune_artifacts
+  trim_log "$LOG" "$LOG_KEEP_LINES"
+  log "===== FINISH ok ====="
+  emit sites-sync.ok "удалено доменов: $removed, Karing в норме"
+  return 0
+}
+
+# Пропуск прогона: тихо в лог; каждый 3-й подряд пропуск (VPN лежит весь
+# день) — уведомление о фактическом статусе.
+skip_tick() {
+  local reason="$1" n
+  n=$(cat "$SKIP_COUNT" 2>/dev/null || echo 0)
+  n=$(( n + 1 ))
+  printf '%s' "$n" > "$SKIP_COUNT"
+  log "SKIP ($n подряд): $reason"
+  if [ "$n" -ge 3 ]; then
+    emit sites-sync.skip "3 прогона подряд пропущены ($reason) — проверь VPN"
+    printf '0' > "$SKIP_COUNT"
+  fi
+}
+
+mark_ok() {
+  date +%s > "$LAST_OK"
+  printf '0' > "$SKIP_COUNT"
+}
+
+# Догон: с последнего успеха прошло больше CATCHUP_HOURS — прогон нужен.
+catchup_due() {
+  local last now
+  [ -f "$LAST_OK" ] || return 0
+  last=$(cat "$LAST_OK" 2>/dev/null || echo 0)
+  now=$(date +%s)
+  [ $(( now - last )) -gt $(( CATCHUP_HOURS * 3600 )) ]
+}
+
+# Karing: дрейф -> quit -> -i -> open -> перепроверка.
+kar_check() {
+  local drift
+  drift=$(sh "$REPO/karing-rules.sh" --check 2>&1 | grep -E 'ОТСУТСТВУЮТ|ДРЕЙФ' || true)
+  if [ -z "$drift" ]; then log "karing: дрейфа нет"; return 0; fi
+  log "karing: дрейф, рестарт для -i"
+  /usr/bin/osascript -e 'tell application "Karing" to quit' >/dev/null 2>&1 || true
+  sleep 6
+  if pgrep -f "Karing.app/Contents/MacOS/Karing" >/dev/null 2>&1; then
+    log "FAIL: Karing не закрылся, -i пропускается"
+    emit sites-sync.fail "Karing не закрылся для синхронизации"
+    return 1
+  fi
+  if sh "$REPO/karing-rules.sh" -i >> "$LOG" 2>&1; then
+    log "karing: -i применён"
+  else
+    log "FAIL: karing -i"
+  fi
+  open -a Karing >/dev/null 2>&1 || true
+  sleep 15
+  if sh "$REPO/karing-rules.sh" --check >/dev/null 2>&1; then
+    log "karing: после рестарта чисто"
+  else
+    log "FAIL: дрейф остался после рестарта"
+    emit sites-sync.fail "дрейф Karing остался после рестарта"
+    return 1
+  fi
+}
+
+# Автоудаление артефактов старше KEEP_DAYS (3 последних бэкапа каждого
+# конфига не трогаем — часть страховки).
+prune_artifacts() {
+  local b
+  find "$LOGDIR" -name 'fresh-*.txt' -mtime +"$KEEP_DAYS" -delete 2>/dev/null || true
+  for f in "$INSTALLED_CONF" "$REPO_CONF"; do
+    ls -t "$f".bak.* 2>/dev/null | tail -n +4 | while IFS= read -r b; do
+      [ -n "$b" ] && find "$b" -mtime +"$KEEP_DAYS" -delete 2>/dev/null || true
+    done
+  done
+}
+
+do_rollback() {
+  local f b
+  for f in "$INSTALLED_CONF" "$REPO_CONF"; do
+    b=$(ls -t "$f".bak.* 2>/dev/null | head -1)
+    if [ -z "$b" ]; then echo "нет бэкапа для $f"; continue; fi
+    if [ "$f" = "$INSTALLED_CONF" ]; then
+      $SUDO cp "$b" "$f" && echo "откат $f <- $b"
+    else
+      cp "$b" "$f" && echo "откат $f <- $b"
+    fi
+  done
+  $SUDO launchctl kickstart -k system/com.tradesoft.corp-vpn-routes 2>&1
+  emit sites-sync.rollback "откат конфигов на последний бэкап"
+}
+
+selftest() {
+  local pass=0 fail=0 tmp
+  tmp=$(mktemp -d)
+  ck() {
+    if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
+      fail=$((fail + 1)); printf '  FAIL %s\n' "$1"; fi
+  }
+  printf '# коммент\nKeep.RU\n\nauto.ru\n' > "$tmp/manual"
+  printf 'learn1.ru\n# x\nLEARN2.RU\n' > "$tmp/auto"
+  ck "keep: мердж+lower+дедуп+комменты мимо" \
+    "auto.ru keep.ru learn1.ru learn2.ru" \
+    "$(build_keep "$tmp/manual" "$tmp/auto" | tr '\n' ' ' | sed 's/ $//')"
+  ck "keep: нет файлов" "" "$(build_keep "$tmp/no" "$tmp/no2")"
+  ck "signal: формат" "1|sites-sync.ok|msg" \
+    "$(signal_line() { printf '%s|%s|%s\n' "1" "sites-sync.ok" "msg"; }; signal_line)"
+  # emit: строка уходит в файл целиком через sh -c с аргументом.
+  # Регрессия: пайп `signal_line | $SUDO tee -a` терял данные, т.к.
+  # обёртка sudo не пробрасывает свой stdin дочернему процессу.
+  # Подменяем SUDO заглушкой `exec "$@"` (как настоящий sudo с аргументами).
+  printf '#!/bin/sh\nexec "$@"\n' > "$tmp/fake-sudo"
+  chmod +x "$tmp/fake-sudo"
+  ( SUDO="$tmp/fake-sudo" SIGNALS="$tmp/signals" emit "sites-sync.ok" "тест 123" )
+  ck "emit: событие и текст дописаны в файл" "1" \
+    "$(grep -c '|sites-sync.ok|тест 123$' "$tmp/signals" || true)"
+  printf 'a\nb\nc\nd\ne\n' > "$tmp/log"
+  trim_log "$tmp/log" 3
+  ck "trim: кольцо" "c d e" "$(tr '\n' ' ' < "$tmp/log" | sed 's/ $//')"
+  printf 'a\nb\n' > "$tmp/log2"
+  trim_log "$tmp/log2" 10
+  ck "trim: короткий цел" "a b" "$(tr '\n' ' ' < "$tmp/log2" | sed 's/ $//')"
+  rm -rf "$tmp"
+  printf 'selftest: %d passed, %d failed\n' "$pass" "$fail"
+  [ "$fail" -eq 0 ]
+}
+
+case "${1:-}" in
+  --dry-run) mkdir -p "$LOGDIR"; run_cycle 1 ;;
+  --force) mkdir -p "$LOGDIR"; run_cycle 0 ;;
+  --rollback) do_rollback ;;
+  --selftest) selftest ;;
+  *)
+    mkdir -p "$LOGDIR"
+    if catchup_due; then
+      log "catchup: последний успех >${CATCHUP_HOURS}ч назад, догоняю"
+      run_cycle 0
+    else
+      log "расписание: догон не нужен (успех был недавно)"
+    fi
+    ;;
+esac
