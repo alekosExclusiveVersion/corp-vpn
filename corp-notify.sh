@@ -11,9 +11,12 @@
 #   badroutes.off     битые fake-IP исчезли
 #   vpn.up / vpn.down корп VPN поднялся/отключился (corp-vpn-routes)
 #   sites-sync.ok / skip / fail / rollback актуализация доменов
-#     (corp-sites-sync): ok/skip — только баннер, fail/rollback — ещё
-#     и в B24+Telegram
+#     (corp-sites-sync) — только баннер macOS, без B24+Telegram
 #   sites-learn.add новый домен в ts-network (corp-learn) — только баннер
+#   karing-watch.ok / fail ресинк ts-network из корп. конфигов
+#     (corp-karing-watch) — только баннер macOS, без B24+Telegram
+#   repo-dirty.remind репо corp-vpn давно грязное (karing-watch) —
+#     только баннер macOS, без B24+Telegram
 #
 # Обработка: байтовый указатель читает только НОВЫЕ строки файла (POS-файл).
 # Дедупликация: одно и то же событие (event|message) не чаще раза в 30 сек
@@ -43,15 +46,18 @@ notify() {
     sites-sync.fail)  title="домены: ошибка синхронизации" ;;
     sites-sync.rollback) title="домены: откат на бэкап" ;;
     sites-learn.add)  title="ts-network: новый домен" ;;
+    karing-watch.ok)  title="Karing: ts-network синхронизирован" ;;
+    karing-watch.fail) title="Karing: ошибка синхронизации" ;;
+    repo-dirty.remind) title="corp-vpn: незакоммиченные изменения" ;;
     *)                title="corp-vpn: $event" ;;
   esac
   osascript -e "display notification \"$msg\" with title \"$title\" sound name \"default\"" 2>/dev/null
 
   # Дублируем события очистки БД aisql в B24 и Telegram (секреты — Keychain).
-  # Из sites-sync дублируем только аварии (fail/rollback): ok приходит
-  # 3 раза в день и заспамит тему алертов.
+  # Доменные события (sites-sync.*, sites-learn.*, karing-watch.*) — только
+  # баннер macOS: это рутина/самопочинка, тему алертов не спамим.
   case "$event" in
-    db-clean.*|sites-sync.fail|sites-sync.rollback)
+    db-clean.*)
       if [ -x "/opt/homebrew/bin/python3" ] && [ -f "$NOTIFY_PY" ]; then
         /opt/homebrew/bin/python3 "$NOTIFY_PY" "$title: $msg" "$title" >/dev/null 2>&1
       fi
