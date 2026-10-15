@@ -53,6 +53,10 @@ SYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$SYNC_LABEL.plist"
 SYNC_SCRIPT="/usr/local/sbin/corp-sites-sync.sh"
 SYNC_KEEP="/usr/local/etc/sites-keep.txt"
 SYNC_LOGDIR="/Users/aleksei/Library/Logs/corp-sites-sync"
+KWATCH_LABEL="com.tradesoft.corp-karing-watch"
+KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
+KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
+KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
@@ -149,6 +153,20 @@ else
 fi
 echo
 
+echo "==> Самопроверка вотчера Karing (без сети, без приложения)..."
+# karing-watch.sh рестартует Karing и пишет в его конфиг через karing-rules
+# -i: ошибка в логике кулдауна/гардов даст рестарт-луп или пропуск дрейфа.
+# Selftest на фикстурах с подменёнными обёртками quit/open/apply/check.
+if sh "$DIR/karing-watch.sh" --selftest; then
+  KWATCH_SELFTEST_OK=1
+else
+  KWATCH_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки karing-watch.sh — вотчер дрейфа Karing"
+  echo "!! не устанавливается."
+fi
+echo
+
 echo "==> Установка файлов демона..."
 if [ "$ROUTES_SELFTEST_OK" -eq 1 ]; then
   cp "$DIR/corp-vpn-routes.sh" "$DAEMON_SCRIPT"
@@ -231,8 +249,21 @@ fi
 launchctl load -w "$CLEAN_PLIST"
 
 echo "==> Установка демона очистки БД aisql (db-clean) из $DB_CLEAN_REPO..."
+# На macOS развёртывание db-clean выведено из эксплуатации (только Windows):
+# его установщик выходит с SKIP и кодом 0 без файлов — это не провал,
+# такие компоненты в проверке результата не участвуют.
+DB_CLEAN_SKIP=0
 if [ -x "$DB_CLEAN_REPO/install.sh" ]; then
-  (cd "$DB_CLEAN_REPO" && ./install.sh)
+  DB_CLEAN_OUT=$((cd "$DB_CLEAN_REPO" && ./install.sh) 2>&1)
+  DB_CLEAN_RC=$?
+  printf '%s\n' "$DB_CLEAN_OUT" | tail -3
+  if [ "$DB_CLEAN_RC" -ne 0 ]; then
+    echo "  [FAIL] установщик db-clean завершился с кодом $DB_CLEAN_RC"
+    fail=1
+  elif printf '%s\n' "$DB_CLEAN_OUT" | grep -q '^SKIP: db-clean на macOS'; then
+    echo "  (db-clean пропущен на macOS, в проверке не участвует)"
+    DB_CLEAN_SKIP=1
+  fi
 else
   echo "  [FAIL] $DB_CLEAN_REPO/install.sh не найден — db-clean не устанавливается"
   fail=1
@@ -277,6 +308,27 @@ if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$SYNC_PLIST" 2>/dev/null || true
 fi
 launchctl bootstrap "gui/$NOTIFY_UID" "$SYNC_PLIST"
+
+echo "==> Установка юзер-агента вотчера Karing (karing-watch, LaunchAgent $NOTIFY_UID)..."
+# Каждые 10 мин + при логине: --check без VPN-гейта, при дрейфе -i
+# с рестартом Karing (кулдаун 30 мин). Нужен на корп. Wi-Fi, где
+# sites-sync не работает (требует поднятый VPN для MySQL-скана).
+if [ "${KWATCH_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/karing-watch.sh" "$KWATCH_SCRIPT"
+  chmod 755 "$KWATCH_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $KWATCH_SCRIPT НЕ обновлён."
+  echo "!! (осталась предыдущая версия, если агент ставился ранее)"
+fi
+mkdir -p /Users/aleksei/Library/LaunchAgents
+cp "$DIR/com.tradesoft.corp-karing-watch.plist" "$KWATCH_PLIST"
+chown aleksei:staff "$KWATCH_PLIST"
+mkdir -p "$KWATCH_LOGDIR"
+chown aleksei:staff "$KWATCH_LOGDIR"
+if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
+fi
+launchctl bootstrap "gui/$NOTIFY_UID" "$KWATCH_PLIST"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -371,18 +423,22 @@ else
   fail=1
 fi
 
-if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
-  echo "  [OK]   демон $DB_CLEAN_LABEL загружен"
+if [ "$DB_CLEAN_SKIP" -eq 1 ]; then
+  echo "  [--]   db-clean пропущен на macOS"
 else
-  echo "  [FAIL] демон $DB_CLEAN_LABEL не загружен"
-  fail=1
-fi
+  if launchctl list | grep -q "$DB_CLEAN_LABEL"; then
+    echo "  [OK]   демон $DB_CLEAN_LABEL загружен"
+  else
+    echo "  [FAIL] демон $DB_CLEAN_LABEL не загружен"
+    fail=1
+  fi
 
-if [ -x "$DB_CLEAN_SCRIPT" ] && [ -x "$DB_CLEAN_PY" ]; then
-  echo "  [OK]   скрипт $DB_CLEAN_SCRIPT"
-else
-  echo "  [FAIL] скрипт $DB_CLEAN_SCRIPT отсутствует"
-  fail=1
+  if [ -x "$DB_CLEAN_SCRIPT" ] && [ -x "$DB_CLEAN_PY" ]; then
+    echo "  [OK]   скрипт $DB_CLEAN_SCRIPT"
+  else
+    echo "  [FAIL] скрипт $DB_CLEAN_SCRIPT отсутствует"
+    fail=1
+  fi
 fi
 
 if launchctl print "gui/$NOTIFY_UID/$NOTIFY_LABEL" >/dev/null 2>&1; then
@@ -410,6 +466,20 @@ if [ -x "$SYNC_SCRIPT" ]; then
   echo "  [OK]   скрипт $SYNC_SCRIPT"
 else
   echo "  [FAIL] скрипт $SYNC_SCRIPT отсутствует"
+  fail=1
+fi
+
+if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
+  echo "  [OK]   юзер-агент $KWATCH_LABEL загружен"
+else
+  echo "  [FAIL] юзер-агент $KWATCH_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$KWATCH_SCRIPT" ]; then
+  echo "  [OK]   скрипт $KWATCH_SCRIPT"
+else
+  echo "  [FAIL] скрипт $KWATCH_SCRIPT отсутствует"
   fail=1
 fi
 
@@ -449,9 +519,10 @@ if [ "$fail" -eq 0 ]; then
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
   echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
   echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
-  echo "Очистка БД aisql по заявкам Б24 — corp-db-clean (ежедневно 03:00, /var/log/corp-db-clean.log)."
+  echo "Очистка БД aisql по заявкам Б24 — corp-db-clean (только Windows; на macOS пропущен)."
   echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
 echo "Актуализация доменов — corp-sites-sync (LaunchAgent, 08:00/14:00/20:00 + догон)."
+echo "Вотчер Karing — corp-karing-watch (LaunchAgent, каждые 10 мин + при логине)."
 else
   echo
   if [ "$ROUTES_SELFTEST_OK" -eq 0 ]; then

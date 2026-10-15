@@ -52,6 +52,10 @@ NOTIFY_LABEL="com.tradesoft.corp-notify"
 NOTIFY_PLIST="/Users/aleksei/Library/LaunchAgents/$NOTIFY_LABEL.plist"
 NOTIFY_SCRIPT="/usr/local/sbin/corp-notify.sh"
 NOTIFY_UID="$(id -u aleksei 2>/dev/null || echo 501)"
+KWATCH_LABEL="com.tradesoft.corp-karing-watch"
+KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
+KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
+KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
@@ -120,6 +124,12 @@ fi
 rm -f "$NOTIFY_PLIST" "$NOTIFY_SCRIPT"
 rm -f "$SIGNALS" /tmp/corp-vpn-notify.pos /tmp/corp-vpn-notify.seen
 rm -f /tmp/corp-notify.stdout.log /tmp/corp-notify.stderr.log
+
+echo "==> Остановка и удаление юзер-агента вотчера Karing (corp-karing-watch)..."
+if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
+fi
+rm -f "$KWATCH_PLIST" "$KWATCH_SCRIPT"
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -251,6 +261,20 @@ if [ -e "$NOTIFY_SCRIPT" ] || [ -e "$NOTIFY_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы юзер-агента corp-notify удалены"
+fi
+
+if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
+  echo "  [FAIL] юзер-агент $KWATCH_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   юзер-агент $KWATCH_LABEL удалён"
+fi
+
+if [ -e "$KWATCH_SCRIPT" ] || [ -e "$KWATCH_PLIST" ]; then
+  echo "  [FAIL] файлы юзер-агента corp-karing-watch остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы юзер-агента corp-karing-watch удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then
