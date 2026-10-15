@@ -56,6 +56,11 @@ KWATCH_LABEL="com.tradesoft.corp-karing-watch"
 KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
 KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
 KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
+SYNC_LABEL="com.tradesoft.corp-sites-sync"
+SYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$SYNC_LABEL.plist"
+SYNC_SCRIPT="/usr/local/sbin/corp-sites-sync.sh"
+SYNC_KEEP="/usr/local/etc/sites-keep.txt"
+SYNC_LOGDIR="/Users/aleksei/Library/Logs/corp-sites-sync"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
@@ -130,6 +135,13 @@ if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
 fi
 rm -f "$KWATCH_PLIST" "$KWATCH_SCRIPT"
+
+echo "==> Остановка и удаление юзер-агента актуализации доменов (corp-sites-sync)..."
+if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$SYNC_PLIST" 2>/dev/null || true
+fi
+rm -f "$SYNC_PLIST" "$SYNC_SCRIPT" "$SYNC_KEEP"
+rm -rf "$SYNC_LOGDIR"
 
 echo "==> Очистка маршрутов, добавленных демоном..."
 if [ -f "$STATE" ]; then
@@ -275,6 +287,20 @@ if [ -e "$KWATCH_SCRIPT" ] || [ -e "$KWATCH_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы юзер-агента corp-karing-watch удалены"
+fi
+
+if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
+  echo "  [FAIL] юзер-агент $SYNC_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   юзер-агент $SYNC_LABEL удалён"
+fi
+
+if [ -e "$SYNC_SCRIPT" ] || [ -e "$SYNC_PLIST" ] || [ -e "$SYNC_KEEP" ] || [ -e "$SYNC_LOGDIR" ]; then
+  echo "  [FAIL] файлы юзер-агента corp-sites-sync остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы юзер-агента corp-sites-sync удалены"
 fi
 
 if [ -e "$NETWORKS_CONF" ]; then
