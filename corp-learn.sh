@@ -6,7 +6,7 @@
 # внешних IP запрашивает PTR-запись (dig -x); если домен попадает в корпоративную
 # зону Tradesoft (DOMAIN_SUFFIX из corp-networks.conf), домен:
 #   1) навсегда дописывается в строку SITE_DOMAINS установленного конфига
-#      ($MAIN_CONF) и его репозиторной копии ($REPO_CONF) — переживает рестарты;
+#      ($CONF) и его репозиторной копии ($REPO_CONF) — переживает рестарты;
 #   2) для немедленного применения (не дожидаясь 300-сек цикла основного демона)
 #      также дописывается в /usr/local/etc/corp-networks-auto.conf.
 #
@@ -91,7 +91,7 @@ append_site_domains() {
 
 add_permanent() {
   d="$1"
-  [ -f "$MAIN_CONF" ] && append_site_domains "$MAIN_CONF" "$d"
+  [ -f "$CONF" ] && append_site_domains "$CONF" "$d"
   [ -n "$REPO_CONF" ] && [ -f "$REPO_CONF" ] && append_site_domains "$REPO_CONF" "$d"
   echo "learn: $d -> SITE_DOMAINS (навсегда)"
 }
