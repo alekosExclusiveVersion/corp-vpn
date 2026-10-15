@@ -61,6 +61,13 @@ MYSQL_HOSTS="${MYSQL_HOSTS:-}"
 # поднимается и на изолированной корп. Wi-Fi сети.
 VPN_SERVERS="${VPN_SERVERS:-}"
 
+# Домены автодетекта corp-learn.sh (по одному на строку). Демон
+# corp-vpn-routes.sh уже маршрутизирует их через ppp; здесь они попадают
+# в ts-network (direct_out), чтобы работали и без VPN на корп. Wi-Fi.
+# Переопределяется через CORP_NETWORKS_AUTO (нужно selftest на фикстурах).
+AUTO_CONF="${CORP_NETWORKS_AUTO:-/usr/local/etc/corp-networks-auto.conf}"
+AUTO_SITE_DOMAINS="$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" 2>/dev/null | tr '\n' ' ')"
+
 to_json_array() {
   # Повторы убираются с сохранением порядка: SITE_DOMAINS и MYSQL_HOSTS
   # пересекаются (хост БД одновременно является сайтом), и без дедупа
@@ -78,7 +85,7 @@ to_json_array() {
 group_json() {
   local ds d ip
   ds="$(to_json_array "$DOMAIN_SUFFIX")"
-  d="$(to_json_array "$DOMAINS $SITE_DOMAINS $MYSQL_HOSTS")"
+  d="$(to_json_array "$DOMAINS $SITE_DOMAINS $MYSQL_HOSTS $AUTO_SITE_DOMAINS")"
   ip="$(to_json_array "$NET_ROUTES $VPN_SERVERS")"
   printf '{\n  "groupid": "custom",\n  "name": "ts-network",\n  "type": "",\n  "or": true,\n'
   [ -n "$ip" ] && printf '  "ip_cidr": [%s],\n' "$ip"
@@ -91,7 +98,7 @@ singbox_rule() {
   local parts=() j="" first
   local ds d ip
   ds="$(to_json_array "$DOMAIN_SUFFIX")"
-  d="$(to_json_array "$DOMAINS $SITE_DOMAINS $MYSQL_HOSTS")"
+  d="$(to_json_array "$DOMAINS $SITE_DOMAINS $MYSQL_HOSTS $AUTO_SITE_DOMAINS")"
   ip="$(to_json_array "$NET_ROUTES $VPN_SERVERS")"
   [ -n "$ip" ] && parts+=("{\"ip_cidr\": [$ip]}")
   [ -n "$ds" ] && parts+=("{\"domain_suffix\": [$ds]}")
@@ -119,10 +126,10 @@ apply() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   group_json > "$tmpdir/direct.json"
-  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" <<'PY'
+  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" <<'PY'
 import json, sys, shutil, time, os, socket
 routing_path, subscribe_path, tmpdir = sys.argv[1:4]
-corp_domains = (sys.argv[4] + ' ' + sys.argv[5] + ' ' + sys.argv[6]).split()
+corp_domains = (sys.argv[4] + ' ' + sys.argv[5] + ' ' + sys.argv[6] + ' ' + sys.argv[10]).split()
 mysql_hosts = sys.argv[6].split()
 domain_suffixes = sys.argv[7].split() if len(sys.argv) > 7 else []
 NET_ROUTES = sys.argv[8].split() if len(sys.argv) > 8 else []
@@ -268,16 +275,16 @@ check() {
   # Ничего не изменяет. Код возврата: 0 — расхождений нет, 1 — есть дрейф,
   # 2 — конфиг не прочитан (пригодно как гейт в мониторинге).
   python3 - "$0" "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$DOMAINS" "$SITE_DOMAINS" \
-      "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" <<'PY'
+      "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" <<'PY'
 import json, sys, os, socket, subprocess
 
 self_name = sys.argv[1]
 routing_path, subscribe_path = sys.argv[2:4]
-DOMAINS, SITE_DOMAINS, MYSQL_HOSTS, DOMAIN_SUFFIX, NET_ROUTES, VPN_SERVERS = \
-    (sys.argv[i].split() for i in range(4, 10))
+DOMAINS, SITE_DOMAINS, MYSQL_HOSTS, DOMAIN_SUFFIX, NET_ROUTES, VPN_SERVERS, AUTO_DOMAINS = \
+    (sys.argv[i].split() for i in range(4, 11))
 
 managed = {
-    'domain': DOMAINS + SITE_DOMAINS + MYSQL_HOSTS,
+    'domain': DOMAINS + SITE_DOMAINS + MYSQL_HOSTS + AUTO_DOMAINS,
     'domain_suffix': DOMAIN_SUFFIX,
     'ip_cidr': NET_ROUTES + VPN_SERVERS,
 }
@@ -430,6 +437,8 @@ DOMAIN_SUFFIX=".tradesoft.ru"
 NET_ROUTES="192.168.0.0/16"
 VPN_SERVERS="203.0.113.7"
 CONF
+  printf '# пустой auto-конфиг (комменты игнорируются)\n' > "$tmp/auto-empty"
+  printf 'auto-learn.ru\n' > "$tmp/auto-one"
   home="$tmp/home"
   kg="$home/Library/Group Containers/group.com.nebula.karing"
   mkdir -p "$kg"
@@ -462,12 +471,27 @@ with open(sys.argv[1].replace('routing_group', 'subscribe_use'), 'w',
          "dns_servers": []}]}, f, ensure_ascii=False, indent=2)
 PY
 
-  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
   ck "check: без дрейфа, код 0" "0" "$?"
   ck "check: без дрейфа, нет расхождений" "0" \
     "$(printf '%s' "$out" | grep -c '^ДРЕЙФ')"
   ck "check: чистая группа, дубли не отмечены" "0" \
     "$(printf '%s' "$out" | grep -c 'дублей')"
+
+  # --- auto-конфиг learn-находок входит в управляемый список ---
+  # (выполняется на чистом live, до мутаций ниже).
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-one" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: auto-домен вне live, код 1" "1" "$?"
+  ck "check: назван отсутствующий auto-домен" "1" \
+    "$(printf '%s' "$out" | grep -c 'ОТСУТСТВУЮТ (1): auto-learn\.ru')"
+  HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-one" \
+    "$DIR/karing-rules.sh" \
+    | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert "auto-learn.ru" in d.get("domain",[]), "auto-домена нет в ts-network"
+print("ok")' \
+    >/dev/null 2>&1
+  ck "group_json: auto-домен попадает в ts-network" "0" "$?"
 
   # корп. домен, оставшийся в «На прямую», — дрейф
   python3 - "$kg/karing_routing_group.json" <<'PY'
@@ -479,7 +503,7 @@ for g in doc['items'][0]['groups']:
         g['domain'] = [".yandex.ru", "a.ru"]
 json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
-  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
   ck "check: остаток в «На прямую», код 1" "1" "$?"
   ck "check: назван унесённый домен" "1" \
     "$(printf '%s' "$out" | grep -c 'корп. элементов не перенесено.*a\.ru')"
@@ -498,7 +522,7 @@ for g in groups:
 json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
 
-  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check 2>&1)"
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
   ck "check: дрейф, код 1" "1" "$?"
   ck "check: назван отсутствующий домен" "1" \
     "$(printf '%s' "$out" | grep -c 'ОТСУТСТВУЮТ (1): b\.ru')"
@@ -513,7 +537,7 @@ doc = json.load(open(p, encoding='utf-8'))
 doc['diversion_group'][0]['server_name'] = 'proxy'
 json.dump(doc, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
 PY
-  HOME="$home" CORP_NETWORKS_CONF="$conf" "$DIR/karing-rules.sh" --check >/dev/null 2>&1
+  HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check >/dev/null 2>&1
   ck "check: неверный outbound, код 1" "1" "$?"
 
   # --- генераторы отдают валидный JSON на боевом conf ---
