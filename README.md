@@ -12,7 +12,7 @@
 
 | Группа | Outbound | Назначение |
 |---|---|---|
-| `ts-network` | `direct_out` | вся корп. зона: домены (`DOMAINS`, `SITE_DOMAINS`, `MYSQL_HOSTS`), суффиксы `DOMAIN_SUFFIX`, IP (`NET_ROUTES`, `VPN_SERVERS`, MySQL) |
+| `ts-network` | `direct_out` | вся корп. зона: домены (`DOMAINS`, `SITE_DOMAINS`, `MYSQL_HOSTS`, находки learn из `corp-networks-auto.conf`), суффиксы `DOMAIN_SUFFIX`, IP (`NET_ROUTES`, `VPN_SERVERS`, MySQL) |
 | `На прямую` | `direct_out` | только личные правки пользователя (напр. `.yandex.ru`) |
 
 На корп. Wi-Fi группы намеренно нужны: L2TP там не поднимается (§3.6.1 в
@@ -126,31 +126,54 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 ./sites-sync.sh --dry-run    # проверка без изменений
 ./sites-sync.sh --force      # цикл безусловно
 ./sites-sync.sh --rollback   # откат конфигов на последний .bak + kickstart
-./sites-sync.sh --selftest   # проверки, 6
+./sites-sync.sh --selftest   # проверки, 11
 ```
 
-Уведомления о фактическом статусе — события `sites-sync.*` (баннер macOS
-всегда; `fail`/`rollback` ещё и в B24+Telegram). Лог-кольцо
+Уведомления о фактическом статусе — события `sites-sync.*`, только баннер
+macOS (без B24+Telegram). Лог-кольцо
 `~/Library/Logs/corp-sites-sync/`, артефакты старше 30 дней удаляются
 (3 последних бэкапа каждого конфига хранятся).
+
+### karing-watch.sh — вотчер дрейфа Karing (каждые 10 мин)
+
+Юзер-агент `com.tradesoft.corp-karing-watch` (каждые 10 мин + при логине):
+`karing-rules.sh --check` без VPN-гейта, при дрейфе `quit → -i → open`
+с перепроверкой. Кулдаун ресинка — 30 мин (`KWATCH_COOLDOWN`), guard
+незакрывшегося Karing. Закрывает зазор sites-sync на корп. Wi-Fi без VPN
+(там sites-sync не работает — нужен MySQL-скан) и доставляет в `ts-network`
+находки `corp-learn` из `corp-networks-auto.conf` (генератор их тоже
+учитывает — см. `CORP_NETWORKS_AUTO`).
+
+```bash
+./karing-watch.sh --check      # только сверка, без изменений
+./karing-watch.sh --force      # ресинк безусловно (отладка)
+./karing-watch.sh --selftest   # проверки, 31
+```
+
+События `karing-watch.ok` / `karing-watch.fail` — только баннер macOS
+(без B24+Telegram, как и остальные доменные события). Попутно вотчер
+следит за чистотой репо: грязь старше 48 ч (`KWATCH_DIRTY_AFTER`) даёт
+баннер `repo-dirty.remind` не чаще раза в сутки (`KWATCH_REMIND_EVERY`).
+Лог-кольцо `~/Library/Logs/corp-karing-watch/`.
 
 ## Самопроверки
 
 ```bash
 sh corp-vpn-routes.sh --selftest              # демон маршрутов, 41 проверка
-sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 16
+sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 19
 sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 88
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
-./sites-sync.sh --selftest                     # цикл актуализации, 6
+./sites-sync.sh --selftest                     # цикл актуализации, 11
+./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 31
 ```
 
 Все шесть работают без root, без сети и без MySQL. `install.sh` прогоняет их
 гейтом до установки: провал `corp-vpn-routes.sh` или `corp-routes-clean.sh`
 оставляет прежнюю версию соответствующего демона, провал остальных прерывает
-установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME` и
-`CORP_NETWORKS_CONF`, поэтому живой конфиг Karing не читается и не меняется.
+установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME`,
+`CORP_NETWORKS_CONF` и `CORP_NETWORKS_AUTO`, поэтому живой конфиг Karing не читается и не меняется.
 `corp-routes-clean.sh --selftest` подменяет `netstat`, `route`, `ipconfig`, а
 логи и состояние уводит во временный каталог: живая таблица маршрутов не
 читается на запись и не меняется.
@@ -187,6 +210,7 @@ open -a Karing                # вернуть приложение
 | `corp-routes-check.sh` | Детектор битых маршрутов Karing, только чтение: fake-IP в назначении и фантомный шлюз из fake-IP; `--sudo-cmd` печатает готовые команды, не выполняя их |
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
 | `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: dry-run по умолчанию, `--apply` с бэкапом, предохранитель от частичного скана (порог 30%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 13 проверок |
-| `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): VPN-гейт, скан с ретраями, чистка, Karing `-i` с рестартом; события `sites-sync.*`, лог-кольцо, `--rollback`; `--selftest` — 6 проверок |
+| `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): VPN-гейт, скан с ретраями, чистка, Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--rollback`; `--selftest` — 11 проверок |
+| `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 31 проверка |
 | `sites-keep.txt` | Ручные исключения для чистки (осознанные алиасы вне `csSiteDomain`); устанавливается в `/usr/local/etc/sites-keep.txt` один раз, дальше не перезаписывается |
 | `README.md` | Документация |

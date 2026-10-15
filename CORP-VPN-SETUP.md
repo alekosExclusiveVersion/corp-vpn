@@ -14,7 +14,7 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 домашний IP через `direct_out` Karing мимо `ppp0` в момент хиджака),
 чистка `clean-sites.py --apply` (keep = `sites-keep.txt` + auto-конфиг),
 `karing-rules.sh -i` с авто-рестартом Karing; уведомления `sites-sync.*`
-(баннер всегда, B24/TG только fail/rollback); лог-кольцо + чистка
+(только баннер macOS, без B24/TG); лог-кольцо + чистка
 артефактов старше 30 дней; `--rollback` на последний `.bak`.
 Дополнено 14.08.2026: отдельный скрипт-дубль `fix-mysql-routes.sh` удалён —
 хосты `btk66.ru`, `shop.eurotradeplus.pl` (SITE_DOMAINS) и
@@ -67,6 +67,22 @@ utun6, выбор интерфейса флапал между ppp0/utun6 и л�
 `/var/run/corp-wifi-corp-ip.state`, refresh 300 c, sweep каждый цикл 30 c) —
 страховка на случай, если Karing перехватит корп. публичные IP после сна до
 подхвата правила «На прямую» (на корп. WiFi основной контроль — сам Karing-direct).
+15.10.2026: вотчер дрейфа Karing `karing-watch.sh` (LaunchAgent
+`com.tradesoft.corp-karing-watch`, каждые 10 мин + при логине): `--check`
+без VPN-гейта, при дрейфе quit → `-i` → open с перепроверкой, кулдаун
+ресинка 30 мин, события `karing-watch.ok/fail`. Закрывает зазор `sites-sync`
+на корп. Wi-Fi без VPN (скан MySQL там невозможен) — новые домены попадают
+в `ts-network` в течение минут, а не к ближайшему прогону 08/14/20.
+Заодно `karing-rules.sh` учитывает находки `corp-learn` из
+`corp-networks-auto.conf` (раньше они до Karing не доходили вовсе, только
+до ppp-демона) и починен `corp-learn.sh` (`$MAIN_CONF` → `$CONF`: находки
+теперь навсегда пишутся и в установленный конфиг, добавлен `oilcity.pro`).
+15.10.2026 (продолжение): `sites-sync` чистит `.bak` живого конфига Karing
+по тем же правилам (3 newest + 30 дней) — раньше они копились бесконечно;
+`install.sh` больше не считает провалом отключённый на macOS db-clean
+(блок SKIP в проверке не участвует, итог — «Готово»); `karing-watch`
+напоминает баннером `repo-dirty.remind`, если репо грязное больше 48 ч
+(повтор не чаще раза в сутки, только macOS, без B24/TG).
 
 ---
 
