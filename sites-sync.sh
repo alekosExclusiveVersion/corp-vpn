@@ -42,6 +42,11 @@ INSTALLED_CONF="${SITES_SYNC_CONF:-/usr/local/etc/corp-networks.conf}"
 REPO_CONF="$REPO/corp-networks.conf"
 AUTO_CONF="${SITES_SYNC_AUTO:-/usr/local/etc/corp-networks-auto.conf}"
 MANUAL_KEEP="${SITES_SYNC_KEEP:-/usr/local/etc/sites-keep.txt}"
+# Живой конфиг Karing (для чистки .bak после -i). Переопределяется через
+# SITES_SYNC_KARING_DIR (нужно selftest на фикстурах).
+KARING_DIR="${SITES_SYNC_KARING_DIR:-$HOME/Library/Group Containers/group.com.nebula.karing}"
+KARING_ROUTING_JSON="$KARING_DIR/karing_routing_group.json"
+KARING_SUBSCRIBE_JSON="$KARING_DIR/karing_subscribe_use.json"
 SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
 LOGDIR="${SITES_SYNC_LOGDIR:-$HOME/Library/Logs/corp-sites-sync}"
 LOG="$LOGDIR/corp-sites-sync.log"
@@ -270,11 +275,12 @@ kar_check() {
 }
 
 # Автоудаление артефактов старше KEEP_DAYS (3 последних бэкапа каждого
-# конфига не трогаем — часть страховки).
+# конфига не трогаем — часть страховки). Бэкапы Karing (*.bak.* после -i,
+# в т.ч. ручные вроде *-pinval) чистятся теми же правилами.
 prune_artifacts() {
-  local b
+  local b f
   find "$LOGDIR" -name 'fresh-*.txt' -mtime +"$KEEP_DAYS" -delete 2>/dev/null || true
-  for f in "$INSTALLED_CONF" "$REPO_CONF"; do
+  for f in "$INSTALLED_CONF" "$REPO_CONF" "$KARING_ROUTING_JSON" "$KARING_SUBSCRIBE_JSON"; do
     ls -t "$f".bak.* 2>/dev/null | tail -n +4 | while IFS= read -r b; do
       [ -n "$b" ] && find "$b" -mtime +"$KEEP_DAYS" -delete 2>/dev/null || true
     done
@@ -326,6 +332,32 @@ selftest() {
   printf 'a\nb\n' > "$tmp/log2"
   trim_log "$tmp/log2" 10
   ck "trim: короткий цел" "a b" "$(tr '\n' ' ' < "$tmp/log2" | sed 's/ $//')"
+  # prune: свежие артефакты целы, старые за пределами 3 newest — удалены.
+  mkdir -p "$tmp/prune/logs" "$tmp/prune/karing"
+  LOGDIR="$tmp/prune/logs" INSTALLED_CONF="$tmp/prune/noexist.conf"
+  REPO_CONF="$tmp/prune/corp.conf"
+  KARING_ROUTING_JSON="$tmp/prune/karing/routing.json"
+  KARING_SUBSCRIBE_JSON="$tmp/prune/karing/noexist.json"
+  KEEP_DAYS=30
+  printf 'x' > "$tmp/prune/logs/fresh-old.txt"
+  touch -t 202001010000 "$tmp/prune/logs/fresh-old.txt"
+  printf 'x' > "$tmp/prune/logs/fresh-new.txt"
+  : > "$tmp/prune/corp.conf"
+  printf 'x' > "$tmp/prune/corp.conf.bak.new1"
+  printf 'x' > "$tmp/prune/corp.conf.bak.new2"
+  : > "$tmp/prune/karing/routing.json"
+  for i in 1 2 3; do printf 'x' > "$tmp/prune/karing/routing.json.bak.new$i"; done
+  for i in 4 5; do printf 'x' > "$tmp/prune/karing/routing.json.bak.old$i"
+    touch -t 202001010000 "$tmp/prune/karing/routing.json.bak.old$i"; done
+  prune_artifacts
+  ck "prune: старый fresh удалён" "1" "$([ -f "$tmp/prune/logs/fresh-old.txt" ] && echo 0 || echo 1)"
+  ck "prune: свежий fresh цел" "0" "$([ -f "$tmp/prune/logs/fresh-new.txt" ]; echo $?)"
+  ck "prune: мало бэкапов — всё цело" "0" \
+    "$([ -f "$tmp/prune/corp.conf.bak.new1" ] && [ -f "$tmp/prune/corp.conf.bak.new2" ]; echo $?)"
+  ck "prune: старые karing-бэкапы за 3 newest удалены" "1" \
+    "$([ -f "$tmp/prune/karing/routing.json.bak.old4" ] || [ -f "$tmp/prune/karing/routing.json.bak.old5" ]; echo $?)"
+  ck "prune: свежие karing-бэкапы целы" "0" \
+    "$([ -f "$tmp/prune/karing/routing.json.bak.new1" ] && [ -f "$tmp/prune/karing/routing.json.bak.new2" ] && [ -f "$tmp/prune/karing/routing.json.bak.new3" ]; echo $?)"
   rm -rf "$tmp"
   printf 'selftest: %d passed, %d failed\n' "$pass" "$fail"
   [ "$fail" -eq 0 ]
