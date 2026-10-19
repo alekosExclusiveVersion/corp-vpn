@@ -418,7 +418,8 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
 - Источник: `~/Work/scripts/corp-vpn/corp-networks.conf`, устанавливается
   `install.sh` в `/usr/local/etc/corp-networks.conf`.
 - Переменные: `DOMAIN_SUFFIX`, `DOMAINS`, `NET_ROUTES`, `LOCAL_ROUTES`,
-  `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`.
+  `MYSQL_HOSTS`, `SITE_DOMAINS`, `PROBE_HOSTS`, `DNS_HOSTS`, `VPN_SERVERS`,
+  `TUNNEL_SERVERS`.
 - `SITE_DOMAINS` — сайты на корп. серверах, идут через ppp (см. 3.6.2) и
   добавляются `karing-rules.sh` в direct-группу «На прямую». 09.09.2026 добавлены
   `parts-catalogs.com parts-index.com` (каталоги автозапчастей: реальный трафик
@@ -436,6 +437,16 @@ log show --predicate 'eventMessage CONTAINS "corp-vpn"' --last 5m
   резолвит их в IPv4 и добавляет в `ip_cidr` direct-группы «На прямую» — на
   корп. Wi-Fi (без L2TP) их трафик идёт в `direct_out` (см. §3.4), иначе MySQL
   уходит в нод Karing и сервер отвергает авторизацию по external IP.
+- `TUNNEL_SERVERS` — внешние серверы параллельных туннелей (OpenVPN/Tunnelblick
+  «Правду_2А», udp/4914): `178.141.253.96 178.141.253.126 109.194.197.9`
+  (добавлено 19.10.2026). Сервер отвечает только на трафик, пришедший через
+  корп. L2TP; с корп. Wi-Fi (en0) и через нод Karing он молчит — без пина
+  OpenVPN-хендшейк не проходит (`TLS key negotiation failed to occur`). Поэтому
+  демон закрепляет их `/32` через `ppp0` сразу при подъёме туннеля, до длинной
+  пересборки доменов (см. 3.6.2). Попадание в `STATE` заставляет
+  `sweep_corp_hijacks` снимать конкурирующий `utun`-`/32` Karing — маршрут через
+  ppp выигрывает детерминированно. В direct-правила Karing (`karing-rules.sh`) их
+  не добавляем: `direct_out` — это выход через en0, а этот путь не работает.
 - **Автодетект** — `corp-learn.sh` по PTR-записи исходящих соединений находит
   корп. сайты и **навсегда** дописывает их в строку `SITE_DOMAINS` конфига
   (и установленного, и репозиторной копии), а для немедленного применения —

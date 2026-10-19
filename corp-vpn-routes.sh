@@ -21,6 +21,10 @@ AUTO_SITE_DOMAINS=""
 # Хосты, разрешённые через параллельный туннель Tunnelblick (см. коммент в
 # corp-networks.conf). Заполняется там же; здесь пустая по умолчанию.
 PARALLEL_TUNNEL_HOSTS=""
+# Серверы параллельных туннелей (Tunnelblick/OpenVPN, udp/4914): их /32 держим
+# через корп. интерфейс, иначе Karing (или en0) глушит хендшейк. См. TUNNEL_SERVERS
+# в corp-networks.conf.
+TUNNEL_SERVERS=""
 if [ -f "$CONF" ]; then
   . "$CONF"
 fi
@@ -544,6 +548,16 @@ add_routes() {
     add_host_route "$ip"
     echo "$ip" >> "$STATE"
   done
+  # Серверы параллельных туннелей (Tunnelblick/OpenVPN, внешние адреса): пин /32
+  # через ppp сразу при подъёме туннеля — до длинной пересборки доменов. Иначе
+  # трафик к серверу уходит в Karing (utun) либо напрямую через en0, а сервер
+  # отвечает только с адресов корп. VPN-пула, и OpenVPN-хендшейк не проходит.
+  # Попадание в STATE заставляет sweep_corp_hijacks снимать конкурирующий
+  # utun-/32 Karing — маршрут через ppp выигрывает детерминированно.
+  for ip in $TUNNEL_SERVERS; do
+    add_host_route "$ip"
+    echo "$ip" >> "$STATE"
+  done
   # Критичные бизнес-домены (в т.ч. админка parts-opt.com) — сразу после DNS.
   # Их /32 должен быть пинован с первой секунды пересборки: иначе длинный
   # последовательный резолв SITE_DOMAINS (~288 доменов, 40+с) держит админку
@@ -661,7 +675,8 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
 8.8.8.8            link#7            UHS         utun7
 192.168.0.33       192.168.128.55    UHS         utun7
 192.168.0.232      192.168.128.55    UHS         utun7
-203.0.113.9        192.168.128.55    UHS         utun7"
+203.0.113.9        192.168.128.55    UHS         utun7
+178.141.253.96     192.168.128.55    UHS         utun7"
   LOCAL_ROUTES="192.168.128.0/24 10.34.0.0/16"
   NET_ROUTES="10.0.0.0/8 192.168.0.0/16"
   PARALLEL_TUNNEL_HOSTS="192.168.0.77"
@@ -735,6 +750,19 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
     "192.168.0.33 192.168.0.232" "$(sweep_removed '')"
   teq "sweep: хост из STATE тоже снимается" \
     "192.168.0.33 192.168.0.232 203.0.113.9" "$(sweep_removed '203.0.113.9')"
+
+  # 7b. Сервер параллельного туннеля (TUNNEL_SERVERS — внешний публичный адрес,
+  #     вне NET_ROUTES): пока его нет в STATE, чужой utun-/32 не трогаем; после
+  #     add_routes он в STATE, и sweep снимает utun-пин Karing, чтобы /32 через
+  #     ppp0 выигрывал детерминированно (иначе хендшейк OpenVPN не проходит).
+  st_ts=$(sweep_removed '')
+  case " $st_ts " in
+    *" 178.141.253.96 "*)
+      t "sweep: TUNNEL_SERVERS вне STATE сниматься не должен" 1 ;;
+    *) t "sweep: TUNNEL_SERVERS вне STATE не трогается" 0 ;;
+  esac
+  teq "sweep: TUNNEL_SERVERS в STATE — чужой utun-/32 снимается" \
+    "192.168.0.33 192.168.0.232 178.141.253.96" "$(sweep_removed '178.141.253.96')"
 
   # 8. fail-open: без списка подсетей TUN фильтр снят и on-link адреса TUN
   #    попадают под снос — цена отказа get_tunnel_subnets, фиксируем явно.
