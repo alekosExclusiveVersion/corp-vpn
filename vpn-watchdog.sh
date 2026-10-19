@@ -26,23 +26,20 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 PROFILES="vpn3-ts vpn4-ts vpn2-ts"
 
-# Подключены ли к корп. Wi-Fi (en0 в подсети 192.168.128.0/24).
+# Подключены ли к корп. Wi-Fi.
 # На корп. Wi-Fi L2TP/IPSec не поднимается (сетевое оборудование глушит L2TP-в-ESP),
 # поэтому корп. VPN там не подключаем — на этом Wi-Fi он бесполезен и только
 # молотит попытки.
-# Критерий по IP en0: корп. Wi-Fi единственный выдаёт подсеть 192.168.128.0/24.
-# SSID/ассоциацию через networksetup здесь получить НЕЛЬЗЯ (отдаёт "not associated"
-# даже при рабочей сети без DHCP), поэтому IP-детект — основной.
-# ДОПОЛНИТЕЛЬНО (08.09): хотспот телефона раздаёт ту же 192.168.128.0/24, но
-# приватный MAC en0 per-network отличается (корп b6:be:0c:d5:9a:24 vs хотспот
-# 3e:e9:15:74:f3:be) — см. CORP_WIFI_EN0_MACS в конфиге.
+# Критерий — эталоны из corp-networks.conf: приватный MAC en0 (основной, работает
+# и без IP) и ARP-MAC шлюза (вторичный, требует IP). Хотспот телефона раздаёт ту
+# же подсеть 192.168.128.0/24, но его MAC en0 другой (3e:e9:15:74:f3:be), поэтому
+# по одной подсети сети не различить — только по MAC.
+# SSID/ассоциацию через networksetup получить НЕЛЬЗЯ (отдаёт "not associated"
+# даже при рабочей сети без DHCP), поэтому MAC/IP-детект — основной.
 #
-# ПИЛОТ (сбор данных): хотспот телефона тоже раздаёт 192.168.128.0/24, поэтому
-# по IP сети не различить. Вердикт решений оставляем прежним (по IP), а рядом
-# логируем ARP-MAC реального шлюза и приватный MAC en0
-# (corp-vpn: pilot [verdict] gw_mac=... mac_en0=...) через logger — раз в
-# log-запись при смене. Решение НЕ меняется, пока списки
-# CORP_WIFI_GATEWAY_MACS/CORP_WIFI_EN0_MACS не задействованы в логике.
+# ПИЛОТ (сбор данных): рядом с вердиктом логируем ARP-MAC реального шлюза и
+# приватный MAC en0 (corp-vpn: pilot [verdict] gw_mac=... mac_en0=...) через
+# logger — раз в log-запись при смене.
 
 # ARP-MAC реального шлюза (default через НЕ-туннельный интерфейс).
 gw_mac() {
@@ -76,18 +73,37 @@ CORP_WIFI_GATEWAY_MACS_DEFAULT="54:b8:a:cf:80:0"
 # Вердикт «корп. сеть»: корп, если per-network приватный MAC en0 ИЛИ ARP-MAC
 # шлюза совпадает с эталонами (см. corp-networks.conf). Второй признак
 # подстраховывает, но на хотспоте ARP-шлюза обычно не резолвится вовсе.
+#
+# ВАЖНО (19.10): приватный MAC en0 — per-network признак, он присваивается при
+# ассоциации и доступен СРАЗУ, ещё до выдачи IP по DHCP. Поэтому проверяем его
+# НЕЗАВИСИМО от наличия IP. Раньше вердикт требовал одновременно IP и MAC, и
+# после сна/переассоциации окно "no-ip" (1-2 тика) трактовалось как «не корп»:
+# watchdog шёл поднимать L2TP на корп. Wi-Fi, где он не работает, и молотил
+# попытки по всем профилям (см. §3.6.1 в CORP-VPN-SETUP.md).
 is_corp_wifi() {
     local ip verdict mac gm
     ip=$(ipconfig getifaddr en0 2>/dev/null)
     mac=$(en0_mac)
     gm=$(gw_mac)
-    if [ -n "$ip" ] && [ -n "$mac" ]; then
-        case " $CORP_WIFI_EN0_MACS_DEFAULT $CORP_WIFI_GATEWAY_MACS_DEFAULT " in
-            *" $mac "*|*" $gm "*) verdict="corp" ;;
-            *) verdict="not-corp" ;;
+    verdict=""
+    # Основной признак: приватный MAC en0 (не требует IP).
+    if [ -n "$mac" ]; then
+        case " $CORP_WIFI_EN0_MACS_DEFAULT " in
+            *" $mac "*) verdict="corp" ;;
         esac
-    else
-        verdict="no-ip"
+    fi
+    # Вторичный признак: ARP-MAC шлюза (нужен IP, чтобы ARP вообще резолвился).
+    if [ -z "$verdict" ] && [ -n "$ip" ] && [ -n "$gm" ]; then
+        case " $CORP_WIFI_GATEWAY_MACS_DEFAULT " in
+            *" $gm "*) verdict="corp" ;;
+        esac
+    fi
+    if [ -z "$verdict" ]; then
+        if [ -n "$mac" ] || [ -n "$ip" ]; then
+            verdict="not-corp"
+        else
+            verdict="no-ip"
+        fi
     fi
     pilot_log_verdict "$verdict"
     [ "$verdict" = "corp" ]
