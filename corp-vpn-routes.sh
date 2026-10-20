@@ -534,6 +534,11 @@ add_routes() {
     route -n add -net "$r" -interface "$iface" >/dev/null 2>&1
   done
   : > "$STATE"
+  # Перехваченные Karing /32 снимаем СРАЗУ, не дожидаясь конца резолва: после
+  # рестарта Karing он возвращает fake-IP маршруты на корп. адреса, и такие
+  # хосты (b24 и др.) висят всё время пересборки (замер 20.10.2026: 2 мин 46 с).
+  # sweep опирается на NET_ROUTES, STATE для этого не нужен.
+  sweep_corp_hijacks
   # Корп. DNS-серверы строго через ppp ПЕРВЫМИ: закрепляем их раньше, чем
   # начнём резолвить домены (MYSQL_SITE). Иначе при первом цикле после подъёма
   # туннеля host_ip()/corp_resolve() не имеет маршрута через ppp до DNS и запрос
@@ -574,11 +579,18 @@ add_routes() {
       echo "$ip" >> "$STATE"
     done
   done
+  st_dom=0
   for h in $SITE_DOMAINS $AUTO_SITE_DOMAINS; do
     for ip in $(host_ip "$h"); do
       add_host_route "$ip"
       echo "$ip" >> "$STATE"
     done
+    st_dom=$((st_dom + 1))
+    # Karing может вернуть /32 на уже разрешённые корп. адреса прямо во время
+    # пересборки: чистим по ходу, иначе хост ждёт конца цикла.
+    if [ $((st_dom % SWEEP_EVERY)) -eq 0 ]; then
+      sweep_corp_hijacks
+    fi
   done
   for hp in $PROBE_HOSTS; do
     h=${hp%:*}
@@ -610,6 +622,20 @@ vpn_session_id() {
 WAKE_MARKER=${CORP_WAKE_MARKER:-/Users/aleksei/Library/Logs/corp-vpn/wake}
 # Тик цикла 5с, поэтому пауза больше порога = машина спала.
 WAKE_GAP_SEC=${CORP_WAKE_GAP_SEC:-60}
+# Как часто во время длинной пересборки снимать перехваченные Karing /32
+# (каждые N доменов). После рестарта Karing его fake-IP /32 на корп. адреса
+# возвращаются, и корп. хосты (b24 и др.) висят, пока идёт последовательный
+# резолв ~288 доменов — замер 20.10.2026: 2 мин 46 с до первого sweep.
+SWEEP_EVERY=${CORP_SWEEP_EVERY:-25}
+
+# Маршруты уже построены по этой же VPN-сессии? Тогда полная пересборка на
+# wake только выбрасывает работу: хук ставит маркер второй раз уже во время
+# резолва, демон по нему всё удаляет и резолвит заново (замер 20.10.2026:
+# минута работы в мусор, sweep отложен ещё на минуту). Достаточно
+# assert_routes — он сам зовёт sweep_corp_hijacks и чинит выпавшие /32.
+same_vpn_session() { # <iface> <session> <last_iface> <last_session> <STATE 0|1>
+  [ -n "$1" ] && [ "$1" = "$3" ] && [ "$2" = "$4" ] && [ "$5" = "1" ]
+}
 
 # epoch из маркера (пусто/мусор -> пусто).
 wake_marker_epoch() {
@@ -833,6 +859,37 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
   expect "wake/marker: мусор в файле — пробуждения нет" 1 $?
   rm -f "$WAKE_MARKER"
 
+  # 10. Пробуждение при той же сессии: маршруты уже построены, полная
+  #     пересборка только выбрасывает работу (маркер приходит второй раз во
+  #     время резолва). Класс багов: «после второго маркера b24 висит ещё
+  #     минуту, потому что демон всё удалил и начал резолвить заново».
+  same_vpn_session ppp0 ppp0:192.168.160.103 ppp0 ppp0:192.168.160.103 1
+  expect "wake/same: та же сессия и есть STATE — без пересборки" 0 $?
+  same_vpn_session ppp0 ppp0:192.168.160.104 ppp0 ppp0:192.168.160.103 1
+  expect "wake/same: сменился IP ppp0 — пересборка нужна" 1 $?
+  same_vpn_session ppp0 ppp0:192.168.160.103 utun5 ppp0:192.168.160.103 1
+  expect "wake/same: сменился интерфейс — пересборка нужна" 1 $?
+  same_vpn_session ppp0 ppp0:192.168.160.103 ppp0 ppp0:192.168.160.103 0
+  expect "wake/same: нет STATE — пересборка нужна" 1 $?
+  same_vpn_session "" "" ppp0 ppp0:192.168.160.103 1
+  expect "wake/same: VPN не поднят — пересборки нет" 1 $?
+
+  # 11. add_routes чистит перехваченные Karing /32 не только в assert: первый
+  #     sweep — сразу после обнуления STATE, дальше каждые SWEEP_EVERY доменов.
+  #     Проверяем кадентность на двух доменах (SWEEP_EVERY=1): 1 + 2 = 3 sweep.
+  ST_NETSTAT='192.168.0.33       192.168.128.55    UHS         utun7'
+  STATE="$st_tmp/add.state"; DIAG_LOG="$st_tmp/add.diag"; : > "$DIAG_LOG"
+  LOCAL_STATE="$st_tmp/no-local"; LOCAL_ROUTES=""
+  SWEEP_EVERY=1
+  DNS_HOSTS=""; PROTECT_HOSTS=""; TUNNEL_SERVERS=""; SITE_CRITICAL=""
+  MYSQL_HOSTS=""; SITE_DOMAINS="a.example b.example"; AUTO_SITE_DOMAINS=""
+  PROBE_HOSTS=""; NET_ROUTES="192.168.0.0/16"
+  host_ip() { printf '192.168.0.33\n'; }
+  add_routes ppp0 >/dev/null 2>&1
+  st_i=$(grep -c 'SWEEP' "$DIAG_LOG" 2>/dev/null)
+  [ "${st_i:-0}" -ge 3 ]
+  t "add_routes: sweep на старте и каждые SWEEP_EVERY доменов (${st_i:-0} шт)" "$?"
+
   # информационно (не проверка): стоимость in_any_subnet на реальном списке.
   st_n=$(printf '%s\n' $LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24 | wc -l | tr -d ' ')
   st_s=$(date +%s); st_i=0
@@ -890,10 +947,10 @@ while true; do
     diag WAKE "reason=$wake vpn=${iface:-down}"
     dead_until=0
     last_probe=0
-    last_resolve=0
-    last_local_snap=0
     fail=0
-    rm -f "$LOCAL_STATE" 2>/dev/null
+    st_has=0; [ -f "$STATE" ] && st_has=1
+    same=0
+    same_vpn_session "$iface" "$session" "$last_iface" "$last_session" "$st_has" && same=1
     if [ -n "$iface" ] && ! tunnel_alive; then
       # «Connected» после сна часто зомби: configd помнит старую сессию, трафик
       # не проходит. Маршруты в мёртвый туннель только удлиняют окно без сети —
@@ -902,9 +959,19 @@ while true; do
       del_routes "wake-dead"
       iface=""
       session=""
+      same=0
     fi
-    last_iface=""
-    last_session=""
+    if [ "$same" = "1" ]; then
+      # Сессия та же, маршруты уже построены: не выбрасываем работу. На этом же
+      # тике assert_routes снесёт перехваченные Karing /32 и починит дыры.
+      diag WAKE_SAME "session unchanged — assert+sweep instead of rebuild"
+    else
+      last_resolve=0
+      last_local_snap=0
+      rm -f "$LOCAL_STATE" 2>/dev/null
+      last_iface=""
+      last_session=""
+    fi
   fi
 
   if [ $((now - last_diag)) -ge 60 ]; then

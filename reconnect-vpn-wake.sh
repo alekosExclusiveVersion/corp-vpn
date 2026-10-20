@@ -331,7 +331,10 @@ if [ "$MODE" = "vpn" ]; then
         log "[dry] $VPN_NAME: check connected / networksetup -connectpppoeservice (до 3 попыток)"
     elif vpn_connected; then
         log "$VPN_NAME уже Connected после сна"
-        if wait_corp 15; then
+        # Живой корп. DNS отвечает за 1–2с, поэтому 8с (4 пробы) достаточно,
+        # чтобы отличить зомби-туннель от медленного подъёма. Было 15с — это
+        # ровно столько лишнего ждал redial в замере 20.10.2026.
+        if wait_corp 8; then
             log "корп. путь жив (t+$(( $(date +%s) - T0 ))s)"
         else
             vpn_redial
