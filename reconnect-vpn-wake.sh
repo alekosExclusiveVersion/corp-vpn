@@ -92,6 +92,50 @@ net_ok() {
 # Корп. проба: корп. DNS отвечает (через ppp0 или напрямую на корп. сети).
 corp_ok() { ping -c 1 -t 2 "$CORP_DNS_PROBE" >/dev/null 2>&1; }
 
+vpn_connected() {
+    [ "$(scutil --nc status "$VPN_NAME" 2>/dev/null | head -1)" = "Connected" ]
+}
+
+# Подъём L2TP до Connected (до 3 попыток, между ними stop + пауза).
+vpn_connect() {
+    for attempt in 1 2 3; do
+        networksetup -connectpppoeservice "$VPN_NAME" 2>/dev/null
+        i=0
+        while [ "$i" -lt 10 ]; do
+            sleep 2
+            if vpn_connected; then
+                log "$VPN_NAME connected (attempt $attempt, t+$(( $(date +%s) - T0 ))s)"
+                return 0
+            fi
+            i=$((i + 1))
+        done
+        scutil --nc stop "$VPN_NAME" 2>/dev/null
+        sleep 3
+    done
+    log "$VPN_NAME connect failed after 3 attempts"
+    return 1
+}
+
+# Корп. путь после подъёма туннеля появляется не мгновенно (DNS, маршруты).
+wait_corp() { # <секунд>
+    left=${1:-20}
+    while [ "$left" -gt 0 ]; do
+        corp_ok && return 0
+        sleep 2
+        left=$((left - 2))
+    done
+    return 1
+}
+
+# «Connected» после сна часто зомби: configd помнит старую сессию, трафик мёртв.
+# Переподключаем сразу, не ожидая 2 тика watchdog (~35–40с без корп. сети).
+vpn_redial() {
+    log "L2TP: зомби-туннель (Connected, корп. проба не проходит) — переподключ"
+    scutil --nc stop "$VPN_NAME" 2>/dev/null
+    sleep 2
+    vpn_connect
+}
+
 # Проверка с повторами: 5/15/30/60с от момента вызова. Ожидаем внешнюю сеть
 # всегда, корп. путь — только когда он должен идти через VPN.
 verify() {
@@ -172,31 +216,23 @@ if [ "$MODE" = "vpn" ]; then
     done
 fi
 
-# 5. Подъём L2TP (только вне корп. сети).
+# 5. Подъём L2TP (только вне корп. сети). «Connected» после сна не доверяем:
+#    в 08:28 20.10.2026 профиль был Connected, а корп. DNS не отвечал 83с,
+#    пока watchdog не сбросил зомби-туннель. Проверяем корп. путь и при
+#    провале переподключаемся сразу.
 if [ "$MODE" = "vpn" ]; then
-    STATUS=$(scutil --nc status "$VPN_NAME" 2>/dev/null | head -1)
-    if [ "$STATUS" = "Connected" ]; then
+    if [ "$DRY" = "1" ]; then
+        log "[dry] $VPN_NAME: check connected / networksetup -connectpppoeservice (до 3 попыток)"
+    elif vpn_connected; then
         log "$VPN_NAME уже Connected после сна"
-    elif [ "$DRY" = "1" ]; then
-        log "[dry] networksetup -connectpppoeservice $VPN_NAME (до 3 попыток)"
-    else
-        for attempt in 1 2 3; do
-            networksetup -connectpppoeservice "$VPN_NAME" 2>/dev/null
-            for i in $(seq 1 10); do
-                sleep 2
-                STATUS=$(scutil --nc status "$VPN_NAME" 2>/dev/null | head -1)
-                if [ "$STATUS" = "Connected" ]; then
-                    log "$VPN_NAME reconnected after wake (attempt $attempt, t+$(( $(date +%s) - T0 ))s)"
-                    break
-                fi
-            done
-            [ "$STATUS" = "Connected" ] && break
-            scutil --nc stop "$VPN_NAME" 2>/dev/null
-            sleep 3
-        done
-        if [ "$STATUS" != "Connected" ]; then
-            log "$VPN_NAME reconnect failed after 3 attempts"
+        if wait_corp 15; then
+            log "корп. путь жив (t+$(( $(date +%s) - T0 ))s)"
+        else
+            vpn_redial
+            wait_corp 20 || log "корп. путь всё ещё не отвечает после переподключения"
         fi
+    else
+        vpn_connect
     fi
     # Сессия ppp0 после wake меняется (в логах 20.10: .175 -> .103) — маркер
     # повторяем, чтобы демон пересобрал маршруты уже по финальной сессии.
@@ -215,13 +251,18 @@ EXPECT_CORP=0
 if [ "$DRY" = "1" ]; then
     log "[dry] verify: пропущено"
 elif ! verify "$EXPECT_CORP"; then
-    notify_fail "сеть не восстановилась за 60с (режим $MODE), повторяю рестарт Karing"
-    if [ "$MODE" = "vpn" ]; then
-        mark_wake
+    # Выбираем лечение по тому, что именно мертво: перезапуск Karing не лечит
+    # L2TP, а переподключение L2TP не лечит сломанный utun Karing.
+    if [ "$MODE" = "vpn" ] && net_ok && ! corp_ok; then
+        log "verify: интернет есть, корп. путь мёртв — переподключаю L2TP"
+        vpn_redial
+    else
+        log "verify: внешняя сеть не восстановилась — рестарт Karing"
+        karing_wake
     fi
-    karing_wake
+    mark_wake
     if verify "$EXPECT_CORP"; then
-        log "=== wake: ok после повторного рестарта Karing ==="
+        log "=== wake: ok после восстановления (t+$(( $(date +%s) - T0 ))s) ==="
         exit 0
     fi
     notify_fail "сеть так и не восстановилась (режим $MODE) — нужен ручной разбор: $LOG"
