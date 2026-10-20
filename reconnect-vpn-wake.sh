@@ -37,6 +37,11 @@ CURL=${CORP_CURL:-/usr/bin/curl}
 DRY=${WAKE_DRY_RUN:-0}
 LOCK=/tmp/corp-wake.lock
 CORP_DNS_PROBE=192.168.0.210
+# «Свежий след» wake-хука: watchdog читает mtime этого файла и 3 мин не
+# вмешивается (не авто-поднимает VPN и не рубит «зомби»). Гонка 23:07
+# 20.10.2026: хук поднимал vpn3-ts, watchdog в тот же тик авто-подключил
+# vpn4-ts — жили два параллельных pppd-диала, один потом деградировал.
+WAKE_HOOK_FILE=${CORP_WAKE_HOOK_FILE:-/tmp/corp-vpn-wake-hook.last}
 
 mkdir -p "$LOGDIR" 2>/dev/null
 log() {
@@ -64,6 +69,16 @@ choose_fix() {
     else
         printf 'report'
     fi
+}
+
+# «Свежий след» wake-хука: файл mtime моложе 180 с => хук шуршал сейчас.
+# Используется watchdog'ом (vpn-watchdog.sh), оффлайн-проверяется selftest.
+wake_hook_busy() {
+    local ts
+    [ -f "$WAKE_HOOK_FILE" ] || return 1
+    ts=$(stat -f %m "$WAKE_HOOK_FILE" 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    [ $(( $(date +%s) - ts )) -lt 180 ]
 }
 
 default_iface() {
@@ -103,6 +118,19 @@ selftest() {
     ST_ROUTE=''
     default_via_utun; teq "default: пусто -> не utun" "1" "$?"
 
+    # wake_hook_busy: свежий след = busy, старый/отсутствующий = нет.
+    ST_TMP=$(mktemp -d)
+    ST_HOOK="$ST_TMP/wake-hook"
+    WAKE_HOOK_FILE="$ST_HOOK"
+    [ -e "$ST_HOOK" ] && rm -f "$ST_HOOK"
+    wake_hook_busy; teq "wake-след: файла нет -> не busy" "1" "$?"
+    : > "$ST_HOOK"
+    wake_hook_busy; teq "wake-след: свежий файл -> busy" "0" "$?"
+    touch -t "$(date -r $(( $(date +%s) - 200 )) '+%Y%m%d%H%M.%S')" "$ST_HOOK"
+    wake_hook_busy; teq "wake-след: файл старше 180с -> не busy" "1" "$?"
+    WAKE_HOOK_FILE=$CORP_WAKE_HOOK_FILE
+    rm -rf "$ST_TMP"
+
     printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
         "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
     [ "$st_fail" -gt 0 ] && return 1
@@ -124,6 +152,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     mkdir "$LOCK" || exit 0
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# След для watchdog: "хук был свежим" (см. wake_hook_busy / vpn-watchdog.sh).
+# В dry-run не пишем — прогон без побочных эффектов.
+if [ "$DRY" != "1" ]; then
+    date +%s > "$WAKE_HOOK_FILE" 2>/dev/null
+fi
 
 # Маркер для root-демонов: одна строка epoch. Не гасим и не перезаписываем
 # нулём — каждый демон помнит последнее увиденное значение.

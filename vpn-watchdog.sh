@@ -159,6 +159,25 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 LAST_IP_FILE="$STATE_DIR/last_en0_ip"
 FAIL_FILE="$STATE_DIR/consec_fail"
 
+# «Свежий след» wake-хука (sleepwatcher ~/.wakeup): моложе 180 с = хук сейчас
+# переподключает L2TP сам. Гонка 23:07 20.10.2026: хук поднимал vpn3-ts,
+# watchdog в тот же тик авто-подключил vpn4-ts — жили два параллельных
+# pppd-диала, один потом деградировал и съел SA. Пока хук свежий — watchdog
+# не вмешивается ни в auto-connect, ни в "dead tunnel".
+WAKE_HOOK_FILE=${CORP_WAKE_HOOK_FILE:-/tmp/corp-vpn-wake-hook.last}
+wake_hook_busy() {
+    local ts
+    [ -f "$WAKE_HOOK_FILE" ] || return 1
+    ts=$(stat -f %m "$WAKE_HOOK_FILE" 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    [ $(( $(date +%s) - ts )) -lt 180 ]
+}
+
+if wake_hook_busy; then
+    logger "corp-vpn: wake hook busy (recent $WAKE_HOOK_FILE) — watchdog hold off"
+    exit 0
+fi
+
 # Текущий IP физического интерфейса en0 (канал к интернету/корп Wi-Fi).
 en0_ip() {
     ipconfig getifaddr en0 2>/dev/null
