@@ -521,6 +521,75 @@ assert_routes() {
   [ -n "$fixed" ] && diag ASSERT "repaired:$fixed"
 }
 
+# Забирает результаты одной пачки резолва и закрепляет IP через ppp.
+# Дедуп по уже закреплённым (www и без-www часто дают один IP): иначе STATE
+# пухнет дублями, а assert_routes зря их перебирает. Sweep — каждые
+# SWEEP_EVERY адресов, чтобы перехваты Karing снимались по ходу сборки.
+take_resolved() { # <каталог> <файл-seen> <номера файлов пачки...>
+  st_dir="$1"; st_seen="$2"; shift 2
+  for st_f in "$@"; do
+    [ -f "$st_dir/$st_f" ] && cat "$st_dir/$st_f"
+    rm -f "$st_dir/$st_f" 2>/dev/null
+  done | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/' | sort -u > "$st_dir/.batch"
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    grep -Fxq "$ip" "$st_seen" 2>/dev/null && continue
+    printf '%s\n' "$ip" >> "$st_seen"
+    add_host_route "$ip"
+    printf '%s\n' "$ip" >> "$STATE"
+    st_dom=$((st_dom + 1))
+    if [ $((st_dom % SWEEP_EVERY)) -eq 0 ]; then
+      sweep_corp_hijacks
+    fi
+  done < "$st_dir/.batch"
+}
+
+# Резолвит SITE_DOMAINS/AUTO_SITE_DOMAINS параллельно (окно из RESOLVE_JOBS) и
+# СРАЗУ закрепляет каждый готовый IP. Последовательный проход по ~327 доменам
+# блокировал цикл демона 75–140 с (wake-маркер ждал конца сборки), а барьер на
+# пачку упирался в самый медленный домен пачки (замер 20.10.2026: 46 с).
+# Готовность резолва сигналится атомарным переименованием файла: без barrier
+# один «висящий» DNS-запрос не держит остальные 300.
+add_site_domain_routes() {
+  [ "${RESOLVE_JOBS:-1}" -ge 1 ] 2>/dev/null || RESOLVE_JOBS=1
+  st_dir="${STATE}.resolve.$$"
+  rm -rf "$st_dir" 2>/dev/null
+  if ! mkdir -p "$st_dir" 2>/dev/null; then
+    return 0
+  fi
+  # Мусор от убитых экземпляров (kill -9 во время резолва): без чистки каталоги
+  # копятся в /var/run. Свои файлы только что созданы, поэтому порог в час.
+  find "$(dirname "$STATE")" -maxdepth 1 -name "$(basename "$STATE").resolve.*" \
+       -mmin +60 -exec rm -rf {} + 2>/dev/null
+  st_seen="$st_dir/.seen"; : > "$st_seen"
+  set -- $SITE_DOMAINS $AUTO_SITE_DOMAINS
+  st_n=0; st_done=0
+  while [ $# -gt 0 ] || [ "$st_done" -lt "$st_n" ]; do
+    while [ $# -gt 0 ] && [ $((st_n - st_done)) -lt "$RESOLVE_JOBS" ]; do
+      ( host_ip "$1" > "$st_dir/$st_n.tmp" 2>/dev/null
+        mv -f "$st_dir/$st_n.tmp" "$st_dir/$st_n" 2>/dev/null ) &
+      st_n=$((st_n + 1))
+      shift
+    done
+    st_ready=""
+    for st_f in "$st_dir"/*; do
+      # Несработавший glob оставляет литерал «/путь/*» — без проверки он
+      # превратился бы в «*» и подставил файлы текущего каталога.
+      [ -f "$st_f" ] || continue
+      case "$st_f" in *.tmp) continue ;; esac
+      st_ready="$st_ready ${st_f##*/}"
+    done
+    if [ -n "$st_ready" ]; then
+      take_resolved "$st_dir" "$st_seen" $st_ready
+      for st_f in $st_ready; do st_done=$((st_done + 1)); done
+    else
+      sleep 0.2
+    fi
+  done
+  wait
+  rm -rf "$st_dir" 2>/dev/null
+}
+
 add_routes() {
   iface="$1"
   diag ROUTES_ADD "iface=$iface"
@@ -580,18 +649,7 @@ add_routes() {
     done
   done
   st_dom=0
-  for h in $SITE_DOMAINS $AUTO_SITE_DOMAINS; do
-    for ip in $(host_ip "$h"); do
-      add_host_route "$ip"
-      echo "$ip" >> "$STATE"
-    done
-    st_dom=$((st_dom + 1))
-    # Karing может вернуть /32 на уже разрешённые корп. адреса прямо во время
-    # пересборки: чистим по ходу, иначе хост ждёт конца цикла.
-    if [ $((st_dom % SWEEP_EVERY)) -eq 0 ]; then
-      sweep_corp_hijacks
-    fi
-  done
+  add_site_domain_routes
   for hp in $PROBE_HOSTS; do
     h=${hp%:*}
     p=${hp##*:}
@@ -627,6 +685,10 @@ WAKE_GAP_SEC=${CORP_WAKE_GAP_SEC:-60}
 # возвращаются, и корп. хосты (b24 и др.) висят, пока идёт последовательный
 # резолв ~288 доменов — замер 20.10.2026: 2 мин 46 с до первого sweep.
 SWEEP_EVERY=${CORP_SWEEP_EVERY:-25}
+# Параллельный резолв доменов. Последовательный проход по ~288 доменам занимал
+# 75–140 с и на это время блокировал тик демона: wake-маркер, пришедший во
+# время сборки, обрабатывался только после неё (замер 20.10.2026: 75 с).
+RESOLVE_JOBS=${CORP_RESOLVE_JOBS:-16}
 
 # Маршруты уже построены по этой же VPN-сессии? Тогда полная пересборка на
 # wake только выбрасывает работу: хук ставит маркер второй раз уже во время
@@ -875,8 +937,9 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
   expect "wake/same: VPN не поднят — пересборки нет" 1 $?
 
   # 11. add_routes чистит перехваченные Karing /32 не только в assert: первый
-  #     sweep — сразу после обнуления STATE, дальше каждые SWEEP_EVERY доменов.
-  #     Проверяем кадентность на двух доменах (SWEEP_EVERY=1): 1 + 2 = 3 sweep.
+  #     sweep — сразу после обнуления STATE, дальше каждые SWEEP_EVERY адресов.
+  #     Проверяем кадентность на двух доменах с разными IP (SWEEP_EVERY=1):
+  #     1 + 2 = 3 sweep.
   ST_NETSTAT='192.168.0.33       192.168.128.55    UHS         utun7'
   STATE="$st_tmp/add.state"; DIAG_LOG="$st_tmp/add.diag"; : > "$DIAG_LOG"
   LOCAL_STATE="$st_tmp/no-local"; LOCAL_ROUTES=""
@@ -884,11 +947,37 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
   DNS_HOSTS=""; PROTECT_HOSTS=""; TUNNEL_SERVERS=""; SITE_CRITICAL=""
   MYSQL_HOSTS=""; SITE_DOMAINS="a.example b.example"; AUTO_SITE_DOMAINS=""
   PROBE_HOSTS=""; NET_ROUTES="192.168.0.0/16"
-  host_ip() { printf '192.168.0.33\n'; }
+  host_ip() {
+    case "$1" in
+      a.example) printf '192.168.0.33\n' ;;
+      b.example) printf '192.168.0.34\n' ;;
+      *) : ;;
+    esac
+  }
   add_routes ppp0 >/dev/null 2>&1
   st_i=$(grep -c 'SWEEP' "$DIAG_LOG" 2>/dev/null)
   [ "${st_i:-0}" -ge 3 ]
-  t "add_routes: sweep на старте и каждые SWEEP_EVERY доменов (${st_i:-0} шт)" "$?"
+  t "add_routes: sweep на старте и каждые SWEEP_EVERY адресов (${st_i:-0} шт)" "$?"
+
+  # 12. Пачки резолва: домены резолвятся параллельно, но IP закрепляются сразу
+  #     по готовности пачки (а не все в конце) и дедуплицируются — у www и
+  #     без-www часто один IP, и без дедупа STATE пухнет дублями, а
+  #     assert_routes зря их перебирает.
+  host_ip() {
+    case "$1" in
+      a.example) printf '10.9.0.1\n10.9.0.2\n' ;;
+      b.example) printf '10.9.0.1\n' ;;
+      c.example) printf '10.9.0.3\n' ;;
+      *) : ;;
+    esac
+  }
+  STATE="$st_tmp/batch.state"; : > "$STATE"
+  SITE_DOMAINS="a.example b.example c.example"; AUTO_SITE_DOMAINS=""
+  RESOLVE_JOBS=2; SWEEP_EVERY=1000; st_dom=0
+  add_site_domain_routes
+  teq "пачки: параллельно, без дублей IP в STATE" "10.9.0.1 10.9.0.2 10.9.0.3" \
+    "$(sort -u "$STATE" | tr '\n' ' ' | sed 's/ *$//')"
+  teq "пачки: временный каталог резолва убран" "" "$(ls -d "$STATE".resolve.* 2>/dev/null)"
 
   # информационно (не проверка): стоимость in_any_subnet на реальном списке.
   st_n=$(printf '%s\n' $LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24 | wc -l | tr -d ' ')
