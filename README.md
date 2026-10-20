@@ -159,7 +159,7 @@ macOS (без B24+Telegram). Лог-кольцо
 ## Самопроверки
 
 ```bash
-sh corp-vpn-routes.sh --selftest              # демон маршрутов, 61 проверка
+sh corp-vpn-routes.sh --selftest              # демон маршрутов, 62 проверки
 sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 19
 sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 96
 sh corp-wifi-routes.sh --selftest               # маршруты корп. Wi-Fi, 10

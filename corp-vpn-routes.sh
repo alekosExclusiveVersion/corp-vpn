@@ -305,13 +305,19 @@ EOF
 #  2) TCP до IP из probe-записей STATE (пинованы через ppp);
 #  3) TCP до IP PROBE_HOSTS, резолв через корп. DNS (fallback).
 tunnel_alive() {
+  # Проверка живёт на пути обработки пробуждения: зомби-L2TP (Connected, но
+  # трафик не идёт) надо распознать за секунды, а не за десятки. Без бюджета
+  # перебор STATE-проб и PROBE_HOSTS (nc -G 3 каждая) занимал 17 с — на это
+  # время демон не снимал перехваты Karing и не пересобирал маршруты.
+  st_end=$(( $(date +%s) + ${TUNNEL_PROBE_BUDGET:-4} ))
   if [ -n "$iface" ]; then
     srvip=$(ifconfig "$iface" 2>/dev/null | awk '/^[[:space:]]*inet /{print $2; exit}')
     if [ -n "$srvip" ]; then
       for h in $DNS_HOSTS; do
-        if ping -c 1 -t 2 -S "$srvip" "$h" >/dev/null 2>&1; then
+        if ping -c 1 -t 1 -S "$srvip" "$h" >/dev/null 2>&1; then
           return 0
         fi
+        [ "$(date +%s)" -ge "$st_end" ] && return 1
       done
     fi
   fi
@@ -320,9 +326,10 @@ tunnel_alive() {
       case "$line" in
         probe:*)
           hp=${line#probe:}
-          if nc -z -G 3 "${hp%:*}" "${hp##*:}" >/dev/null 2>&1; then
+          if nc -z -G 1 "${hp%:*}" "${hp##*:}" >/dev/null 2>&1; then
             return 0
           fi
+          [ "$(date +%s)" -ge "$st_end" ] && return 1
           ;;
       esac
     done < "$STATE"
@@ -331,10 +338,12 @@ tunnel_alive() {
     h=${hp%:*}; p=${hp##*:}
     for ip in $(host_ip "$h" 2>/dev/null); do
       [ -n "$ip" ] || continue
-      if nc -z -G 3 "$ip" "$p" >/dev/null 2>&1; then
+      if nc -z -G 1 "$ip" "$p" >/dev/null 2>&1; then
         return 0
       fi
+      [ "$(date +%s)" -ge "$st_end" ] && return 1
     done
+    [ "$(date +%s)" -ge "$st_end" ] && return 1
   done
   return 1
 }
@@ -689,6 +698,10 @@ SWEEP_EVERY=${CORP_SWEEP_EVERY:-25}
 # 75–140 с и на это время блокировал тик демона: wake-маркер, пришедший во
 # время сборки, обрабатывался только после неё (замер 20.10.2026: 75 с).
 RESOLVE_JOBS=${CORP_RESOLVE_JOBS:-16}
+# Бюджет проверки «туннель жив» (секунды). Проверка стоит на пути обработки
+# wake: без бюджета перебор проб занимал 17 с, и всё это время перехваты
+# Karing не снимались (замер 20.10.2026).
+TUNNEL_PROBE_BUDGET=${CORP_TUNNEL_PROBE_BUDGET:-4}
 
 # Маршруты уже построены по этой же VPN-сессии? Тогда полная пересборка на
 # wake только выбрасывает работу: хук ставит маркер второй раз уже во время
@@ -979,6 +992,20 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
     "$(sort -u "$STATE" | tr '\n' ' ' | sed 's/ *$//')"
   teq "пачки: временный каталог резолва убран" "" "$(ls -d "$STATE".resolve.* 2>/dev/null)"
 
+  # 13. Проверка «туннель жив» обязана укладываться в бюджет: иначе обработка
+  #     wake сдвигается на 17 с (замер 20.10.2026), и всё это время перехваты
+  #     Karing на корп. адресах живут. Бюджет 0 → одна проба и выход.
+  st_probes="$st_tmp/probes"; : > "$st_probes"
+  ping() { printf 'p\n' >> "$st_probes"; return 1; }
+  nc()   { printf 'n\n' >> "$st_probes"; return 1; }
+  host_ip() { printf '10.9.9.9\n'; }
+  STATE="$st_tmp/dead.state"
+  printf 'probe:10.9.9.1:80\nprobe:10.9.9.2:80\nprobe:10.9.9.3:80\n' > "$STATE"
+  PROBE_HOSTS="h.example:80"; DNS_HOSTS="1.2.3.4 5.6.7.8"; iface="ppp0"
+  TUNNEL_PROBE_BUDGET=0
+  tunnel_alive; st_i=$?
+  teq "tunnel_alive: бюджет 0 — одна проба и выход" "1 1" "$st_i $(wc -l < "$st_probes" | tr -d ' ')"
+
   # информационно (не проверка): стоимость in_any_subnet на реальном списке.
   st_n=$(printf '%s\n' $LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24 | wc -l | tr -d ' ')
   st_s=$(date +%s); st_i=0
@@ -1034,6 +1061,10 @@ while true; do
   fi
   if [ -n "$wake" ]; then
     diag WAKE "reason=$wake vpn=${iface:-down}"
+    # Перехваты Karing снимаем ПЕРВЫМ делом: после рестарта Karing вешает свои
+    # fake-IP /32 на корп. адреса, и пока идут проба туннеля и пересборка,
+    # b24 и другие корп. хосты недоступны. Sweep дешёвый (один netstat).
+    sweep_corp_hijacks
     dead_until=0
     last_probe=0
     fail=0
@@ -1053,7 +1084,11 @@ while true; do
     if [ "$same" = "1" ]; then
       # Сессия та же, маршруты уже построены: не выбрасываем работу. На этом же
       # тике assert_routes снесёт перехваченные Karing /32 и починит дыры.
+      # last_resolve сдвигаем: иначе периодическая пересборка (300 с) может
+      # сработать через секунды после wake и снова всё удалить — в замере
+      # 20.10.2026 так и было (ASSERT в 10:22:09, ROUTES_DEL в 10:22:14).
       diag WAKE_SAME "session unchanged — assert+sweep instead of rebuild"
+      last_resolve=$now
     else
       last_resolve=0
       last_local_snap=0
