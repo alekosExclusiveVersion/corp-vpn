@@ -184,6 +184,20 @@ else
 fi
 echo
 
+echo "==> Самопроверка wake-хука (выбор лечения без сети)..."
+# Проверяются решения «чем лечить»: мертва внешняя сеть и default в utun →
+# закрыть Karing; жива внешняя, мертва корп. → переподключить L2TP; Karing уже
+# закрыт / default не в utun → дело не в Karing. Ошибка здесь означает, что
+# после сна хук будет лечить не ту причину и окно без сети снова растянется.
+if sh "$DIR/reconnect-vpn-wake.sh" --selftest; then
+  WAKE_SELFTEST_OK=1
+else
+  WAKE_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки reconnect-vpn-wake.sh — wake-хук НЕ обновляется."
+fi
+echo
+
 echo "==> Самопроверка демона wifi-маршрутов (без root и без сети)..."
 # Проверяются чистые функции пробуждения: после сна демон должен обновить кэш
 # corp-IP и снять utun-пины Karing сразу, а не через 5 минут.
@@ -384,10 +398,14 @@ chmod 755 "$WAKE_LOGDIR"
 if [ -f "$WAKEUP_SCRIPT" ] && ! grep -q "CORP_WAKE_MARKER" "$WAKEUP_SCRIPT" 2>/dev/null; then
   cp -p "$WAKEUP_SCRIPT" "$WAKEUP_SCRIPT.bak"
 fi
-cp "$DIR/reconnect-vpn-wake.sh" "$WAKEUP_SCRIPT"
-chmod 755 "$WAKEUP_SCRIPT"
-chown aleksei:staff "$WAKEUP_SCRIPT"
-echo "  [OK]   $WAKEUP_SCRIPT обновлён (бэкап: $WAKEUP_SCRIPT.bak)"
+if [ "${WAKE_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/reconnect-vpn-wake.sh" "$WAKEUP_SCRIPT"
+  chmod 755 "$WAKEUP_SCRIPT"
+  chown aleksei:staff "$WAKEUP_SCRIPT"
+  echo "  [OK]   $WAKEUP_SCRIPT обновлён (бэкап: $WAKEUP_SCRIPT.bak)"
+else
+  echo "!! ПРОВАЛ самопроверки — $WAKEUP_SCRIPT НЕ обновлён (осталась прежняя версия)."
+fi
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
