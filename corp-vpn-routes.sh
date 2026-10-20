@@ -602,6 +602,36 @@ vpn_session_id() {
   fi
 }
 
+# --- пробуждение после сна -----------------------------------------------------
+# Маркер ставит ~/.wakeup (user, sleepwatcher): одна строка с epoch. Демон —
+# root, в домашний каталог пользователя не пишет, только читает. Гасить файл
+# нельзя: его читают несколько демонов, поэтому каждый помнит последнее
+# увиденное значение у себя.
+WAKE_MARKER=${CORP_WAKE_MARKER:-/Users/aleksei/Library/Logs/corp-vpn/wake}
+# Тик цикла 5с, поэтому пауза больше порога = машина спала.
+WAKE_GAP_SEC=${CORP_WAKE_GAP_SEC:-60}
+
+# epoch из маркера (пусто/мусор -> пусто).
+wake_marker_epoch() {
+  [ -r "$WAKE_MARKER" ] || return 0
+  sed -n '1p' "$WAKE_MARKER" 2>/dev/null | tr -cd '0-9'
+}
+
+# Разрыв между тиками больше порога. Пустой/нечисловой вход = «не пробуждение»
+# (старт демона не должен выглядеть как wake).
+wake_by_gap() { # <prev_epoch> <now_epoch> <порог>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${3:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ $(( $2 - $1 )) -ge "$3" ]
+}
+
+# Маркер новее того, что этот демон уже видел.
+wake_marker_newer() { # <seen_epoch> <marker_epoch>
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$2" -gt "${1:-0}" ]
+}
+
 last_iface=""
 last_session=""
 last_resolve=0
@@ -611,6 +641,11 @@ last_probe=0
 last_local_snap=0
 last_diag=0
 _prev_alive=""
+sleep_start=""
+# Текущее значение маркера на старте считаем уже виденным: иначе рестарт
+# демона (KeepAlive/install) давал бы лишнюю «пробуждённую» пересборку по
+# старому маркеру с прошлого wake.
+wake_seen=$(wake_marker_epoch)
 
 # --- selftest: регрессия чистых функций (без root, без сети, без правок) -------
 # Заглушки затеняют одноимённые команды (вызовы в скрипте без абсолютных путей),
@@ -771,6 +806,33 @@ lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
     "10.20.0.1 10.20.0.2 192.168.0.33 192.168.0.232" "$(sweep_removed '')"
   ST_IF_ALL="$ST_IF_FULL"
 
+  # 9. Пробуждение: разрыв тика и маркер. Класс багов здесь — «проснулись, но
+  #    демон решил, что ничего не произошло» (остаётся кулдаун/300с/старый
+  #    снапшот), либо наоборот «старт демона приняли за wake».
+  expect() { # expect <описание> <ожидаемый rc> <фактический rc>
+    if [ "$2" = "$3" ]; then t "$1" 0
+    else t "$1 — ожидался rc=$2, получен rc=$3" 1; fi
+  }
+  wake_by_gap 1000 1005 60; expect "wake/gap: штатный тик 5с — не пробуждение" 1 $?
+  wake_by_gap 1000 1060 60; expect "wake/gap: ровно порог 60с — пробуждение" 0 $?
+  wake_by_gap 1000 1300 60; expect "wake/gap: разрыв 300с — пробуждение" 0 $?
+  wake_by_gap "" 1300 60;   expect "wake/gap: нет предыдущего тика (старт) — тишина" 1 $?
+  wake_by_gap 1300 1000 60; expect "wake/gap: часы назад — не пробуждение" 1 $?
+
+  WAKE_MARKER="$st_tmp/wake"
+  printf '1700000000\n' > "$WAKE_MARKER"
+  teq "wake/marker: epoch читается из файла" "1700000000" "$(wake_marker_epoch)"
+  wake_marker_newer 1699999999 1700000000
+  expect "wake/marker: новый маркер — пробуждение" 0 $?
+  wake_marker_newer 1700000000 1700000000
+  expect "wake/marker: уже виденный маркер повторно не срабатывает" 1 $?
+  wake_marker_newer "" ""
+  expect "wake/marker: маркера нет — пробуждения нет" 1 $?
+  printf 'мусор\n' > "$WAKE_MARKER"
+  wake_marker_newer 0 "$(wake_marker_epoch)"
+  expect "wake/marker: мусор в файле — пробуждения нет" 1 $?
+  rm -f "$WAKE_MARKER"
+
   # информационно (не проверка): стоимость in_any_subnet на реальном списке.
   st_n=$(printf '%s\n' $LOCAL_ROUTES 10.20.0.0/30 10.30.5.0/24 | wc -l | tr -d ' ')
   st_s=$(date +%s); st_i=0
@@ -808,6 +870,42 @@ while true; do
   now=$(date +%s)
   iface=$(find_iface)
   session=$(vpn_session_id)
+
+  # Пробуждение после сна: тик 5с, значит разрыв больше WAKE_GAP_SEC = спали.
+  # Маркер ~/.wakeup — страховка (демон мог перезапуститься во сне, sleepwatcher
+  # мог опоздать). Дальше принудительно сбрасываем всё, что мешает быстрой
+  # пересборке: кулдаун DEAD (до 60с), таймер 300с, снапшот локальных путей
+  # (после сна сеть может быть другой) и сами маршруты — иначе они живут до
+  # смены сессии ppp0, а Karing успевает увести корп. /32 в utun.
+  wake=""
+  if wake_by_gap "$sleep_start" "$now" "$WAKE_GAP_SEC"; then
+    wake="gap=$((now - sleep_start))s"
+  fi
+  marker_now=$(wake_marker_epoch)
+  if wake_marker_newer "$wake_seen" "$marker_now"; then
+    wake_seen=$marker_now
+    wake="${wake:+$wake,}marker"
+  fi
+  if [ -n "$wake" ]; then
+    diag WAKE "reason=$wake vpn=${iface:-down}"
+    dead_until=0
+    last_probe=0
+    last_resolve=0
+    last_local_snap=0
+    fail=0
+    rm -f "$LOCAL_STATE" 2>/dev/null
+    if [ -n "$iface" ] && ! tunnel_alive; then
+      # «Connected» после сна часто зомби: configd помнит старую сессию, трафик
+      # не проходит. Маршруты в мёртвый туннель только удлиняют окно без сети —
+      # снимаем, watchdog переподключит, маршруты вернутся по смене сессии.
+      diag WAKE_DEAD "tunnel probe failed after wake, routes dropped"
+      del_routes "wake-dead"
+      iface=""
+      session=""
+    fi
+    last_iface=""
+    last_session=""
+  fi
 
   if [ $((now - last_diag)) -ge 60 ]; then
     last_diag=$now
@@ -862,7 +960,11 @@ while true; do
     # Пересобираем маршруты если: сменился интерфейс, сменился IP сессии
     # (VPN переподключился — даже если имя то же ppp0), либо прошло 300с.
     if [ "$iface" != "$last_iface" ] || [ "$session" != "$last_session" ] || [ $((now - last_resolve)) -ge 300 ]; then
-      del_routes "reassembly"
+      if [ -n "$wake" ]; then
+        del_routes "wake"
+      else
+        del_routes "reassembly"
+      fi
       add_routes "$iface"
       last_iface="$iface"
       last_session="$session"
@@ -908,5 +1010,9 @@ while true; do
     fi
   fi
 
+  # Сон ловим только на собственном ожидании цикла: между этим моментом и
+  # следующим `now` нет длинной работы (резолв ~288 доменов в add_routes идёт
+  # 40-70с), иначе обычная пересборка выглядела бы как пробуждение.
+  sleep_start=$(date +%s)
   sleep 5
 done

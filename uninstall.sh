@@ -56,6 +56,8 @@ KWATCH_LABEL="com.tradesoft.corp-karing-watch"
 KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
 KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
 KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
+KRESTART_SCRIPT="/usr/local/sbin/corp-karing-restart.sh"
+WAKEUP_SCRIPT="/Users/aleksei/.wakeup"
 SYNC_LABEL="com.tradesoft.corp-sites-sync"
 SYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$SYNC_LABEL.plist"
 SYNC_SCRIPT="/usr/local/sbin/corp-sites-sync.sh"
@@ -135,6 +137,17 @@ if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
 fi
 rm -f "$KWATCH_PLIST" "$KWATCH_SCRIPT"
+
+echo "==> Удаление рестартера Karing и wake-хука..."
+rm -f "$KRESTART_SCRIPT"
+# ~/.wakeup принадлежит sleepwatcher: возвращаем версию, что была до install
+# (бэкап .bak), иначе удаляем только нашу (с маркером wake), чтобы не снести
+# чужой скрипт пользователя.
+if [ -f "$WAKEUP_SCRIPT.bak" ]; then
+  mv -f "$WAKEUP_SCRIPT.bak" "$WAKEUP_SCRIPT"
+elif grep -q "CORP_WAKE_MARKER\|corp-vpn/wake" "$WAKEUP_SCRIPT" 2>/dev/null; then
+  rm -f "$WAKEUP_SCRIPT"
+fi
 
 echo "==> Остановка и удаление юзер-агента актуализации доменов (corp-sites-sync)..."
 if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then
@@ -287,6 +300,13 @@ if [ -e "$KWATCH_SCRIPT" ] || [ -e "$KWATCH_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы юзер-агента corp-karing-watch удалены"
+fi
+
+if [ -e "$KRESTART_SCRIPT" ]; then
+  echo "  [FAIL] рестартер Karing $KRESTART_SCRIPT не удалён"
+  fail=1
+else
+  echo "  [OK]   рестартер Karing удалён"
 fi
 
 if launchctl print "gui/$NOTIFY_UID/$SYNC_LABEL" >/dev/null 2>&1; then

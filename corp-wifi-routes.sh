@@ -60,6 +60,30 @@ if [ -f "$CONF" ]; then
   done
 fi
 
+# --- пробуждение после сна -----------------------------------------------------
+# Маркер ставит ~/.wakeup: одна строка с epoch. Гасить файл нельзя — его читают
+# несколько root-демонов, поэтому каждый помнит последнее увиденное значение.
+WAKE_MARKER=${CORP_WAKE_MARKER:-/Users/aleksei/Library/Logs/corp-vpn/wake}
+# Тик цикла 10–30с; пауза больше порога = машина спала.
+WAKE_GAP_SEC=${CORP_WAKE_GAP_SEC:-60}
+
+wake_marker_epoch() {
+  [ -r "$WAKE_MARKER" ] || return 0
+  sed -n '1p' "$WAKE_MARKER" 2>/dev/null | tr -cd '0-9'
+}
+
+wake_by_gap() { # <prev_epoch> <now_epoch> <порог>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${3:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ $(( $2 - $1 )) -ge "$3" ]
+}
+
+wake_marker_newer() { # <seen_epoch> <marker_epoch>
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$2" -gt "${1:-0}" ]
+}
+
 log() {
   echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"
   # Ограничиваем размер лога 1000 строк
@@ -319,6 +343,11 @@ resolve_corp_dns() {
 CORP_IP_CACHE=/var/run/corp-wifi-corp-ip.state
 CORP_IP_REFRESH_SEC=300
 _corp_ip_last=0
+sleep_start=""
+# Текущее значение маркера на старте считаем уже виденным: иначе рестарт
+# демона (KeepAlive/install) давал бы лишнюю «пробуждённую» пересборку по
+# старому маркеру с прошлого wake.
+wake_seen=$(wake_marker_epoch)
 
 # Пересобирает кэш публичных IP корп. доменов. Только публичные адреса:
 # внутренние (10/8, 192.168/16) и VPN_SERVERS исключаем — их пины держит
@@ -370,11 +399,88 @@ sweep_karing_pins() {
   [ -n "$rem" ] && log "swept karing utun-pins:$rem"
 }
 
+# --- selftest: чистые функции пробуждения (без root, без сети, без правок) ----
+# Класс багов: «проснулись, но демон решил, что ничего не произошло» (кэш
+# corp-IP живёт до 5 мин, пины Karing остаются с до-сонного состояния), либо
+# «старт демона приняли за пробуждение».
+case "${1:-}" in
+  --selftest|--self-test)
+    st_pass=0; st_fail=0
+    st_tmp=$(mktemp -d 2>/dev/null) || st_tmp="/tmp/corp-wifi-routes-selftest.$$"
+    mkdir -p "$st_tmp" 2>/dev/null
+    t() { # t <описание> <0=ok/иное=fail>
+      if [ "$2" = "0" ]; then
+        printf '[PASS] %s\n' "$1"; st_pass=$((st_pass + 1))
+      else
+        printf '[FAIL] %s\n' "$1"; st_fail=$((st_fail + 1))
+      fi
+    }
+    teq() { # teq <описание> <ожидаемое> <фактическое>
+      if [ "$2" = "$3" ]; then t "$1" 0
+      else t "$1 — ожидалось [$2], получено [$3]" 1; fi
+    }
+    expect() { # expect <описание> <ожидаемый rc> <фактический rc>
+      if [ "$2" = "$3" ]; then t "$1" 0
+      else t "$1 — ожидался rc=$2, получен rc=$3" 1; fi
+    }
+
+    WAKE_MARKER="$st_tmp/wake"
+    WAKE_GAP_SEC=60
+
+    wake_by_gap 1000 1005 60; expect "wake/gap: штатный тик 10с — не пробуждение" 1 $?
+    wake_by_gap 1000 1060 60; expect "wake/gap: ровно порог 60с — пробуждение" 0 $?
+    wake_by_gap 1000 1300 60; expect "wake/gap: разрыв 300с — пробуждение" 0 $?
+    wake_by_gap "" 1300 60;   expect "wake/gap: нет предыдущего тика (старт) — тишина" 1 $?
+    wake_by_gap 1300 1000 60; expect "wake/gap: часы назад — не пробуждение" 1 $?
+
+    printf '1700000000\n' > "$WAKE_MARKER"
+    teq "wake/marker: epoch читается из файла" "1700000000" "$(wake_marker_epoch)"
+    wake_marker_newer 1699999999 1700000000
+    expect "wake/marker: новый маркер — пробуждение" 0 $?
+    wake_marker_newer 1700000000 1700000000
+    expect "wake/marker: уже виденный маркер повторно не срабатывает" 1 $?
+    wake_marker_newer "" ""
+    expect "wake/marker: маркера нет — пробуждения нет" 1 $?
+    printf 'мусор\n' > "$WAKE_MARKER"
+    wake_marker_newer 0 "$(wake_marker_epoch)"
+    expect "wake/marker: мусор в файле — пробуждения нет" 1 $?
+    rm -f "$WAKE_MARKER"
+
+    rm -rf "$st_tmp"
+    printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
+      "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
+    [ "$st_fail" -gt 0 ] && exit 1
+    exit 0
+    ;;
+esac
+
 # Главный цикл
 log "Starting corp-wifi-routes.sh"
 : > "$STATE"
 
 while true; do
+  # Пробуждение после сна: разрыв тика / маркер ~/.wakeup. После сна Karing
+  # переинициализируется и перехватывает публичные IP корп. доменов в utun,
+  # «На прямую» подхватывается поздно; кэш corp-IP и пины надо обновить сразу,
+  # а не через 5 минут (CORP_IP_REFRESH_SEC).
+  now_w=$(date +%s)
+  wake=""
+  if wake_by_gap "$sleep_start" "$now_w" "$WAKE_GAP_SEC"; then
+    wake="gap=$((now_w - sleep_start))s"
+  fi
+  marker_now=$(wake_marker_epoch)
+  if wake_marker_newer "$wake_seen" "$marker_now"; then
+    wake_seen=$marker_now
+    wake="${wake:+$wake,}marker"
+  fi
+  if [ -n "$wake" ]; then
+    log "wake detected ($wake) — forced resync"
+    _corp_ip_last=0
+    # Свои пины снимаем и ставим заново: после сна шлюз/интерфейс могли
+    # смениться, а add_* не переписывают существующую запись.
+    [ -f "$STATE" ] && del_routes
+  fi
+
   # Предохранитель от осиротевших /32 -> 192.168.0.6 (см. clean_dead_gw_routes).
   # Чистим на любой сети, пока корп. VPN не активен (при активном ppp маршруты
   # через ppp и их не трогаем).
@@ -388,6 +494,7 @@ while true; do
       del_routes
       log "VPN connected, cleaned wifi-routes"
     fi
+    sleep_start=$(date +%s)
     sleep 10
     continue
   fi
@@ -411,6 +518,7 @@ while true; do
     fi
     sweep_karing_pins
 
+    sleep_start=$(date +%s)
     sleep 30
   else
     # Не корп. Wi-Fi: держим только VPN_SERVERS (нужны для подъёма L2TP на
@@ -422,6 +530,7 @@ while true; do
     fi
     # VPN-серверы возвращаем всегда (после del_routes они снесены)
     add_vpn_server_routes
+    sleep_start=$(date +%s)
     sleep 10
   fi
 done

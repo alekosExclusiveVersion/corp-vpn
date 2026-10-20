@@ -159,9 +159,11 @@ macOS (без B24+Telegram). Лог-кольцо
 ## Самопроверки
 
 ```bash
-sh corp-vpn-routes.sh --selftest              # демон маршрутов, 41 проверка
+sh corp-vpn-routes.sh --selftest              # демон маршрутов, 53 проверки
 sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 19
-sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 88
+sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 96
+sh corp-wifi-routes.sh --selftest               # маршруты корп. Wi-Fi, 10
+sh karing-restart.sh --selftest                 # решения рестартера Karing, 8
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
@@ -169,7 +171,7 @@ sh corp-routes-clean.sh --selftest              # очистка мёртвых 
 ./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 31
 ```
 
-Все шесть работают без root, без сети и без MySQL. `install.sh` прогоняет их
+Все восемь работают без root, без сети и без MySQL. `install.sh` прогоняет их
 гейтом до установки: провал `corp-vpn-routes.sh` или `corp-routes-clean.sh`
 оставляет прежнюю версию соответствующего демона, провал остальных прерывает
 установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME`,
@@ -212,5 +214,8 @@ open -a Karing                # вернуть приложение
 | `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: dry-run по умолчанию, `--apply` с бэкапом, предохранитель от частичного скана (порог 30%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 13 проверок |
 | `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): VPN-гейт, скан с ретраями, чистка, Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--rollback`; `--selftest` — 11 проверок |
 | `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 31 проверка |
+| `karing-restart.sh` | Рестартер Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы; обновляет метку `corp-karing-watch/last-resync`, чтобы вотчер не перезапускал Karing второй раз; `--selftest` — 8 проверок |
+| `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
+| `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, фоновый рестарт Karing, подъём L2TP с guard'ами корп. Wi-Fi/LAN, повторный маркер и проверка сети 5/15/30/60с + баннер при провале; `WAKE_DRY_RUN=1` — без побочных эффектов |
 | `sites-keep.txt` | Ручные исключения для чистки (осознанные алиасы вне `csSiteDomain`); устанавливается в `/usr/local/etc/sites-keep.txt` один раз, дальше не перезаписывается |
 | `README.md` | Документация |

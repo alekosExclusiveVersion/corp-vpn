@@ -53,6 +53,30 @@ DRY_LOG=${CORP_ROUTES_CLEAN_DRY_LOG:-/tmp/corp-routes-clean.dry.log}
 # Сценарий C: удалять (1) или только наблюдать (0, по умолчанию).
 PHANTOM_DELETE=${CORP_ROUTES_CLEAN_DELETE_PHANTOM:-0}
 
+# --- пробуждение после сна -----------------------------------------------------
+# Маркер ставит ~/.wakeup (одна строка с epoch). Гасить файл нельзя: его читают
+# несколько root-демонов, каждый помнит последнее увиденное значение.
+WAKE_MARKER=${CORP_WAKE_MARKER:-/Users/aleksei/Library/Logs/corp-vpn/wake}
+# Тик 15с; пауза больше порога = машина спала.
+WAKE_GAP_SEC=${CORP_WAKE_GAP_SEC:-60}
+
+wake_marker_epoch() {
+  [ -r "$WAKE_MARKER" ] || return 0
+  sed -n '1p' "$WAKE_MARKER" 2>/dev/null | tr -cd '0-9'
+}
+
+wake_by_gap() { # <prev_epoch> <now_epoch> <порог>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${3:-0}" -gt 0 ] 2>/dev/null || return 1
+  [ $(( $2 - $1 )) -ge "$3" ]
+}
+
+wake_marker_newer() { # <seen_epoch> <marker_epoch>
+  case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$2" -gt "${1:-0}" ]
+}
+
 # Пулды fake-IP Karing (можно переопределить в corp-networks.conf: FAKEIP_ROUTES=...)
 FAKEIP_ROUTES="198.18.0.0/15 198.20.0.0/15"
 # Корп. диапазоны для сценария B (берём NET_ROUTES из конфига, если задан)
@@ -695,6 +719,27 @@ default            10.20.0.1          UGScg           utun7
   sh "$self_path" --help >/dev/null 2>&1
   teq "cli: --help -> rc=0" "0" "$?"
 
+  # 19. Пробуждение после сна: разрыв тика и маркер ~/.wakeup.
+  expect() { # expect <описание> <ожидаемый rc> <фактический rc>
+    if [ "$2" = "$3" ]; then t "$1" 0
+    else t "$1 — ожидался rc=$2, получен rc=$3" 1; fi
+  }
+  WAKE_MARKER="$st_tmp/wake"
+  wake_by_gap 1000 1015 60; expect "wake/gap: штатный тик 15с — не пробуждение" 1 $?
+  wake_by_gap 1000 1060 60; expect "wake/gap: ровно порог 60с — пробуждение" 0 $?
+  wake_by_gap 1000 1300 60; expect "wake/gap: разрыв 300с — пробуждение" 0 $?
+  wake_by_gap "" 1300 60;   expect "wake/gap: нет предыдущего тика (старт) — тишина" 1 $?
+  printf '1700000000\n' > "$WAKE_MARKER"
+  teq "wake/marker: epoch читается из файла" "1700000000" "$(wake_marker_epoch)"
+  wake_marker_newer 1699999999 1700000000
+  expect "wake/marker: новый маркер — пробуждение" 0 $?
+  wake_marker_newer 1700000000 1700000000
+  expect "wake/marker: уже виденный маркер повторно не срабатывает" 1 $?
+  printf 'мусор\n' > "$WAKE_MARKER"
+  wake_marker_newer 0 "$(wake_marker_epoch)"
+  expect "wake/marker: мусор в файле — пробуждения нет" 1 $?
+  rm -f "$WAKE_MARKER"
+
   rm -rf "$st_tmp"
   printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
     "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
@@ -721,8 +766,33 @@ if [ "$PHANTOM_DELETE" -ne 1 ]; then
 fi
 rm -f "$PREV" "$CUR" "$PG_PREV" "$PG_CUR"
 
+sleep_start=""
+# Текущее значение маркера на старте считаем уже виденным: иначе рестарт
+# демона (KeepAlive/install) давал бы лишнюю «пробуждённую» пересборку по
+# старому маркеру с прошлого wake.
+wake_seen=$(wake_marker_epoch)
 while true; do
+  # Пробуждение после сна. Двухснимковый гейт (PREV/CUR) нельзя переносить
+  # через сон: таблица «до сна» несравнима с таблицей после пробуждения, и
+  # устаревший базис может подтвердить/не подтвердить мёртвый маршрут ложно.
+  now=$(date +%s)
+  wake=""
+  if wake_by_gap "$sleep_start" "$now" "$WAKE_GAP_SEC"; then
+    wake="gap=$((now - sleep_start))s"
+  fi
+  marker_now=$(wake_marker_epoch)
+  if wake_marker_newer "$wake_seen" "$marker_now"; then
+    wake_seen=$marker_now
+    wake="${wake:+$wake,}marker"
+  fi
+  if [ -n "$wake" ]; then
+    rm -f "$PREV" "$PG_PREV" 2>/dev/null
+    log "wake detected ($wake) — baseline snapshots dropped"
+  fi
+
   scan_once
   if [ "$ONCE" -eq 1 ]; then break; fi
+  # Сон ловим только на собственном ожидании цикла (см. wake_by_gap).
+  sleep_start=$(date +%s)
   sleep 15
 done

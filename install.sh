@@ -57,6 +57,9 @@ KWATCH_LABEL="com.tradesoft.corp-karing-watch"
 KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
 KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
 KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
+KRESTART_SCRIPT="/usr/local/sbin/corp-karing-restart.sh"
+WAKEUP_SCRIPT="/Users/aleksei/.wakeup"
+WAKE_LOGDIR="/Users/aleksei/Library/Logs/corp-vpn"
 SIGNALS="/var/run/corp-vpn-signals"
 PREFS="/Library/Preferences/SystemConfiguration/preferences.plist"
 
@@ -167,6 +170,32 @@ else
 fi
 echo
 
+echo "==> Самопроверка рестартера Karing (без приложения и без сети)..."
+# Рестартер нужен wake-хуку: сразу после сна Karing остаётся «Connected» с
+# мёртвым utun и держит default-маршрут в никуда. Проверяем чистую логику
+# решений (force / if-dead / не запущен).
+if sh "$DIR/karing-restart.sh" --selftest; then
+  KRESTART_SELFTEST_OK=1
+else
+  KRESTART_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки karing-restart.sh — рестартер и wake-хук"
+  echo "!! не устанавливаются."
+fi
+echo
+
+echo "==> Самопроверка демона wifi-маршрутов (без root и без сети)..."
+# Проверяются чистые функции пробуждения: после сна демон должен обновить кэш
+# corp-IP и снять utun-пины Karing сразу, а не через 5 минут.
+if sh "$DIR/corp-wifi-routes.sh" --selftest; then
+  WIFI_SELFTEST_OK=1
+else
+  WIFI_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки corp-wifi-routes.sh — демон не обновляется."
+fi
+echo
+
 echo "==> Установка файлов демона..."
 if [ "$ROUTES_SELFTEST_OK" -eq 1 ]; then
   cp "$DIR/corp-vpn-routes.sh" "$DAEMON_SCRIPT"
@@ -206,8 +235,12 @@ fi
 launchctl load -w "$LEARN_PLIST"
 
 echo "==> Установка демона маршрутизации при корп. Wi-Fi (corp-wifi-routes)..."
-cp "$DIR/corp-wifi-routes.sh" "$WIFI_SCRIPT"
-chmod 755 "$WIFI_SCRIPT"
+if [ "${WIFI_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/corp-wifi-routes.sh" "$WIFI_SCRIPT"
+  chmod 755 "$WIFI_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $WIFI_SCRIPT НЕ обновлён (осталась старая версия)."
+fi
 cp "$DIR/com.tradesoft.corp-wifi-routes.plist" "$WIFI_PLIST"
 if launchctl list | grep -q "$WIFI_LABEL"; then
   launchctl unload "$WIFI_PLIST" 2>/dev/null || true
@@ -329,6 +362,32 @@ if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
 fi
 launchctl bootstrap "gui/$NOTIFY_UID" "$KWATCH_PLIST"
+
+echo "==> Установка рестартера Karing и wake-хука (~/.wakeup для sleepwatcher)..."
+# karing-restart.sh — user-level рестарт Karing (вызывает ~/.wakeup сразу после
+# сна). ~/.wakeup теперь ставится install.sh, а не руками: раньше копия в
+# домашнем каталоге расходилась с репозиторием, и правки логики wake не
+# доезжали до sleepwatcher.
+if [ "${KRESTART_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/karing-restart.sh" "$KRESTART_SCRIPT"
+  chmod 755 "$KRESTART_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $KRESTART_SCRIPT НЕ обновлён."
+fi
+mkdir -p "$WAKE_LOGDIR"
+chown aleksei:staff "$WAKE_LOGDIR"
+# Каталог логов/маркера должен быть доступен пользователю на запись: маркер
+# ставит ~/.wakeup, читают его root-демоны.
+chmod 755 "$WAKE_LOGDIR"
+# Бэкапим только НЕ нашу версию: иначе повторный install затрёт оригинал
+# (uninstall восстанавливает именно .bak).
+if [ -f "$WAKEUP_SCRIPT" ] && ! grep -q "CORP_WAKE_MARKER" "$WAKEUP_SCRIPT" 2>/dev/null; then
+  cp -p "$WAKEUP_SCRIPT" "$WAKEUP_SCRIPT.bak"
+fi
+cp "$DIR/reconnect-vpn-wake.sh" "$WAKEUP_SCRIPT"
+chmod 755 "$WAKEUP_SCRIPT"
+chown aleksei:staff "$WAKEUP_SCRIPT"
+echo "  [OK]   $WAKEUP_SCRIPT обновлён (бэкап: $WAKEUP_SCRIPT.bak)"
 
 echo "==> Применение split-режима (убираем OverridePrimary)..."
 BIN="/tmp/split_fix_build"
@@ -483,6 +542,27 @@ else
   fail=1
 fi
 
+if [ -x "$KRESTART_SCRIPT" ]; then
+  echo "  [OK]   скрипт рестарта Karing $KRESTART_SCRIPT"
+else
+  echo "  [FAIL] скрипт $KRESTART_SCRIPT отсутствует"
+  fail=1
+fi
+
+if [ -x "$WAKEUP_SCRIPT" ]; then
+  echo "  [OK]   wake-хук $WAKEUP_SCRIPT"
+else
+  echo "  [FAIL] wake-хук $WAKEUP_SCRIPT отсутствует/не исполняемый"
+  fail=1
+fi
+
+if [ -w "$WAKE_LOGDIR" ]; then
+  echo "  [OK]   каталог маркера/логов wake $WAKE_LOGDIR"
+else
+  echo "  [FAIL] $WAKE_LOGDIR недоступен на запись пользователю (маркер wake не создастся)"
+  fail=1
+fi
+
 if [ -r "$NETWORKS_CONF" ]; then
   echo "  [OK]   конфиг корп. сетей $NETWORKS_CONF"
 else
@@ -523,6 +603,8 @@ if [ "$fail" -eq 0 ]; then
   echo "Уведомления (Notification Center) — corp-notify (LaunchAgent, каждые 10с)."
 echo "Актуализация доменов — corp-sites-sync (LaunchAgent, 08:00/14:00/20:00 + догон)."
 echo "Вотчер Karing — corp-karing-watch (LaunchAgent, каждые 10 мин + при логине)."
+echo "После сна: ~/.wakeup (sleepwatcher) ставит маркер wake для демонов,"
+echo "перезапускает Karing и проверяет сеть с повторами (лог ~/Library/Logs/corp-vpn/wake.log)."
 else
   echo
   if [ "$ROUTES_SELFTEST_OK" -eq 0 ]; then
