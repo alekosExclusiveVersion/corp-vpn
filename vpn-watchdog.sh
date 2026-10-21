@@ -30,12 +30,9 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 PROFILES="vpn3-ts vpn4-ts vpn2-ts"
 
 # Подключены ли к корп. Wi-Fi.
-# До 21.10.2026 считалось, что на корп. Wi-Fi L2TP/IPSec не поднимается
-# (сетевое оборудование глушит L2TP-в-ESP) и VPN там не нужен — 21.10.2026 туннель
-# vpn3-ts на корп. Wi-Fi поднялся и передавал трафик (egress 92.255.230.89),
-# поэтому VPN там пригоден и ручной подъём сохраняется (guard watchdogAaron
-# больше не гасит активный туннель, §3.6.1). Автоподъём на корп. Wi-Fi остаётся
-# выключенным: по умолчанию корп. ресурсы идут direct (Karing «На прямую»).
+# На корп. Wi-Fi L2TP/IPSec не поднимается (сетевое оборудование глушит L2TP-в-ESP),
+# поэтому корп. VPN там не подключаем — на этом Wi-Fi он бесполезен и только
+# молотит попытки.
 # Критерий — эталоны из corp-networks.conf: приватный MAC en0 (основной, работает
 # и без IP) и ARP-MAC шлюза (вторичный, требует IP). Хотспот телефона раздаёт ту
 # же подсеть 192.168.128.0/24, но его MAC en0 другой (3e:e9:15:74:f3:be), поэтому
@@ -244,12 +241,13 @@ restart_profile() {
 # В обоих случаях, если профиль числится Connected — это зомби/бесполезный
 # туннель, гасим его и не пытаемся поднять.
 if is_corp_wifi; then
-    # 21.10.2026: снос Connected-профилей убран. L2TP на корп. Wi-Fi теперь
-    # работает (поднят vpn3-ts, egress 92.255.230.89, трафик в обе стороны),
-    # а root-вход в админки сайтов завязан на egress корп. туннеля (§6 п.6),
-    # поэтому вручную поднятый VPN нужно сохранять. Автоподъём остаётся
-    # выключенным — по умолчанию в офисе работает direct (Karing «На прямую»).
-    logger "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped (active VPN kept)"
+    for p in $PROFILES; do
+        if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
+            scutil --nc stop "$p" 2>/dev/null
+            logger "corp-vpn: $p torn down on corp Wi-Fi (L2TP blocked there)"
+        fi
+    done
+    logger "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped"
     exit 0
 fi
 
