@@ -4,7 +4,8 @@
 #
 # Цикл (LaunchAgent com.tradesoft.corp-sites-sync, 3 раза в день
 # 08:00/14:00/20:00 + догон пропущенного прогона при старте):
-#   1) тихий выход, если корп. VPN опущен (MySQL недоступны);
+#   1) тихий выход, если корп. VPN опущен И не корп. Wi-Fi (там MySQL
+#      доступны напрямую, проверено 22.10: полный скан 287 доменов без ppp0);
 #      3 пропуска подряд = уведомление (VPN лежит весь день);
 #   2) полный скан collect-sites.py --from-app с ретраями на хост
 #      (флап MySQL-маршрутов доказан: Access denied с домашнего IP);
@@ -92,6 +93,46 @@ emit() {
 }
 
 vpn_up() { ifconfig ppp0 2>/dev/null | grep -q 'inet '; }
+
+# Корп. Wi-Fi: приватный MAC en0 (per-network признак, работает даже без IP)
+# и/или ARP-MAC шлюза соответствует эталонам из corp-networks.conf. Паттерн —
+# is_corp_wifi/gw_mac из vpn-watchdog.sh (см. §3.6.1 CORP-VPN-SETUP.md).
+CORP_WIFI_MACS_DEFAULT="b6:be:0c:d5:9a:24"
+CORP_WIFI_GW_MACS_DEFAULT="54:b8:a:cf:80:0"
+
+corp_wifi_macs() {
+  local v
+  v=$(grep -E '^CORP_WIFI_EN0_MACS=' "$INSTALLED_CONF" 2>/dev/null |
+      cut -d= -f2- | tr -d '"')
+  [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$CORP_WIFI_MACS_DEFAULT"
+}
+
+gw_mac() {
+  local lines gw
+  lines=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default"{print}')
+  [ -n "$lines" ] || return 1
+  gw=$(printf '%s\n' "$lines" | awk '$NF!~/^utun/{print $2; exit}')
+  [ -n "$gw" ] ||
+    gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')
+  [ -n "$gw" ] && [ "$gw" != "0.0.0.0" ] && [ "$gw" != "default" ] || return 1
+  arp -n "$gw" 2>/dev/null | awk '{print $4; exit}'
+}
+
+is_corp_wifi() {
+  local mac gm verdict=""
+  mac=$(ifconfig en0 2>/dev/null | awk '/ether/{print $2; exit}')
+  case " $(corp_wifi_macs) " in
+    *" $mac "*) verdict="corp" ;;
+  esac
+  # Вторичный признак: ARP-шлюза (нужен отзывчивый gw; на хотспоте не резолвится).
+  if [ -z "$verdict" ] && [ -n "$mac" ]; then
+    gm=$(gw_mac 2>/dev/null) || gm=""
+    case " $CORP_WIFI_GW_MACS_DEFAULT " in
+      *" $gm "*) verdict="corp" ;;
+    esac
+  fi
+  [ "$verdict" = "corp" ]
+}
 
 # conf_mtime <60с назад менял corp-learn? Не драться с автодетектом.
 learn_recent() {
