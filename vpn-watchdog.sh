@@ -160,6 +160,48 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 LAST_IP_FILE="$STATE_DIR/last_en0_ip"
 FAIL_FILE="$STATE_DIR/consec_fail"
 
+# --- Диал-шторм/модалки (23.10.2026, ночь: цепочка vpn3->vpn4->vpn2) ---
+# Каждая сетап-попытка networksetup -connectpppoeservice идёт через
+# NESMLegacySession в Aqua-сессии пользователя, и при неудаче macOS
+# показывает модалку «Подключение VPN — Сервер L2TP-VPN не ответил»
+# (по одной на попытку; попытка может висеть до ~30-65 мин). Поэтому:
+#   1) dial делается БЕЗ блокировки watchdog'а (guard 25s — networksetup
+#      иногда висит до часов, логи ручья 23:18->00:24);
+#   2) одна попытка на тик (round-robin по профилям), не цикл по трём;
+#   3) после неудачного dial'а — общий cooldown-маркер на 600s: и watchdog,
+#      и wake-хук (~/.wakeup, пользовательский context) его уважают. Макер
+#      общий файл /tmp/corp-vpn-dial-cooldown (mtime), user может создать/править.
+DIAL_COOLDOWN_FILE=/tmp/corp-vpn-dial-cooldown
+DIAL_COOLDOWN_SECS=600
+RR_FILE=$STATE_DIR/rr_idx
+
+dial_cooldown_fresh() {
+    local ts
+    [ -f "$DIAL_COOLDOWN_FILE" ] || return 1
+    ts=$(stat -f %m "$DIAL_COOLDOWN_FILE" 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    [ $(( $(date +%s) - ts )) -lt "$DIAL_COOLDOWN_SECS" ]
+}
+set_dial_cooldown() {
+    date +%s > "$DIAL_COOLDOWN_FILE" 2>/dev/null
+    # root создаёт файл 644 — делаем 666, чтобы user wake-хук мог обновить
+    # (или создать свой) маркер после своих неудачных попыток.
+    chmod 666 "$DIAL_COOLDOWN_FILE" 2>/dev/null
+}
+clear_dial_cooldown() { rm -f "$DIAL_COOLDOWN_FILE" 2>/dev/null || true; }
+
+# Неблокирующий dial: networksetup иногда не возвращается десятками минут
+# (сессия не стартует) — рушим процесс networksetup через 25s, а возможный
+# «осиротевший» диал затем зачищаем scutil --nc stop (вызывающая сторона).
+ns_dial() { # <profile>
+    networksetup -connectpppoeservice "$1" 2>/dev/null &
+    local pid=$!
+    ( sleep 25; kill "$pid" 2>/dev/null; sleep 3; kill -9 "$pid" 2>/dev/null ) & local guard=$!
+    wait "$pid" 2>/dev/null
+    kill "$guard" 2>/dev/null
+    return 0
+}
+
 # «Свежий след» wake-хука (sleepwatcher ~/.wakeup): моложе 180 с = хук сейчас
 # переподключает L2TP сам. Гонка 23:07 20.10.2026: хук поднимал vpn3-ts,
 # watchdog в тот же тик авто-подключил vpn4-ts — жили два параллельных
@@ -221,11 +263,7 @@ restart_profile() {
     local p="$1"
     scutil --nc stop "$p" 2>/dev/null
     sleep 2
-    if command -v networksetup >/dev/null 2>&1; then
-        networksetup -connectpppoeservice "$p" 2>/dev/null
-    else
-        scutil --nc start "$p" 2>/dev/null
-    fi
+    ns_dial "$p"
     for i in $(seq 1 10); do
         sleep 2
         if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
@@ -284,8 +322,11 @@ if [ -n "$connected" ]; then
         logger "corp-vpn: en0 IP changed ($last_ip -> $cur_ip), restarting $connected"
         if restart_profile "$connected"; then
             logger "corp-vpn: $connected reconnected after network change"
+            clear_dial_cooldown
         else
             logger "corp-vpn: failed to reconnect $connected after network change"
+            scutil --nc stop "$connected" 2>/dev/null
+            set_dial_cooldown
         fi
         echo 0 > "$FAIL_FILE"
         exit 0
@@ -304,29 +345,42 @@ if [ -n "$connected" ]; then
         logger "corp-vpn: dead tunnel detected (probe failed $fail times), restarting $connected"
         if restart_profile "$connected"; then
             logger "corp-vpn: $connected reconnected after dead-tunnel restart"
+            clear_dial_cooldown
         else
             logger "corp-vpn: failed to reconnect $connected (dead tunnel)"
+            scutil --nc stop "$connected" 2>/dev/null
+            set_dial_cooldown
         fi
         echo 0 > "$FAIL_FILE"
     fi
     exit 0
 fi
 
-# Нет активного профиля — поднимаем по приоритету (existing logic).
-for p in $PROFILES; do
-    if command -v networksetup >/dev/null 2>&1; then
-        networksetup -connectpppoeservice "$p" 2>/dev/null
-    else
-        scutil --nc start "$p" 2>/dev/null
-    fi
-    for i in $(seq 1 10); do
-        sleep 2
-        if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
-            logger "corp-vpn: $p auto-connected by watchdog"
-            exit 0
-        fi
-    done
-    scutil --nc stop "$p" 2>/dev/null
-done
+# Нет активного профиля — поднимаем по приоритету.
+# Анти-шторм: (а) cooldown после неудачного dial'а — не дёргаем macOS 10 мин
+# (каждая попытка в GUI = модалка); (б) одна попытка за тик, round-robin
+# по $PROFILES (networksetup может висеть минуты — ns_dial с guard 25s).
+if dial_cooldown_fresh; then
+    logger "corp-vpn: dial cooldown (<600s после неудачи) — auto-connect пропущен"
+    exit 0
+fi
 
-logger "corp-vpn: watchdog failed to connect any profile"
+idx=$(cat "$RR_FILE" 2>/dev/null); idx=${idx:-0}
+set -- $PROFILES
+p=$(eval "echo \${$(( idx % $# + 1 ))}")
+echo $(( idx + 1 )) > "$RR_FILE"
+logger "corp-vpn: auto-connect attempt $p (round-robin)"
+ns_dial "$p"
+for i in $(seq 1 10); do
+    sleep 2
+    if [ "$(scutil --nc status "$p" 2>/dev/null | head -1)" = "Connected" ]; then
+        logger "corp-vpn: $p auto-connected by watchdog"
+        clear_dial_cooldown
+        exit 0
+    fi
+done
+# Не подключился: гасим возможный осиротевший диал (ns_dial мог убить
+# networksetup уже после старта сессии) и ставим общий cooldown.
+scutil --nc stop "$p" 2>/dev/null
+set_dial_cooldown
+logger "corp-vpn: $p dial failed — cooldown ${DIAL_COOLDOWN_SECS}s"

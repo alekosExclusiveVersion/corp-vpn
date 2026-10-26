@@ -230,9 +230,34 @@ vpn_connected() {
 }
 
 # Подъём L2TP до Connected (до 3 попыток, между ними stop + пауза).
+# networksetup может висеть десятками минут (ночь 23.10.2026) — диал асинхронный
+# с guard 25s. После полного провала — общий с watchdog'ом cooldown-маркер
+# /tmp/corp-vpn-dial-cooldown (10 мин): каждая попытка в GUI-контексте рисует
+# модалку «Сервер L2TP-VPN не ответил», штормить не нужно.
+DIAL_COOLDOWN_FILE=/tmp/corp-vpn-dial-cooldown
+DIAL_COOLDOWN_SECS=600
+dial_cooldown_fresh() {
+    local ts
+    [ -f "$DIAL_COOLDOWN_FILE" ] || return 1
+    ts=$(stat -f %m "$DIAL_COOLDOWN_FILE" 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    [ $(( $(date +%s) - ts )) -lt "$DIAL_COOLDOWN_SECS" ]
+}
+ns_dial() { # <profile>
+    networksetup -connectpppoeservice "$1" 2>/dev/null &
+    local pid=$!
+    ( sleep 25; kill "$pid" 2>/dev/null; sleep 3; kill -9 "$pid" 2>/dev/null ) & local guard=$!
+    wait "$pid" 2>/dev/null
+    kill "$guard" 2>/dev/null
+}
+
 vpn_connect() {
+    if dial_cooldown_fresh; then
+        log "$VPN_NAME: dial cooldown (<600s после неудачи) — попытка пропущена"
+        return 1
+    fi
     for attempt in 1 2 3; do
-        networksetup -connectpppoeservice "$VPN_NAME" 2>/dev/null
+        ns_dial "$VPN_NAME"
         i=0
         while [ "$i" -lt 10 ]; do
             sleep 2
@@ -246,6 +271,7 @@ vpn_connect() {
         sleep 3
     done
     log "$VPN_NAME connect failed after 3 attempts"
+    date +%s > "$DIAL_COOLDOWN_FILE" 2>/dev/null
     return 1
 }
 
@@ -302,6 +328,16 @@ notify_fail() {
 
 T0=$(date +%s)
 log "=== wake: старт (dry=$DRY) ==="
+
+# 0. Свипер модалок VPN: macOS при неудачном дial'е показывает модалку
+#    «Подключение VPN — Сервер L2TP-VPN не ответил» с OK (neagent/Settings),
+#    и человек обязан её закрывать вручную. В течение 10 мин после сна свипер
+#    закрывает сам. Работает только в этом окне, не фоновый надзор.
+if [ "$DRY" != "1" ]; then
+    nohup /usr/local/sbin/vpn-dialog-sweeper.sh 600 >/dev/null 2>&1 &
+    [ -x /usr/local/sbin/vpn-dialog-sweeper.sh ] || \
+        nohup "$HOME/Work/scripts/corp-vpn/vpn-dialog-sweeper.sh" 600 >/dev/null 2>&1 &
+fi
 
 # 1. Маркер — первым делом, ещё до ожидания IP: демонам важно начать
 #    пересборку как можно раньше.
