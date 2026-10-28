@@ -2,6 +2,19 @@
 # Автовосстановление сети после пробуждения (копируется в ~/.wakeup).
 # Вызывается sleepwatcher: -w /Users/aleksei/.wakeup.
 #
+# Нулевой шаг — guard «Mac спит?» (28.10.2026): sleepwatcher -w подписан на
+# события пробуждения, а пробуждение бывает и «тёмным» (DarkWake: крышка
+# закрыта, дисплея нет, система лишь обслуживает себя — rtc/Maintenance,
+# SleepService каждые ~15 мин на батарее). Восстанавливать там нечего и вредно:
+# dial и рестарт Karing бодят машину, а через 2–45 с она снова засыпает прямо
+# посреди последовательности. Реально за 28.10 все 35 стартов хука совпали с
+# настоящим Wake (Δ+0…2с), т.е. это страховка, а не объяснение ночной
+# активности: ночью VPN трогает root-демон vpn-watchdog (StartInterval 30,
+# работает и в DarkWake — /tmp/corp-vpn-notify.seen, 02:41:10/05:56:07/06:56:37).
+# Поэтому ДО lock/маркера/Karing проверяем, что пробуждение пользовательское;
+# иначе тихий выход rc=0 без восстановительных действий — только след для
+# watchdog (/tmp/corp-vpn-wake-hook.last, чтобы он не влез в тот же тик).
+#
 # Порядок важен (20.10.2026, разбор пробуждения 07:55:38):
 #   1. маркер пробуждения ~/Library/Logs/corp-vpn/wake — root-демоны
 #      (corp-vpn-routes, corp-wifi-routes, corp-routes-clean) по нему сбрасывают
@@ -24,6 +37,8 @@
 #      Karing; жива внешняя, мертва корп. → переподключение L2TP.
 #
 # Отладка без побочных эффектов: WAKE_DRY_RUN=1 ~/.wakeup
+# Отладка детектора сна: CORP_WAKE_PM_DUMP=<файл с дампом IOPMrootDomain> —
+# детектор читает дамп из файла и не опрашивает pmset (полностью оффлайн).
 VPN_NAME="vpn3-ts"
 CONF=/usr/local/etc/corp-networks.conf
 CORP_WIFI_EN0_MACS_DEFAULT="b6:be:0c:d5:9a:24"
@@ -35,6 +50,9 @@ KRESTART=${CORP_KARING_RESTART:-/usr/local/sbin/corp-karing-restart.sh}
 [ -x "$KRESTART" ] || KRESTART="$HOME/Work/scripts/corp-vpn/karing-restart.sh"
 CURL=${CORP_CURL:-/usr/bin/curl}
 DRY=${WAKE_DRY_RUN:-0}
+# Детектор сна: пусто — боевой режим (ioreg + pmset), путь к файлу — оффлайн-
+# режим (дамп IOPMrootDomain из файла, pmset не опрашивается) для тестов.
+PM_DUMP=${CORP_WAKE_PM_DUMP:-}
 LOCK=/tmp/corp-wake.lock
 CORP_DNS_PROBE=192.168.0.210
 # «Свежий след» wake-хука: watchdog читает mtime этого файла и 3 мин не
@@ -92,6 +110,83 @@ default_via_utun() {
     esac
 }
 
+# --- Детектор сна (guard «Mac спит?») --------------------------------------
+# Различать «настоящее» пробуждение и DarkWake умеет сам powerd, и он же
+# складывает признаки в IOPMrootDomain (14 мс на чтение, pmset -g log — 1,6 с,
+# поэтому лог не парсим). Сверено с pmset -g log за 28.10.2026:
+#   • настоящий wake 08:05:07 (крышка): UserIsActive "lidopen", [DeclUser kDisp],
+#     IOPMUserTriggeredFullWake=Yes, IOPMUserIsActive=Yes;
+#   • DarkWake 06:40:16 (обслуживание): ни одного UserIsActive-ассерта,
+#     [PrevIdle SysAct kCPU] — без DeclUser/kDisp, крышка закрыта.
+# Пустой/битый дамп -> unknown -> НЕ спим: пропустить восстановление хуже, чем
+# сделать его лишний раз (fail-open). Но молчать об этом нельзя: в оффлайн-
+# режиме битый/отсутствующий CORP_WAKE_PM_DUMP тихо выключает весь guard
+# «Mac спит?» — пишем WARN, чтобы причина была видна в логе. Предупреждение
+# выходит ровно одно на прогон: деградация даёт вердикт unknown, а значит guard
+# не уходит в повторную пробу (флаг в $(...) не выживает — не заводим его).
+pm_dump_warn() {
+    [ "${PM_WARN_SILENT:-0}" = "1" ] && return 0
+    # Только в лог/системный лог (stderr для dry): pm_dump вызывается внутри
+    # $(...) и любой stdout отсюда попал бы в «дамп» и в вердикт детектора.
+    log "WARN: оффлайн-режим CORP_WAKE_PM_DUMP=$PM_DUMP: $1 — детектор сна недоступен, считаю Mac бодрствующим (fail-open)" >&2
+}
+pm_dump() {
+    if [ -n "$PM_DUMP" ]; then
+        local dump
+        # Проверяем читаемость ДО redirection: ошибку `tr < $PM_DUMP` печатает
+        # сам bash и подавить её изнутри команды нельзя.
+        if [ ! -r "$PM_DUMP" ]; then
+            pm_dump_warn "файл не читается"
+            return 0
+        fi
+        dump=$(tr '\n' ' ' < "$PM_DUMP" 2>/dev/null)
+        case "$dump" in
+            *IOPMrootDomain*) printf '%s' "$dump"; return 0 ;;
+        esac
+        if [ -z "$dump" ]; then
+            pm_dump_warn "дамп пуст"
+        else
+            pm_dump_warn "в дампе нет IOPMrootDomain (повреждён)"
+        fi
+        printf '%s' "$dump"
+        return 0
+    fi
+    ioreg -n IOPMrootDomain -r -d 1 2>/dev/null | tr '\n' ' '
+}
+
+# Число ассертов UserIsActive (второй, независимый от ioreg, признак «человек
+# за машиной»). В оффлайн-режиме не опрашивается.
+pm_useractive() {
+    [ -n "$PM_DUMP" ] && return 0
+    pmset -g assertions 2>/dev/null | awk '$1=="UserIsActive"{print $2; exit}'
+}
+
+# asleep|awake|unknown. Чистая функция: <дамп IOPMrootDomain> <UserIsActive|"">.
+sleep_verdict() {
+    case "$1" in
+        *IOPMrootDomain*) ;;
+        *) printf 'unknown'; return ;;
+    esac
+    # Есть пользовательские признаки — это настоящее пробуждение.
+    case "$1" in
+        *'"IOPMUserTriggeredFullWake" = Yes'*|*'"IOPMUserIsActive" = Yes'*|*'"Wake Type" = "User'*)
+            printf 'awake'; return ;;
+    esac
+    # Живой ассерт UserIsActive тоже доказывает присутствие человека.
+    case "${2:-}" in
+        ''|*[!0-9]*) ;;                 # нет данных — не доказательство
+        0)           ;;
+        *) printf 'awake'; return ;;
+    esac
+    # Пользователя нет и крышка закрыта — DarkWake, восстанавливать нечего.
+    case "$1" in
+        *'"AppleClamshellState" = Yes'*) printf 'asleep'; return ;;
+    esac
+    printf 'unknown'
+}
+
+mac_asleep() { [ "$(sleep_verdict "$(pm_dump)" "$(pm_useractive)")" = "asleep" ]; }
+
 selftest() {
     st_pass=0; st_fail=0
     teq() {
@@ -131,6 +226,37 @@ selftest() {
     WAKE_HOOK_FILE=$CORP_WAKE_HOOK_FILE
     rm -rf "$ST_TMP"
 
+    # Детектор сна: тёмное пробуждение (крышка закрыта, пользователя нет) —
+    # именно оно приходит ночью на батарее — против настоящего wake.
+    ST_DARK='+-o IOPMrootDomain <class IOPMrootDomain> { "Wake Type" = "Maintenance" "IOPMUserTriggeredFullWake" = No "AppleClamshellState" = Yes "IOPMUserIsActive" = No }'
+    ST_WAKE='+-o IOPMrootDomain <class IOPMrootDomain> { "Wake Type" = "UserActivity Assertion" "IOPMUserTriggeredFullWake" = Yes "AppleClamshellState" = No "IOPMUserIsActive" = Yes }'
+    ST_LIDOPEN='+-o IOPMrootDomain <class IOPMrootDomain> { "IOPMUserTriggeredFullWake" = No "AppleClamshellState" = No "IOPMUserIsActive" = No }'
+    teq "сон: DarkWake + крышка закрыта -> asleep" "asleep" "$(sleep_verdict "$ST_DARK" 0)"
+    teq "сон: DarkWake без данных об ассертах -> asleep" "asleep" "$(sleep_verdict "$ST_DARK" '')"
+    teq "сон: настоящий wake -> awake" "awake" "$(sleep_verdict "$ST_WAKE" 1)"
+    teq "сон: DarkWake + живой ассерт UserIsActive -> awake" "awake" "$(sleep_verdict "$ST_DARK" 1)"
+    teq "сон: крышка открыта, признаков пользователя нет -> unknown" "unknown" "$(sleep_verdict "$ST_LIDOPEN" 0)"
+    teq "сон: мусор вместо дампа -> unknown" "unknown" "$(sleep_verdict "hello" 0)"
+    teq "сон: пустой дамп -> unknown" "unknown" "$(sleep_verdict "" '')"
+
+    # mac_asleep целиком: дамп из файла (оффлайн-режим) + подмена pm_useractive.
+    ST_TMP2=$(mktemp -d)
+    ST_SAVED_PM="$PM_DUMP"
+    # Тестовые дампы специально битые (в т.ч. /dev/null) — WARN о деградации
+    # оффлайн-режима тут ожидаем и в боевой лог попадать не должен.
+    ST_SAVED_QUIET="${PM_WARN_SILENT:-0}"
+    PM_WARN_SILENT=1
+    printf '%s\n' "$ST_DARK" > "$ST_TMP2/dark"
+    printf '%s\n' "$ST_WAKE" > "$ST_TMP2/awake"
+    pm_useractive() { printf '%s\n' "${ST_UA:-}"; }
+    PM_DUMP="$ST_TMP2/dark"; ST_UA=0; mac_asleep; teq "сон: дамп DarkWake + UA=0 -> спим" "0" "$?"
+    PM_DUMP="$ST_TMP2/dark"; ST_UA=1; mac_asleep; teq "сон: дамп DarkWake + UA=1 -> не спим" "1" "$?"
+    PM_DUMP="$ST_TMP2/awake"; ST_UA=1; mac_asleep; teq "сон: дамп wake -> не спим" "1" "$?"
+    PM_DUMP=/dev/null;         ST_UA=0; mac_asleep; teq "сон: пустой дамп -> не спим (fail-open)" "1" "$?"
+    PM_DUMP="$ST_SAVED_PM"
+    PM_WARN_SILENT="$ST_SAVED_QUIET"
+    rm -rf "$ST_TMP2"
+
     printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
         "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
     [ "$st_fail" -gt 0 ] && return 1
@@ -140,6 +266,29 @@ selftest() {
 case "${1:-}" in
     --selftest) selftest; exit $? ;;
 esac
+
+# Guard «Mac спит?» — до lock, маркера, Karing и dial. Повтор через 1 с: на
+# настоящем wake powerd выставляет user-active за доли секунды, а ложный
+# пропуск (нет сети до следующего пробуждения) недопустим.
+if mac_asleep; then
+    sleep 1
+    if mac_asleep; then
+        # След «хук шуршал» ставим и на пропуске: вход в хук состоялся (его
+        # вызвало событие sleepwatcher), и пока след свежий, watchdog не
+        # авто-подключает VPN и не рубит «зомби» — на DarkWake именно это
+        # будит машину и рвёт сессию. Без записи следа пропуск по сну
+        # выглядел для watchdog'а как «хука не было» — hold-off терялся.
+        if [ "$DRY" = "1" ]; then
+            log "[dry] след wake-хука -> $WAKE_HOOK_FILE (пропуск по сну) — не пишу"
+        else
+            date +%s > "$WAKE_HOOK_FILE" 2>/dev/null || \
+                log "WARN: не записал след wake-хука $WAKE_HOOK_FILE"
+        fi
+        log "Mac во сне (DarkWake: крышка закрыта, пользователя нет) — восстановление не нужно, rc=0"
+        exit 0
+    fi
+    log "детектор сна: первая проба «спит», повторная «бодрствует» — продолжаю"
+fi
 
 # Один прогон за раз: sleepwatcher может выдать несколько wake-событий подряд,
 # а два параллельных подъёма L2TP и рестарта Karing только мешают друг другу.
