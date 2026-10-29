@@ -18,6 +18,13 @@
 #      подменить DNS-хайджек Karing'а (вечер 20.10.2026).
 #
 # Запускается LaunchDaemon'ом com.tradesoft.corp-vpn-watchdog каждые 30с.
+#
+# Guard «Mac спит?» (DarkWake, добавлен 29.10.2026): LaunchDaemon с StartInterval
+# тикает и в DarkWake (lid закрыт, пользователь не активен — «Mac спит»). Без
+# guard'а watchdog в такой момент видел «нет Connected-профиля» и молотил
+# авто-подключение L2TP — отсюда «ночные» попытки в 00:xx/02:xx/03:xx при
+# спящем Mac. Восстановление после сна делает wake-хук (~/.wakeup); watchdog
+# в сне просто выходит. См. §3.6.1 CORP-VPN-SETUP.md.
 
 LOCK=/tmp/corp-vpn-watchdog.lock
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -26,6 +33,71 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     mkdir "$LOCK" || exit 0
 fi
 trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
+# --- Guard «Mac спит?» (DarkWake) — корень «ночных» авто-подключений (29.10.2026) ---
+# Аналог guard'а из ~/.wakeup (reconnect-vpn-wake.sh, fix 3f7c6ec): LaunchDaemon
+# watchdog (StartInterval 30, RunAtLoad) получает тики и в DarkWake — крышка
+# закрыта, пользователь не активен, для пользователя это «Mac спит», а по powerd
+# это поддерживающий режим (maintenance). Watchdog без guard'а не знает о сне:
+# в состоянии сна/no-IP у него нет Connected-профиля -> попадает в авто-подключение
+# и молотит networksetup -connectpppoeservice (ночные попытки в 00:xx/02:xx/03:xx).
+# Восстановление после сна делает wake-хук (~/.wakeup); здесь просто выходим.
+# Fail-open: пустой/битый дамп -> unknown -> считаем Mac бодрствующим (как в хуке).
+PM_DUMP=${CORP_WAKE_PM_DUMP:-}
+pm_dump_warn() {
+    [ "${PM_WARN_SILENT:-0}" = "1" ] && return 0
+    logger "corp-vpn: watchdog: WARN: оффлайн-режим CORP_WAKE_PM_DUMP=$PM_DUMP: $1 — детектор сна недоступен, считаю Mac бодрствующим (fail-open)"
+}
+pm_dump() {
+    if [ -n "$PM_DUMP" ]; then
+        local dump
+        if [ ! -r "$PM_DUMP" ]; then
+            pm_dump_warn "файл не читается"
+            return 0
+        fi
+        dump=$(tr '\n' ' ' < "$PM_DUMP" 2>/dev/null)
+        case "$dump" in
+            *IOPMrootDomain*) printf '%s' "$dump"; return 0 ;;
+        esac
+        if [ -z "$dump" ]; then
+            pm_dump_warn "дамп пуст"
+        else
+            pm_dump_warn "в дампе нет IOPMrootDomain (повреждён)"
+        fi
+        printf '%s' "$dump"
+        return 0
+    fi
+    ioreg -n IOPMrootDomain -r -d 1 2>/dev/null | tr '\n' ' '
+}
+pm_useractive() {
+    [ -n "$PM_DUMP" ] && return 0
+    pmset -g assertions 2>/dev/null | awk '$1=="UserIsActive"{print $2; exit}'
+}
+sleep_verdict() {
+    case "$1" in
+        *IOPMrootDomain*) ;;
+        *) printf 'unknown'; return ;;
+    esac
+    case "$1" in
+        *'"IOPMUserTriggeredFullWake" = Yes'*|*'"IOPMUserIsActive" = Yes'*|*'"Wake Type" = "User'*)
+            printf 'awake'; return ;;
+    esac
+    case "${2:-}" in
+        ''|*[!0-9]*) ;;
+        0) ;;
+        *) printf 'awake'; return ;;
+    esac
+    case "$1" in
+        *'"AppleClamshellState" = Yes'*) printf 'asleep'; return ;;
+    esac
+    printf 'unknown'
+}
+mac_asleep() { [ "$(sleep_verdict "$(pm_dump)" "$(pm_useractive)")" = "asleep" ]; }
+
+if mac_asleep; then
+    logger "corp-vpn: watchdog: Mac во сне (DarkWake) — авто-подключение пропущено"
+    exit 0
+fi
 
 PROFILES="vpn3-ts vpn4-ts vpn2-ts"
 

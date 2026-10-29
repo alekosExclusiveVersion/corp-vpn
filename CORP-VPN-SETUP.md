@@ -540,6 +540,15 @@ grep -E "WAKE|WAKE_DEAD|ROUTES_ADD" /var/log/corp-vpn-routes-diag.log | tail
   `RunAtLoad: true`), файл `/Library/LaunchDaemons/com.tradesoft.corp-vpn-watchdog.plist`
 
 **Как работает:**
+0. **Guard «Mac спит?» (добавлен 29.10.2026):** перед любой проверки watchdog
+   сам детектит сон — тот же детектор, что в `~/.wakeup` (fix `3f7c6ec`): `ioreg` +
+   `pmset` + оффлайн-режим через `CORP_WAKE_PM_DUMP`. В DarkWake (крышка закрыта,
+   пользователь не активен — «Mac спит») watchdog выходит с rc=0 без dial'ов.
+   Раньше guard'а у watchdog'а не было: LaunchDaemon (`StartInterval` 30)
+   получает тики и в DarkWake, скрипт не знал о сне и, видя «нет Connected»,
+   поднимал L2TP заново — отсюда ночные попытки в 00:xx/02:xx/03:xx при спящем
+   Mac. Восстановление после сна — дело `~/.wakeup` (там guard есть с 28.10.2026);
+   watchdog в сне молча выходит.
 1. Замок на `mkdir /tmp/corp-vpn-watchdog.lock` (протухший через 3 мин
    автоочищается) — защита от параллельных запусков.
 2. **Корп. Wi-Fi guard (добавлено 04.09.2026, уточнён 19.10.2026):** вердикт
