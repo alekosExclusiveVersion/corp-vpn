@@ -68,6 +68,31 @@ done
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 
+# Защита от параллельных прогонов (flock нет в macOS по умолчанию).
+LOCKDIR="${SITES_SYNC_LOCKDIR:-/tmp/corp-sites-sync.lock}"
+acquire_lock() {
+  if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    # Если lock старше 2ч — считаем его мёртвым и снимаем.
+    if [ -d "$LOCKDIR" ]; then
+      local age now mt
+      now=$(date +%s)
+      mt=$(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0)
+      age=$(( now - mt ))
+      if [ "$age" -gt 7200 ]; then
+        rmdir "$LOCKDIR" 2>/dev/null || true
+        mkdir "$LOCKDIR" 2>/dev/null || { log "SKIP: другой прогон уже идёт"; exit 0; }
+      else
+        log "SKIP: другой прогон уже идёт (lock age ${age}s)"
+        exit 0
+      fi
+    else
+      log "SKIP: другой прогон уже идёт"
+      exit 0
+    fi
+  fi
+  trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+}
+
 # Кольцевая обрезка лога (конвенция DIAG_MAX демона маршрутов).
 trim_log() {
   local f="$1" max="$2" n
@@ -235,7 +260,7 @@ run_cycle() {
   fi
 
   if [ "$removed" -gt 0 ]; then
-    if "$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
+    if $SUDO "$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
         --keep-file "$dir/keep.txt" --apply >> "$LOG" 2>&1; then
       log "clean --apply ok, удалено $removed"
       $SUDO launchctl kickstart -k system/com.tradesoft.corp-vpn-routes \
@@ -405,14 +430,15 @@ selftest() {
 }
 
 case "${1:-}" in
-  --dry-run) mkdir -p "$LOGDIR"; run_cycle 1 ;;
-  --force) mkdir -p "$LOGDIR"; run_cycle 0 ;;
+  --dry-run) mkdir -p "$LOGDIR"; acquire_lock; run_cycle 1 ;;
+  --force) mkdir -p "$LOGDIR"; acquire_lock; run_cycle 0 ;;
   --rollback) do_rollback ;;
   --selftest) selftest ;;
   *)
     mkdir -p "$LOGDIR"
     if catchup_due; then
       log "catchup: последний успех >${CATCHUP_HOURS}ч назад, догоняю"
+      acquire_lock
       run_cycle 0
     else
       log "расписание: догон не нужен (успех был недавно)"

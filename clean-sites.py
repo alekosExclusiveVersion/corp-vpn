@@ -52,6 +52,9 @@ def compute_stale(site_domains, fresh, protected, suffixes):
             continue
         if dl in protected:
             continue
+        # www-вариант считается живым, если жив базовый домен
+        if dl.startswith("www.") and dl[4:] in fresh:
+            continue
         if any(dl.endswith(s.lower()) for s in suffixes):
             continue
         stale.append(d)
@@ -97,8 +100,8 @@ def main(argv=None):
                     help="домены-исключения через запятую")
     ap.add_argument("--keep-file", default=None,
                     help="файл с доменами-исключениями")
-    ap.add_argument("--threshold", type=float, default=0.30,
-                    help="макс. доля протухших без --force (по умолч. 0.30)")
+    ap.add_argument("--threshold", type=float, default=0.50,
+                    help="макс. доля протухших без --force (по умолч. 0.50)")
     ap.add_argument("--force", action="store_true",
                     help="применить даже при превышении порога")
     ap.add_argument("--apply", action="store_true",
