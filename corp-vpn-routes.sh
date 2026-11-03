@@ -73,6 +73,18 @@ signal_vpn_transition() {
   fi
 }
 
+# Запуск свипера модалок «Сервер L2TP-VPN не ответил» под консольным
+# пользователем (root-демон не имеет доступа к UI/TCC). Свипер имеет pidfile,
+# поэтому повторные вызовы безопасны — второй экземпляр сразу выходит.
+trigger_dialog_sweeper() {
+  cu=$(stat -f%Su /dev/console 2>/dev/null)
+  [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+  uid=$(id -u "$cu" 2>/dev/null) || return 0
+  [ -x /usr/local/sbin/vpn-dialog-sweeper.sh ] || return 0
+  launchctl asuser "$uid" /usr/local/sbin/vpn-dialog-sweeper.sh 600 \
+    >/dev/null 2>&1 &
+}
+
 find_iface() {
   for svc in $CORP_SERVICES; do
     out=$(scutil --nc status "$svc" 2>/dev/null)
@@ -1179,6 +1191,7 @@ while true; do
     last_session=""
     fail=0
     signal_vpn_transition "down"
+    trigger_dialog_sweeper
   fi
 
   # Проверка живости: маршруты держим, только пока корп. трафик реально проходит.
@@ -1197,6 +1210,7 @@ while true; do
         fail=0
         dead_until=$((now + 60))
         signal_vpn_transition "down"
+        trigger_dialog_sweeper
       fi
     fi
   fi

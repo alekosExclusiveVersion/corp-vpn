@@ -261,6 +261,14 @@ set_dial_cooldown() {
     chmod 666 "$DIAL_COOLDOWN_FILE" 2>/dev/null
 }
 clear_dial_cooldown() { rm -f "$DIAL_COOLDOWN_FILE" 2>/dev/null || true; }
+trigger_dialog_sweeper() {
+    cu=$(stat -f%Su /dev/console 2>/dev/null)
+    [ -n "$cu" ] && [ "$cu" != "root" ] || return 0
+    uid=$(id -u "$cu" 2>/dev/null) || return 0
+    [ -x /usr/local/sbin/vpn-dialog-sweeper.sh ] || return 0
+    launchctl asuser "$uid" /usr/local/sbin/vpn-dialog-sweeper.sh 600 \
+        >/dev/null 2>&1 &
+}
 
 # Неблокирующий dial: networksetup иногда не возвращается десятками минут
 # (сессия не стартует) — рушим процесс networksetup через 25s, а возможный
@@ -399,6 +407,7 @@ if [ -n "$connected" ]; then
             logger "corp-vpn: failed to reconnect $connected after network change"
             scutil --nc stop "$connected" 2>/dev/null
             set_dial_cooldown
+            trigger_dialog_sweeper
         fi
         echo 0 > "$FAIL_FILE"
         exit 0
@@ -422,6 +431,7 @@ if [ -n "$connected" ]; then
             logger "corp-vpn: failed to reconnect $connected (dead tunnel)"
             scutil --nc stop "$connected" 2>/dev/null
             set_dial_cooldown
+            trigger_dialog_sweeper
         fi
         echo 0 > "$FAIL_FILE"
     fi
@@ -455,4 +465,5 @@ done
 # networksetup уже после старта сессии) и ставим общий cooldown.
 scutil --nc stop "$p" 2>/dev/null
 set_dial_cooldown
+trigger_dialog_sweeper
 logger "corp-vpn: $p dial failed — cooldown ${DIAL_COOLDOWN_SECS}s"
