@@ -424,6 +424,69 @@ def app_servers(app_path: str) -> list[dict]:
     return out
 
 
+def scan_one_server(spec, args, password, hosts_filter):
+    """Сканирует один MySQL-сервер; возвращает (host, domains, no_domain_dbs, err, skipped)."""
+    host = spec.get("host")
+    if not host:
+        return (None, set(), [], "нет host", False)
+    if host in EXCLUDED_SERVERS:
+        print(f"{host}: пропущен (в EXCLUDED_SERVERS)")
+        return (host, set(), [], None, True)
+    if hosts_filter and host not in hosts_filter:
+        return (host, set(), [], None, True)
+    s_port = int(spec.get("port") or args.port)
+    s_user = spec.get("user") or args.user
+    s_pass = spec.get("password") or password
+    if not s_pass:
+        print(f"{host}: нет пароля, пропущен", file=sys.stderr)
+        return (host, set(), [], "нет пароля", False)
+    server_domains: set[str] = set()
+    no_domain_dbs: list[str] = []
+    try:
+        conn = make_conn(host, s_port, s_user, s_pass, args.timeout)
+    except Exception as ex:
+        print(f"{host}: ошибка: {ex}", file=sys.stderr)
+        return (host, set(), [], f"ошибка: {ex}", False)
+    try:
+        cur = conn.cursor()
+        try:
+            server_domains |= scan_psa_domains(cur)
+            dbs = list_databases(cur)
+        except Exception as ex:
+            print(f"{host}: ошибка: {ex}", file=sys.stderr)
+            conn.close()
+            return (host, set(), [], f"ошибка: {ex}", False)
+        for db in dbs:
+            try:
+                found = scan_site_structure(cur, db)
+                if not found:
+                    found = scan_cfg_settings(cur, db)
+            except Exception as ex:
+                print(f"  {db}: ошибка: {ex}", file=sys.stderr)
+                cur.close()
+                try:
+                    conn = make_conn(host, s_port, s_user, s_pass, args.timeout)
+                    cur = conn.cursor()
+                except Exception as rex:
+                    print(f"{host}: ошибка переподключения: {rex}", file=sys.stderr)
+                    break
+                continue
+            if found:
+                server_domains |= found
+                print(f"  {db}: {', '.join(sorted(found))}")
+            else:
+                no_domain_dbs.append(db)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if no_domain_dbs:
+        print(f"  без домена: {', '.join(no_domain_dbs)}")
+    print(f"{host}: {len(server_domains)} домен(ов)")
+    return (host, server_domains, no_domain_dbs, None, False)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Сбор доменов сайтов с MySQL-серверов")
     ap.add_argument("--servers", default="",
@@ -445,6 +508,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=3306)
     ap.add_argument("--timeout", type=int, default=60,
                     help="read_timeout на запрос, сек (по умолчанию 60)")
+    ap.add_argument("--workers", type=int, default=6,
+                    help="число параллельных потоков сканирования серверов "
+                         "(по умолчанию 6)")
     ap.add_argument("--out", default="sites.txt",
                     help="файл со списком доменов (по одному на строку)")
     ap.add_argument("--hosts", default="",
@@ -526,68 +592,23 @@ def main() -> None:
     all_domains: set[str] = set()
     by_server: dict[str, set[str]] = {}
 
-    for spec in servers:
-        host = spec.get("host")
-        if not host:
-            continue
-        if host in EXCLUDED_SERVERS:
-            print(f"{host}: пропущен (в EXCLUDED_SERVERS)")
-            continue
-        if hosts and host not in hosts:
-            continue
-        # При --from-app у каждого сервера своя учётка, иначе — общий пароль
-        s_port = int(spec.get("port") or args.port)
-        s_user = spec.get("user") or args.user
-        s_pass = spec.get("password") or password
-        if not s_pass:
-            print(f"{host}: нет пароля, пропущен", file=sys.stderr)
-            continue
-        server_domains: set[str] = set()
-        no_domain_dbs: list[str] = []
-        try:
-            conn = make_conn(host, s_port, s_user, s_pass, args.timeout)
-        except Exception as ex:
-            print(f"{host}: ошибка: {ex}", file=sys.stderr)
-            continue
-        try:
-            cur = conn.cursor()
-            try:
-                server_domains |= scan_psa_domains(cur)
-                dbs = list_databases(cur)
-            except Exception as ex:
-                print(f"{host}: ошибка: {ex}", file=sys.stderr)
-                conn.close()
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    workers = max(1, int(getattr(args, "workers", 6)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for spec in servers:
+            if not spec.get("host"):
                 continue
-            for db in dbs:
-                try:
-                    found = scan_site_structure(cur, db)
-                    if not found:
-                        found = scan_cfg_settings(cur, db)
-                except Exception as ex:
-                    print(f"  {db}: ошибка: {ex}", file=sys.stderr)
-                    cur.close()
-                    conn.close()
-                    try:
-                        conn = make_conn(host, s_port, s_user, s_pass,
-                                         args.timeout)
-                        cur = conn.cursor()
-                    except Exception as rex:
-                        print(f"{host}: ошибка переподключения: {rex}",
-                              file=sys.stderr)
-                        break
-                    continue
-                if found:
-                    server_domains |= found
-                    print(f"  {db}: {', '.join(sorted(found))}")
-                else:
-                    no_domain_dbs.append(db)
-        finally:
-            conn.close()
-        if no_domain_dbs:
-            print(f"  без домена: {', '.join(no_domain_dbs)}")
-        print(f"{host}: {len(server_domains)} домен(ов)")
-        by_server[host] = server_domains
-        all_domains |= server_domains
+            futures[ex.submit(scan_one_server, spec, args, password, hosts)] = spec
+        for fut in as_completed(futures):
+            host, server_domains, no_domain_dbs, err, skipped = fut.result()
+            if skipped:
+                continue
+            if err:
+                print(f"{host}: {err}", file=sys.stderr)
+                continue
+            by_server[host] = server_domains
+            all_domains |= server_domains
 
     ordered = clean_list(all_domains)
     print()

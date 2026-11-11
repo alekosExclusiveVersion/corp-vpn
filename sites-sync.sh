@@ -156,6 +156,14 @@ is_corp_wifi() {
       *" $gm "*) verdict="corp" ;;
     esac
   fi
+  # Fallback: корп. подсеть по IP en0 (192.168.128.0/24), даже если MAC
+  # рандомизирован/ARP шлюза не резолвится.
+  if [ -z "$verdict" ]; then
+    ip=$(ipconfig getifaddr en0 2>/dev/null || true)
+    case "$ip" in
+      192.168.128.*) verdict="corp" ;;
+    esac
+  fi
   [ "$verdict" = "corp" ]
 }
 
@@ -198,6 +206,9 @@ do_collect() {
   local dir="$1" err hosts h i ok
   : > "$dir/union.txt"; : > "$dir/failhosts"
   err=$(collect_once "" "$dir/full.txt")
+  if [ -n "$err" ]; then
+    log "collect: stderr: $(printf '%s' "$err" | head -1 | cut -c1-200)"
+  fi
   cat "$dir/full.txt" 2>/dev/null >> "$dir/union.txt"
   hosts=$(printf '%s' "$err" | grep -oE '^[a-z0-9][a-z0-9.-]*\.ru' | sort -u)
   for h in $hosts; do
@@ -205,6 +216,9 @@ do_collect() {
     for i in $(seq 1 $MAX_TRIES); do
       sleep "$RETRY_SLEEP"
       err=$(collect_once "$h" "$dir/host-$h.txt")
+      if [ -n "$err" ]; then
+        log "collect retry $h: $(printf '%s' "$err" | head -1 | cut -c1-120)"
+      fi
       if [ -z "$err" ]; then ok=1; break; fi
     done
     if [ "$ok" -eq 1 ]; then
@@ -222,7 +236,7 @@ run_cycle() {
   dir=$(mktemp -d "${TMPDIR:-/tmp}/sites-sync.XXXXXX")
   log "===== START dry=$dry ====="
 
-  if ! vpn_up; then
+  if ! vpn_up && ! is_corp_wifi; then
     skip_tick "vpn=down"
     return 0
   fi
@@ -240,10 +254,14 @@ run_cycle() {
   union="$dir/union.txt"
   failhosts=$(tr '\n' ' ' < "$dir/failhosts")
   log "collect: union=$(wc -l < "$union" | tr -d ' ') доменов"
+  if [ ! -s "$union" ]; then
+    log "SKIP: скан пустой (0 доменов), чистка пропущена"
+    emit sites-sync.skip "скан пустой — чистка пропущена"
+    return 0
+  fi
   if [ -n "$failhosts" ]; then
-    log "FAIL: неоспрошены: $failhosts"
-    emit sites-sync.fail "частичный скан, хосты: $failhosts — чистка пропущена"
-    return 1
+    log "WARN: неоспрошены: $failhosts"
+    emit sites-sync.warn "частичный скан: $failhosts"
   fi
 
   cp "$union" "$LOGDIR/fresh-$(date +%Y%m%d-%H%M).txt"
