@@ -69,8 +69,8 @@ start() {
             return 0
         fi
     done
-    echo "Подключаю $VPN_NAME (CLI)..."
-    scutil --nc start "$VPN_NAME" 2>/dev/null
+    echo "Подключаю $VPN_NAME (networksetup)..."
+    networksetup -connectpppoeservice "$VPN_NAME" 2>/dev/null
     sleep 6
     if corp_up; then
         echo "OK: туннель поднят."

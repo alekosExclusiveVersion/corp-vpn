@@ -244,7 +244,7 @@ FAIL_FILE="$STATE_DIR/consec_fail"
 #      и wake-хук (~/.wakeup, пользовательский context) его уважают. Макер
 #      общий файл /tmp/corp-vpn-dial-cooldown (mtime), user может создать/править.
 DIAL_COOLDOWN_FILE=/tmp/corp-vpn-dial-cooldown
-DIAL_COOLDOWN_SECS=600
+DIAL_COOLDOWN_SECS=180
 RR_FILE=$STATE_DIR/rr_idx
 
 dial_cooldown_fresh() {
