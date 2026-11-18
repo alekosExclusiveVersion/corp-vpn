@@ -23,11 +23,21 @@
 # sudo событие только логируется.
 #
 # Режимы:
-#   (без флагов)   цикл проверки (для LaunchAgent);
+#   (без флагов)   цикл проверки (для LaunchAgent, кулдаун действует);
 #   --check        только сверка дрейфа, без изменений;
-#   --force        ресинк безусловно (отладка; кулдаун игнорируется,
-#                  guard запущенного Karing — нет);
+#   --sync         синк по дрейфу немедленно, без кулдауна (для sites-sync
+#                  и агента WatchPaths на изменение конфига);
+#   --force        ресинк безусловно (отладка; кулдаун и guard запущенного
+#                  Karing игнорируются);
 #   --selftest     проверки на фикстурах (без Karing, без сети, без root).
+#
+# Не зависит от корп. VPN/Wi-Fi: правится только live-конфиг Karing
+# (direct_out), MySQL и скан доменов не нужны. Если Karing закрыт
+# (VPN лежит, приложение не запущено), -i применяется без запуска
+# приложения; если был запущен — quit -> -i -> open.
+#
+# Параллельные ресинки (sites-sync, WatchPaths-агент, вотчер) исключены
+# общим локом /tmp/corp-karing-resync.lock.
 # ==========================================================
 set -uo pipefail
 
@@ -43,6 +53,10 @@ SUDO="${KWATCH_SUDO:-$HOME/bin/sudo}"
 COOLDOWN="${KWATCH_COOLDOWN:-1800}"
 QUIT_SLEEP="${KWATCH_QUIT_SLEEP:-6}"
 OPEN_SLEEP="${KWATCH_OPEN_SLEEP:-15}"
+# Общий лок ресинка: sites-sync, WatchPaths-агент и этот вотчер могут
+# сработать одновременно (правка конфига + плановый прогон) — рестарт
+# Karing должен быть один.
+LOCKDIR="${KWATCH_LOCK:-/tmp/corp-karing-resync.lock}"
 # Напоминание о незакоммиченных изменениях репо (баннер, без B24/TG):
 # DIRTY_AFTER — возраст грязи для первого напоминания (48ч),
 # REMIND_EVERY — пауза между повторами (24ч).
@@ -108,30 +122,73 @@ cooldown_ok() {
 
 mark_resync() { date +%s > "$LAST_RESYNC"; }
 
+# Лок на время ресинка (flock в macOS нет по умолчанию — mkdir).
+# Старше 10 минут считаем мёртвым: рестарт Karing столько не живёт.
+acquire_resync_lock() {
+  local now mt age
+  if mkdir "$LOCKDIR" 2>/dev/null; then
+    trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+    return 0
+  fi
+  now=$(date +%s)
+  mt=$(stat -f %m "$LOCKDIR" 2>/dev/null || echo 0)
+  age=$(( now - mt ))
+  if [ "$age" -gt 600 ]; then
+    rmdir "$LOCKDIR" 2>/dev/null || true
+    if mkdir "$LOCKDIR" 2>/dev/null; then
+      trap 'rmdir "$LOCKDIR" 2>/dev/null' EXIT INT TERM
+      return 0
+    fi
+  fi
+  log "SKIP: ресинк уже идёт другим процессом (lock ${age}s)"
+  return 1
+}
+
 do_resync() {
-  local drift out
-  log "дрейф, рестарт Karing для -i"
-  karing_quit
-  if karing_running; then
-    log "FAIL: Karing не закрылся, -i пропускается"
-    emit karing-watch.fail "Karing не закрылся для синхронизации"
-    return 1
+  local rc
+  if ! acquire_resync_lock; then
+    return 0
+  fi
+  _resync_locked
+  rc=$?
+  rmdir "$LOCKDIR" 2>/dev/null || true
+  trap - EXIT INT TERM
+  return $rc
+}
+
+_resync_locked() {
+  local drift out was_running=0
+  if karing_running; then was_running=1; fi
+  if [ "$was_running" -eq 1 ]; then
+    log "дрейф, рестарт Karing для -i"
+    karing_quit
+    if karing_running; then
+      log "FAIL: Karing не закрылся, -i пропускается"
+      emit karing-watch.fail "Karing не закрылся для синхронизации"
+      return 1
+    fi
+  else
+    log "дрейф, Karing не запущен — -i без рестарта приложения"
   fi
   if out=$(karing_apply 2>&1); then
     log "karing: -i применён"
   else
     log "FAIL: karing -i: $out"
+    emit karing-watch.fail "karing -i: ошибка записи конфига"
+    return 1
   fi
-  karing_open
+  if [ "$was_running" -eq 1 ]; then
+    karing_open
+  fi
   if drift=$(drift_lines); [ -z "$drift" ]; then
-    log "karing: после рестарта чисто"
+    log "karing: после применения чисто"
     mark_resync
     emit karing-watch.ok "ts-network синхронизирован с корп. конфигами"
     return 0
   else
-    log "FAIL: дрейф остался после рестарта: $drift"
+    log "FAIL: дрейф остался после синхронизации: $drift"
     mark_resync
-    emit karing-watch.fail "дрейф Karing остался после рестарта"
+    emit karing-watch.fail "дрейф Karing остался после синхронизации"
     return 1
   fi
 }
@@ -187,6 +244,24 @@ run_cycle() {
   return $rc
 }
 
+# Немедленный синк по дрейфу (кулдаун не действует). Вызывают sites-sync
+# перед VPN-гейтом и WatchPaths-агент после правки corp-networks.conf.
+sync_now() {
+  local drift
+  mkdir -p "$LOGDIR"
+  if [ ! -x "$RULES" ]; then
+    log "FAIL: нет генератора $RULES"
+    emit karing-watch.fail "нет генератора karing-rules.sh"
+    return 1
+  fi
+  if drift=$(drift_lines); [ -z "$drift" ]; then
+    log "sync: дрейфа нет"
+    return 0
+  fi
+  log "sync: дрейф: $drift"
+  do_resync
+}
+
 selftest() {
   local pass=0 fail=0 tmp
   tmp=$(mktemp -d)
@@ -202,6 +277,7 @@ selftest() {
   # переопределённые ниже обёртки видят локальный tmp).
   LOGDIR="$tmp/logs" LOG="$tmp/logs/karing-watch.log"
   LAST_RESYNC="$tmp/logs/last-resync"
+  LOCKDIR="$tmp/lock"
   SIGNALS="$tmp/signals" SUDO="$tmp/fake-sudo" COOLDOWN=100
   mkdir -p "$tmp/logs"
 
@@ -209,8 +285,8 @@ selftest() {
   # первый вызов — CHECK_FIRST, остальные — CHECK_REST (счётчик в файле,
   # чтобы пережить подшеллы в $(...)).
   karing_running() { [ -f "$tmp/still-running" ]; }
-  karing_quit() { :; }
-  karing_open() { :; }
+  karing_quit() { [ -f "$tmp/quit-works" ] && rm -f "$tmp/still-running"; return 0; }
+  karing_open() { printf 'opened\n' >> "$tmp/opened"; }
   karing_apply() { printf 'applied\n' >> "$tmp/applied"; return 0; }
   karing_check() {
     local n
@@ -292,6 +368,23 @@ selftest() {
   run_cycle >/dev/null 2>&1
   ck "cycle: без генератора код 1" "1" "$?" "cy15"
 
+  # --sync: кулдаун не действует; запущенный Karing переоткрывается.
+  RULES="$tmp/rules.sh"
+  printf '#!/bin/sh\nexit 0\n' > "$RULES"; chmod +x "$RULES"
+  CHECK_FIRST='ДРЕЙФ: 2 расхождения' CHECK_REST='Дрейфа нет'
+  clean_state; rm -f "$tmp/opened" "$tmp/quit-works"
+  : > "$tmp/still-running"; : > "$tmp/quit-works"
+  date +%s > "$tmp/logs/last-resync"
+  sync_now >/dev/null 2>&1
+  ck "sync: кулдаун игнорируется" "0" "$([ -f "$tmp/applied" ]; echo $?)" "sy1"
+  ck "sync: запущенный Karing переоткрыт" "1" "$(grep -c . "$tmp/opened" 2>/dev/null || true)" "sy2"
+
+  # --sync: Karing не запущен — -i применяется без старта приложения.
+  clean_state; rm -f "$tmp/opened" "$tmp/quit-works"
+  sync_now >/dev/null 2>&1
+  ck "sync: без Karing -i применён" "0" "$([ -f "$tmp/applied" ]; echo $?)" "sy3"
+  ck "sync: без Karing приложение не стартует" "0" "$([ -f "$tmp/opened" ] && echo 1 || echo 0)" "sy4"
+
   printf 'a\nb\nc\nd\ne\n' > "$tmp/log"
   trim_log "$tmp/log" 3
   ck "trim: кольцо" "c d e" "$(tr '\n' ' ' < "$tmp/log" | sed 's/ $//')" "tr"
@@ -338,6 +431,7 @@ case "${1:-}" in
     fi
     ;;
   --force) mkdir -p "$LOGDIR"; do_resync ;;
+  --sync) sync_now ;;
   --selftest) selftest ;;
   *) mkdir -p "$LOGDIR"; run_cycle ;;
 esac

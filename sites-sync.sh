@@ -236,6 +236,14 @@ run_cycle() {
   dir=$(mktemp -d "${TMPDIR:-/tmp}/sites-sync.XXXXXX")
   log "===== START dry=$dry ====="
 
+  # Синк Karing не зависит от VPN, корп. Wi-Fi и скана MySQL: сначала
+  # приводим live-конфиг к corp-networks.conf, потом уже решаем про скан.
+  # Так правила обновляются и когда VPN лежит (домашний Wi-Fi после сна,
+  # корп. Wi-Fi без L2TP), а не только после успешного collect.
+  if [ "$dry" -eq 0 ]; then
+    kar_check || log "WARN: синк Karing не удался (детали: corp-karing-watch)"
+  fi
+
   if ! vpn_up && ! is_corp_wifi; then
     skip_tick "vpn=down"
     return 0
@@ -273,7 +281,11 @@ run_cycle() {
   log "clean dry-run: протухших $removed"
   if [ "$dry" -eq 1 ]; then
     log "dry-run: изменений нет"
-    kar_check
+    if sh "$REPO/karing-watch.sh" --check >> "$LOG" 2>&1; then
+      log "karing(dry): дрейфа нет"
+    else
+      log "karing(dry): дрейф есть — -i не выполняется в dry-run"
+    fi
     return 0
   fi
 
@@ -329,33 +341,18 @@ catchup_due() {
   [ $(( now - last )) -gt $(( CATCHUP_HOURS * 3600 )) ]
 }
 
-# Karing: дрейф -> quit -> -i -> open -> перепроверка.
+# Karing: единая реализация — karing-watch.sh --sync. Он сам сверяет
+# дрейф, берёт общий лок, не трогает Karing, если тот закрыт, и не
+# зависит от VPN. Кулдаун в этом режиме не действует.
 kar_check() {
-  local drift
-  drift=$(sh "$REPO/karing-rules.sh" --check 2>&1 | grep -E 'ОТСУТСТВУЮТ|ДРЕЙФ' || true)
-  if [ -z "$drift" ]; then log "karing: дрейфа нет"; return 0; fi
-  log "karing: дрейф, рестарт для -i"
-  /usr/bin/osascript -e 'tell application "Karing" to quit' >/dev/null 2>&1 || true
-  sleep 6
-  if pgrep -f "Karing.app/Contents/MacOS/Karing" >/dev/null 2>&1; then
-    log "FAIL: Karing не закрылся, -i пропускается"
-    emit sites-sync.fail "Karing не закрылся для синхронизации"
-    return 1
+  local out
+  if out=$(sh "$REPO/karing-watch.sh" --sync 2>&1); then
+    log "karing: синк по corp-networks.conf — ок"
+    return 0
   fi
-  if sh "$REPO/karing-rules.sh" -i >> "$LOG" 2>&1; then
-    log "karing: -i применён"
-  else
-    log "FAIL: karing -i"
-  fi
-  open -a Karing >/dev/null 2>&1 || true
-  sleep 15
-  if sh "$REPO/karing-rules.sh" --check >/dev/null 2>&1; then
-    log "karing: после рестарта чисто"
-  else
-    log "FAIL: дрейф остался после рестарта"
-    emit sites-sync.fail "дрейф Karing остался после рестарта"
-    return 1
-  fi
+  log "FAIL: karing sync: $(printf '%s' "$out" | head -1 | cut -c1-200)"
+  emit sites-sync.fail "синхронизация Karing не удалась"
+  return 1
 }
 
 # Автоудаление артефактов старше KEEP_DAYS (3 последних бэкапа каждого

@@ -57,6 +57,10 @@ KWATCH_LABEL="com.tradesoft.corp-karing-watch"
 KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
 KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
 KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
+# WatchPaths-агент: мгновенный синк Karing после правки корп. конфигов
+# (тот же karing-watch.sh --sync, кулдаун не действует).
+WSYNC_LABEL="com.tradesoft.corp-karing-sync-onchange"
+WSYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$WSYNC_LABEL.plist"
 KRESTART_SCRIPT="/usr/local/sbin/corp-karing-restart.sh"
 WAKEUP_SCRIPT="/Users/aleksei/.wakeup"
 WAKE_LOGDIR="/Users/aleksei/Library/Logs/corp-vpn"
@@ -377,6 +381,16 @@ if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
 fi
 launchctl bootstrap "gui/$NOTIFY_UID" "$KWATCH_PLIST"
 
+echo "==> Установка агента WatchPaths (синк Karing сразу после правки конфигов)..."
+# Не ждём плановых прогонов: правка /usr/local/etc/corp-networks.conf
+# (или -auto) запускает karing-watch.sh --sync. VPN/Wi-Fi не нужны.
+cp "$DIR/com.tradesoft.corp-karing-sync-onchange.plist" "$WSYNC_PLIST"
+chown aleksei:staff "$WSYNC_PLIST"
+if launchctl print "gui/$NOTIFY_UID/$WSYNC_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$WSYNC_PLIST" 2>/dev/null || true
+fi
+launchctl bootstrap "gui/$NOTIFY_UID" "$WSYNC_PLIST"
+
 echo "==> Установка рестартера Karing и wake-хука (~/.wakeup для sleepwatcher)..."
 # karing-restart.sh — user-level рестарт Karing (вызывает ~/.wakeup сразу после
 # сна). ~/.wakeup теперь ставится install.sh, а не руками: раньше копия в
@@ -557,6 +571,13 @@ if [ -x "$KWATCH_SCRIPT" ]; then
   echo "  [OK]   скрипт $KWATCH_SCRIPT"
 else
   echo "  [FAIL] скрипт $KWATCH_SCRIPT отсутствует"
+  fail=1
+fi
+
+if launchctl print "gui/$NOTIFY_UID/$WSYNC_LABEL" >/dev/null 2>&1; then
+  echo "  [OK]   юзер-агент $WSYNC_LABEL загружен"
+else
+  echo "  [FAIL] юзер-агент $WSYNC_LABEL не загружен"
   fail=1
 fi
 

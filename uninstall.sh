@@ -56,6 +56,8 @@ KWATCH_LABEL="com.tradesoft.corp-karing-watch"
 KWATCH_PLIST="/Users/aleksei/Library/LaunchAgents/$KWATCH_LABEL.plist"
 KWATCH_SCRIPT="/usr/local/sbin/corp-karing-watch.sh"
 KWATCH_LOGDIR="/Users/aleksei/Library/Logs/corp-karing-watch"
+WSYNC_LABEL="com.tradesoft.corp-karing-sync-onchange"
+WSYNC_PLIST="/Users/aleksei/Library/LaunchAgents/$WSYNC_LABEL.plist"
 KRESTART_SCRIPT="/usr/local/sbin/corp-karing-restart.sh"
 WAKEUP_SCRIPT="/Users/aleksei/.wakeup"
 SYNC_LABEL="com.tradesoft.corp-sites-sync"
@@ -137,6 +139,12 @@ if launchctl print "gui/$NOTIFY_UID/$KWATCH_LABEL" >/dev/null 2>&1; then
   launchctl bootout "gui/$NOTIFY_UID" "$KWATCH_PLIST" 2>/dev/null || true
 fi
 rm -f "$KWATCH_PLIST" "$KWATCH_SCRIPT"
+
+echo "==> Остановка и удаление WatchPaths-агента синка Karing..."
+if launchctl print "gui/$NOTIFY_UID/$WSYNC_LABEL" >/dev/null 2>&1; then
+  launchctl bootout "gui/$NOTIFY_UID" "$WSYNC_PLIST" 2>/dev/null || true
+fi
+rm -f "$WSYNC_PLIST"
 
 echo "==> Удаление рестартера Karing и wake-хука..."
 rm -f "$KRESTART_SCRIPT"

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tradesoft.corp-karing-sync-onchange</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/usr/local/sbin/corp-karing-watch.sh</string>
+		<string>--sync</string>
+	</array>
+	<!-- Мгновенный синк Karing после правки корп. конфигов (не ждём
+	     планового прогона 08/14/20 и не зависим от VPN). При запущенном
+	     Karing: quit -> -i -> open; если закрыт — просто -i. -->
+	<key>WatchPaths</key>
+	<array>
+		<string>/usr/local/etc/corp-networks.conf</string>
+		<string>/usr/local/etc/corp-networks-auto.conf</string>
+	</array>
+	<!-- Защита от каскада событий при пакетной записи конфига. -->
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<false/>
+</dict>
+</plist>

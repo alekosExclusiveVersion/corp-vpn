@@ -115,12 +115,14 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 ### sites-sync.sh — автоматическая актуализация списков (3 раза в день)
 
 Юзер-агент `com.tradesoft.corp-sites-sync` (08:00/14:00/20:00 + догон
-пропущенного при сне/выключенном Mac): проверка `vpn=up`, полный скан
-`collect-sites.py --from-app` с ретраями до 6 попыток на хост (частичный
-скан = пропуск чистки), `clean-sites.py --apply` (keep = `sites-keep.txt`
-+ `corp-networks-auto.conf`), `karing-rules.sh -i` с авто-рестартом Karing
-при дрейфе. Контекст пользователя обязателен (Fernet-ключ в его Keychain),
-привилегии — через `~/bin/sudo` внутри скрипта.
+пропущенного при сне/выключенном Mac). Порядок цикла: **сначала синк
+Karing** (`karing-watch.sh --sync`, без VPN-гейта), затем проверка
+`vpn=up`/корп. Wi-Fi, полный скан `collect-sites.py --from-app` с ретраями
+до 6 попыток на хост (частичный скан = пропуск чистки), `clean-sites.py
+--apply` (keep = `sites-keep.txt` + `corp-networks-auto.conf`). Если VPN
+лежит или скан пустой — правила Karing всё равно уже приведены к
+`corp-networks.conf`. Контекст пользователя обязателен (Fernet-ключ в его
+Keychain), привилегии — через `~/bin/sudo` внутри скрипта.
 
 ```bash
 ./sites-sync.sh --dry-run    # проверка без изменений
@@ -134,20 +136,31 @@ macOS (без B24+Telegram). Лог-кольцо
 `~/Library/Logs/corp-sites-sync/`, артефакты старше 30 дней удаляются
 (3 последних бэкапа каждого конфига хранятся).
 
-### karing-watch.sh — вотчер дрейфа Karing (каждые 10 мин)
+### karing-watch.sh — вотчер и синк правил Karing (10 мин + WatchPaths)
 
 Юзер-агент `com.tradesoft.corp-karing-watch` (каждые 10 мин + при логине):
 `karing-rules.sh --check` без VPN-гейта, при дрейфе `quit → -i → open`
 с перепроверкой. Кулдаун ресинка — 30 мин (`KWATCH_COOLDOWN`), guard
-незакрывшегося Karing. Закрывает зазор sites-sync на корп. Wi-Fi без VPN
-(там sites-sync не работает — нужен MySQL-скан) и доставляет в `ts-network`
-находки `corp-learn` из `corp-networks-auto.conf` (генератор их тоже
-учитывает — см. `CORP_NETWORKS_AUTO`).
+незакрывшегося Karing, общий лок `/tmp/corp-karing-resync.lock`.
+
+Второй агент `com.tradesoft.corp-karing-sync-onchange` (`WatchPaths` на
+`/usr/local/etc/corp-networks.conf` и `-auto`) вызывает этот же скрипт с
+`--sync`: правка конфига применяется сразу, не дожидаясь 10 минут и не
+зависит от VPN/сети.
+
+Если Karing закрыт (VPN лежит, приложение не запущено) — `-i` применяется
+**без запуска** приложения, чтобы не навязывать прокси; если был запущен —
+перезапускается и возвращается. Закрывает зазор sites-sync на корп. Wi-Fi
+без VPN и доставляет в `ts-network` находки `corp-learn` из
+`corp-networks-auto.conf` (генератор их тоже учитывает — см.
+`CORP_NETWORKS_AUTO`).
 
 ```bash
 ./karing-watch.sh --check      # только сверка, без изменений
+./karing-watch.sh --sync       # синк по дрейфу сейчас, без кулдауна
 ./karing-watch.sh --force      # ресинк безусловно (отладка)
-./karing-watch.sh --selftest   # проверки, 31
+./karing-watch.sh --selftest   # проверки, 35
+```
 ```
 
 События `karing-watch.ok` / `karing-watch.fail` — только баннер macOS

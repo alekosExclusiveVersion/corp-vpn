@@ -48,6 +48,9 @@ LOG=$LOGDIR/wake.log
 WAKE_MARKER=${CORP_WAKE_MARKER:-$LOGDIR/wake}
 KRESTART=${CORP_KARING_RESTART:-/usr/local/sbin/corp-karing-restart.sh}
 [ -x "$KRESTART" ] || KRESTART="$HOME/Work/scripts/corp-vpn/karing-restart.sh"
+# Синк правил ts-network (VPN не нужен, Karing закрыт — без запуска).
+KWATCH=${CORP_KARING_WATCH:-/usr/local/sbin/corp-karing-watch.sh}
+[ -x "$KWATCH" ] || KWATCH="$HOME/Work/scripts/corp-vpn/karing-watch.sh"
 CURL=${CORP_CURL:-/usr/bin/curl}
 DRY=${WAKE_DRY_RUN:-0}
 # Детектор сна: пусто — боевой режим (ioreg + pmset), путь к файлу — оффлайн-
@@ -315,6 +318,22 @@ mark_wake() {
     date +%s > "$WAKE_MARKER" 2>/dev/null || log "WARN: не записал маркер $WAKE_MARKER"
 }
 
+# Правила ts-network после wake: Karing мог сохранить старый снимок
+# конфига, а сеть после сна меняется (корп. Wi-Fi <-> домашний). Синк
+# идёт по дрейфу и VPN не требует.
+karing_rules_sync() {
+    [ -x "$KWATCH" ] || return 0
+    if [ "$DRY" = "1" ]; then
+        log "[dry] $KWATCH --sync"
+        return 0
+    fi
+    if "$KWATCH" --sync >>"$LOG" 2>&1; then
+        log "Karing: правила ts-network сверены с corp-networks.conf"
+    else
+        log "WARN: Karing: синк правил не удался (см. corp-karing-watch)"
+    fi
+}
+
 # Karing: после сна состояние недостоверно, рестартуем безусловно. Если
 # приложение закрыто — не навязываем (--launch-if-stopped всё же включает:
 # именно Karing даёт интернет, а после wake он обычно и был запущен).
@@ -332,6 +351,7 @@ karing_wake() {
     fi
     if "$KRESTART" --force --launch-if-stopped --quiet >>"$LOG" 2>&1; then
         log "Karing: трафик после рестарта есть (t+$(( $(date +%s) - T0 ))s)"
+        karing_rules_sync
         return 0
     fi
     log "Karing: рестарт не дал трафика (t+$(( $(date +%s) - T0 ))s)"
@@ -350,6 +370,7 @@ karing_fallback() {
     fi
     if "$KRESTART" --fallback --quiet >>"$LOG" 2>&1; then
         log "Karing закрыт: интернет напрямую (t+$(( $(date +%s) - T0 ))s)"
+        karing_rules_sync
         return 0
     fi
     log "Karing: fallback не дал трафика (t+$(( $(date +%s) - T0 ))s)"
