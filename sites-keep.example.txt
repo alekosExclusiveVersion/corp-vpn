@@ -21,6 +21,10 @@ drpiese.ro
 www.drpiese.ro
 dosparts.kz
 www.dosparts.kz
+# Проект mos.parts: БД на отдельном сервере mosparts-msk-2 (в скан попадает
+# только после появления его учётных данных в реестре PSA).
+mos.parts
+www.mos.parts
 
 # Локальные алиасы (www-варианты, служебные поддомены) добавляйте ниже:
 # www.example.ru
