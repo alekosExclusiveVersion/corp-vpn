@@ -1,0 +1,26 @@
+# sites-keep.example.txt — шаблон ручных исключений для clean-sites.py.
+#
+# install.sh копирует этот файл в /usr/local/etc/sites-keep.txt, ТОЛЬКО если
+# рабочего файла ещё нет; существующий не перезаписывается. Личные/машинные
+# дополнения вносите в /usr/local/etc/sites-keep.txt (он не в git).
+#
+# sites-sync.sh подмешивает к этому файлу все домены
+# /usr/local/etc/corp-networks-auto.conf. Формат: один домен в строке,
+# строки "#" и пустые игнорируются, MySQL не трогается.
+
+# Базы без записи в csSiteDomain: суффикс DOMAIN_SUFFIX их не покрывает
+# (нужна точка перед суффиксом), поэтому перечислены явно.
+parts-catalogs.com
+parts-catalogs.ru
+parts-index.com
+
+# Клиентские зоны, которых нет в скане csSiteDomain (админки/сайты).
+# imex.parts, www.imex.parts, parts-opt.com и api.parts-catalogs.com уже
+# защищены через SITE_CRITICAL — дублировать не нужно.
+drpiese.ro
+www.drpiese.ro
+dosparts.kz
+www.dosparts.kz
+
+# Локальные алиасы (www-варианты, служебные поддомены) добавляйте ниже:
+# www.example.ru

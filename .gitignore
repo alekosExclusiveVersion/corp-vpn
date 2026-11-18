@@ -8,3 +8,5 @@ logs/
 # Результаты сбора доменов сайтов (collect-sites.py)
 sites.txt
 sites-*.txt
+# шаблон keep-файла — в git, рабочие списки — нет
+!sites-keep.example.txt

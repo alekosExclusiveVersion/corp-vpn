@@ -343,8 +343,17 @@ else
   echo "!! (осталась предыдущая версия, если агент ставился ранее)"
 fi
 if [ ! -f "$SYNC_KEEP" ]; then
-  cp "$DIR/sites-keep.txt" "$SYNC_KEEP"
-  chmod 644 "$SYNC_KEEP"
+  # Шаблон в git — sites-keep.example.txt; sites-keep.txt (рабочий, в .gitignore)
+  # используем как fallback для старых копий репозитория.
+  KEEP_SRC="$DIR/sites-keep.example.txt"
+  [ -f "$KEEP_SRC" ] || KEEP_SRC="$DIR/sites-keep.txt"
+  if [ -f "$KEEP_SRC" ]; then
+    cp "$KEEP_SRC" "$SYNC_KEEP"
+    chmod 644 "$SYNC_KEEP"
+    echo "  keep-файл создан из шаблона: $SYNC_KEEP"
+  else
+    echo "!! шаблон sites-keep.example.txt не найден — keep-файл не создан"
+  fi
 else
   echo "  (keep-файл уже есть, не перезаписываю: $SYNC_KEEP)"
 fi

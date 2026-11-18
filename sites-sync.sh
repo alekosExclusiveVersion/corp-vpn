@@ -58,6 +58,9 @@ KEEP_DAYS=30
 MAX_TRIES=6
 RETRY_SLEEP=8
 CATCHUP_HOURS=5
+# Сколько сканов подряд домен должен отсутствовать, чтобы его удалили
+# (карантин). 1 — старое поведение «удалить сразу».
+GRACE="${SITES_GRACE:-3}"
 SUDO="$HOME/bin/sudo"
 
 VENV_PY=""
@@ -267,18 +270,23 @@ run_cycle() {
     emit sites-sync.skip "скан пустой — чистка пропущена"
     return 0
   fi
+  cp "$union" "$LOGDIR/fresh-$(date +%Y%m%d-%H%M).txt"
   if [ -n "$failhosts" ]; then
-    log "WARN: неоспрошены: $failhosts"
-    emit sites-sync.warn "частичный скан: $failhosts"
+    # Неполный скан: домены неопрошенных хостов выглядели бы протухшими.
+    # Чистку (и счётчики карантина) не трогаем вообще.
+    log "SKIP: чистка пропущена — неоспрошены: $failhosts"
+    emit sites-sync.warn "частичный скан, чистка пропущена: $failhosts"
+    return 0
   fi
 
-  cp "$union" "$LOGDIR/fresh-$(date +%Y%m%d-%H%M).txt"
   build_keep "$MANUAL_KEEP" "$AUTO_CONF" > "$dir/keep.txt"
 
   stale=$("$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
-    --keep-file "$dir/keep.txt" 2>&1)
-  removed=$(printf '%s' "$stale" | grep -c '^  - ' || true)
-  log "clean dry-run: протухших $removed"
+    --keep-file "$dir/keep.txt" --grace "$GRACE" 2>&1)
+  removed=$(printf '%s' "$stale" | sed -n 's/.*удалить \([0-9][0-9]*\),.*/\1/p' | head -1)
+  removed=${removed:-0}
+  log "clean: удалить $removed; $(printf '%s' "$stale" | grep -m1 '  удалить:' | cut -c1-400)"
+  log "clean: $(printf '%s' "$stale" | grep -m1 '  карантин:' | cut -c1-400)"
   if [ "$dry" -eq 1 ]; then
     log "dry-run: изменений нет"
     if sh "$REPO/karing-watch.sh" --check >> "$LOG" 2>&1; then
@@ -291,7 +299,7 @@ run_cycle() {
 
   if [ "$removed" -gt 0 ]; then
     if $SUDO "$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
-        --keep-file "$dir/keep.txt" --apply >> "$LOG" 2>&1; then
+        --keep-file "$dir/keep.txt" --grace "$GRACE" --apply >> "$LOG" 2>&1; then
       log "clean --apply ok, удалено $removed"
       $SUDO launchctl kickstart -k system/com.tradesoft.corp-vpn-routes \
         >/dev/null 2>&1 || log "WARN: kickstart демона"
@@ -301,7 +309,7 @@ run_cycle() {
       return 1
     fi
   else
-    log "clean: протухших нет"
+    log "clean: удалять нечего"
   fi
 
   kar_check || return 1
@@ -444,9 +452,29 @@ selftest() {
   [ "$fail" -eq 0 ]
 }
 
+# Показать протухшие/карантин по последнему сохранённому скану.
+# Сеть и MySQL не нужны; состояние не меняется (dry-run).
+report_stale() {
+  local fresh keep rc
+  fresh=$(ls -t "$LOGDIR"/fresh-*.txt 2>/dev/null | head -1)
+  if [ -z "$fresh" ]; then
+    echo "нет сохранённых сканов в $LOGDIR — запустите ./sites-sync.sh --force"
+    return 1
+  fi
+  keep=$(mktemp "${TMPDIR:-/tmp}/sites-keep.XXXXXX")
+  build_keep "$MANUAL_KEEP" "$AUTO_CONF" > "$keep"
+  echo "скан: $fresh ($(wc -l < "$fresh" | tr -d ' ') доменов), grace=$GRACE"
+  "${VENV_PY:-python3}" "$REPO/clean-sites.py" --fresh "$fresh" \
+    --keep-file "$keep" --grace "$GRACE"
+  rc=$?
+  rm -f "$keep"
+  return $rc
+}
+
 case "${1:-}" in
   --dry-run) mkdir -p "$LOGDIR"; acquire_lock; run_cycle 1 ;;
   --force) mkdir -p "$LOGDIR"; acquire_lock; run_cycle 0 ;;
+  --report) report_stale ;;
   --rollback) do_rollback ;;
   --selftest) selftest ;;
   *)

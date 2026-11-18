@@ -5,15 +5,21 @@
 никак: ни чтение на запись, ни удаление баз — для мёртвых доменов в том числе.
 Источник правды — файл свежего скана `collect-sites.py --from-app --out`.
 
+Протухание с карантином (grace): домен удаляется не после одного промаха,
+а после N подряд сканов, где его нет (по умолчанию 3). Состояние —
+JSON-файл (first_seen/last_seen/miss) рядом с логами, не в git.
+
 Использование:
-  ./clean-sites.py --fresh sites.txt            # dry-run: показать протухшие
-  ./clean-sites.py --fresh sites.txt --apply    # удалить с бэкапом
-  ./clean-sites.py --selftest                    # проверки без сети и MySQL
+  ./clean-sites.py --fresh sites.txt              # отчёт: удалить/карантин
+  ./clean-sites.py --fresh sites.txt --apply      # удалить с бэкапом
+  ./clean-sites.py --fresh sites.txt --grace 1    # старое поведение
+  ./clean-sites.py --selftest                     # проверки без сети и MySQL
 
 Коды возврата: 0 — чисто / применено, 1 — есть протухшие (dry-run)
 или отказ предохранителя, 2 — ошибка чтения/записи.
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -25,6 +31,10 @@ DEFAULT_CONFS = [
     os.path.join(HERE, "corp-networks.conf"),
     "/usr/local/etc/corp-networks.conf",
 ]
+DEFAULT_STATE = os.path.join(
+    os.path.expanduser("~/Library/Application Support/corp-vpn"),
+    "sites-state.json",
+)
 VAR_RE = re.compile(r'^([A-Z_]+)="((?:[^"\\]|\\.)*)"', re.M | re.S)
 
 
@@ -88,6 +98,78 @@ def load_keep(args):
     return keep
 
 
+def load_state(path):
+    """Состояние протухания. Нет файла/битый JSON — начинаем с чистого."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"version": 1, "domains": {}}
+    except (OSError, ValueError):
+        return {"version": 1, "domains": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("domains"), dict):
+        return {"version": 1, "domains": {}}
+    return data
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def ordered_unique(seq):
+    seen, out = set(), []
+    for x in seq:
+        xl = x.lower()
+        if xl not in seen:
+            seen.add(xl)
+            out.append(xl)
+    return out
+
+
+def update_state(state, domains, fresh, protected, suffixes, grace, today):
+    """Обновляет счётчики промахов и возвращает (удалить, карантин).
+
+    Удалить — miss >= grace; карантин — 1 <= miss < grace.
+    Защищённые (keep/SITE_CRITICAL/MYSQL_HOSTS/суффиксы) и живые домены
+    счётчик сбрасывают; www-вариант жив, если жив базовый домен.
+    """
+    entries = state.setdefault("domains", {})
+    for d in domains:
+        e = entries.setdefault(
+            d, {"first_seen": today, "last_seen": today, "miss": 0})
+        if d in fresh:
+            e["miss"] = 0
+            e["last_seen"] = today
+        elif d in protected or any(d.endswith(s.lower()) for s in suffixes):
+            # Ручные/инфраструктурные/суффиксные не «протухают».
+            e["miss"] = 0
+        elif d.startswith("www.") and d[4:] in fresh:
+            e["miss"] = 0
+            e["last_seen"] = today
+        else:
+            e["miss"] = int(e.get("miss", 0)) + 1
+    to_remove, quarantine = [], []
+    for d in domains:
+        miss = int(entries[d].get("miss", 0))
+        if miss <= 0:
+            continue
+        (to_remove if miss >= grace else quarantine).append((d, miss))
+    return to_remove, quarantine
+
+
+def format_list(items, grace, show_miss):
+    if not items:
+        return ""
+    if show_miss:
+        return ", ".join(f"{d} ({m}/{grace})" for d, m in items)
+    return ", ".join(d for d, _ in items)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--fresh", required=False,
@@ -100,6 +182,12 @@ def main(argv=None):
                     help="домены-исключения через запятую")
     ap.add_argument("--keep-file", default=None,
                     help="файл с доменами-исключениями")
+    ap.add_argument("--state", default=os.environ.get(
+        "CORP_SITES_STATE", DEFAULT_STATE),
+        help="JSON состояния протухания (first_seen/last_seen/miss)")
+    ap.add_argument("--grace", type=int, default=3,
+                    help="сколько сканов подряд без домена до удаления "
+                         "(по умолч. 3; 1 — удалять сразу)")
     ap.add_argument("--threshold", type=float, default=0.50,
                     help="макс. доля протухших без --force (по умолч. 0.50)")
     ap.add_argument("--force", action="store_true",
@@ -122,39 +210,68 @@ def main(argv=None):
         return 2
     fresh = load_fresh(args.fresh)
     keep = load_keep(args)
-    rc = 0
+    grace = max(1, int(args.grace))
+    today = time.strftime("%Y-%m-%d")
+
+    # Собираем домены и защиту из всех конфигов: решения о протухании
+    # принимаются один раз, иначе два одина��овых conf дадут двойной
+    # инкремент miss.
+    texts, domains, protected, suffixes = {}, [], set(), set()
     for path in confs:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError as ex:
+            print(f"{path}: не читается ({ex}) — пропуск", file=sys.stderr)
+            continue
         var = parse_vars(text)
         if "SITE_DOMAINS" not in var:
             print(f"{path}: нет SITE_DOMAINS — пропуск", file=sys.stderr)
             continue
-        domains = split_list(var["SITE_DOMAINS"])
-        protected = keep | {d.lower() for d in
-                            split_list(var.get("SITE_CRITICAL", "")) +
-                            split_list(var.get("DOMAINS", "")) +
-                            split_list(var.get("MYSQL_HOSTS", ""))}
-        suffixes = split_list(var.get("DOMAIN_SUFFIX", ""))
-        stale = compute_stale(domains, fresh, protected, suffixes)
-        if not stale:
-            print(f"{path}: чисто ({len(domains)} доменов)")
-            continue
-        print(f"{path}: протухших {len(stale)} из {len(domains)}:")
-        for d in stale:
-            print(f"  - {d}")
-        if over_cap(stale, len(domains), args.threshold) and not args.force:
-            print(f"  ОТКАЗ: доля {len(stale)/len(domains):.0%} > порога "
-                  f"{args.threshold:.0%} — похоже на частичный скан, "
-                  "нужен --force", file=sys.stderr)
-            rc = 1
-            continue
-        if not args.apply:
-            rc = 1
+        texts[path] = text
+        domains += split_list(var["SITE_DOMAINS"])
+        protected |= keep
+        protected |= {d.lower() for d in split_list(var.get("SITE_CRITICAL", ""))}
+        protected |= {d.lower() for d in split_list(var.get("DOMAINS", ""))}
+        protected |= {d.lower() for d in split_list(var.get("MYSQL_HOSTS", ""))}
+        suffixes |= set(split_list(var.get("DOMAIN_SUFFIX", "")))
+    if not texts:
+        return 2
+
+    domains = ordered_unique(domains)
+    state = load_state(args.state)
+    to_remove, quarantine = update_state(
+        state, domains, fresh, protected, suffixes, grace, today)
+
+    total = len(domains)
+    print(f"протухшие: удалить {len(to_remove)}, карантин {len(quarantine)}, "
+          f"всего доменов {total} (grace={grace}, порог {args.threshold:.0%})")
+    print(f"  удалить: {format_list(to_remove, grace, False) or '—'}")
+    print(f"  карантин: {format_list(quarantine, grace, True) or '—'}")
+
+    if over_cap(to_remove, total, args.threshold) and not args.force:
+        print(f"  ОТКАЗ: доля {len(to_remove)/max(total,1):.0%} > порога "
+              f"{args.threshold:.0%} — похоже на частичный скан, "
+              "нужен --force", file=sys.stderr)
+        return 1
+
+    remove_set = {d for d, _ in to_remove}
+    rc = 0
+    if not args.apply:
+        rc = 1 if (to_remove or quarantine) else 0
+        print("dry-run: без --apply изменения не вносятся")
+        return rc
+
+    for path, text in texts.items():
+        conf_domains = set(d.lower() for d in
+                           split_list(parse_vars(text)["SITE_DOMAINS"]))
+        in_conf = remove_set & conf_domains
+        if not in_conf:
+            print(f"{path}: удалять нечего")
             continue
         bak = path + ".bak." + time.strftime("%Y%m%d-%H%M%S")
         shutil.copy(path, bak)
-        new_text, n = remove_from_text(text, set(stale))
+        new_text, n = remove_from_text(text, in_conf)
         if n != 1:
             print(f"{path}: строка SITE_DOMAINS не найдена/не одна "
                   f"(n={n}) — откат", file=sys.stderr)
@@ -163,9 +280,12 @@ def main(argv=None):
             continue
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_text)
-        print(f"  применено, бэкап {bak}")
-    if rc == 1 and not args.apply:
-        print("dry-run: изменений нет, для применения нужен --apply")
+        print(f"{path}: удалено {len(in_conf)} (бэкап {bak})")
+
+    if rc == 0:
+        state["updated"] = today
+        save_state(args.state, state)
+        print(f"состояние: {args.state}")
     return rc
 
 
@@ -207,6 +327,39 @@ def selftest():
        ('SITE_DOMAINS="b.ru a.ru"', 1))
     ck("remove: нет строки",
        remove_from_text('DOMAINS="a.ru"', {"a.ru"})[1] == 0)
+
+    # --- grace-карантин ---------------------------------------------------
+    st = {"version": 1, "domains": {}}
+    rm, q = update_state(st, ["old.ru", "live.ru"], {"live.ru"},
+                         set(), set(), 3, "2026-11-18")
+    ck("grace: первый промах — карантин", rm == [] and q == [("old.ru", 1)])
+    ck("grace: живой не в карантине", all(d != "live.ru" for d, _ in q))
+    rm, q = update_state(st, ["old.ru", "live.ru"], {"live.ru"},
+                         set(), set(), 3, "2026-11-19")
+    ck("grace: второй промах — карантин", q == [("old.ru", 2)] and rm == [])
+    rm, q = update_state(st, ["old.ru", "live.ru"], {"live.ru"},
+                         set(), set(), 3, "2026-11-20")
+    ck("grace: третий промах — удаление", rm == [("old.ru", 3)] and q == [])
+    rm, q = update_state(st, ["old.ru", "live.ru"], {"live.ru", "old.ru"},
+                         set(), set(), 3, "2026-11-21")
+    ck("grace: возврат домена сбрасывает счётчик",
+       rm == [] and q == [] and st["domains"]["old.ru"]["miss"] == 0)
+
+    st2 = {"version": 1, "domains": {}}
+    rm, q = update_state(st2, ["keep.ru", "x.parts.ru"], set(),
+                         {"keep.ru"}, [".parts.ru"], 3, "2026-11-18")
+    ck("grace: защищённые и суффиксные не протухают", rm == [] and q == [])
+
+    st3 = {"version": 1, "domains": {}}
+    rm, q = update_state(st3, ["www.a.ru"], {"a.ru"},
+                         set(), set(), 3, "2026-11-18")
+    ck("grace: www жив при живом базовом", rm == [] and q == [])
+    ck("grace: first_seen ставится",
+       st3["domains"]["www.a.ru"]["first_seen"] == "2026-11-18")
+
+    st4 = {"version": 1, "domains": {}}
+    rm, q = update_state(st4, ["old.ru"], set(), set(), set(), 1, "2026-11-18")
+    ck("grace=1: удаление сразу", rm == [("old.ru", 1)] and q == [])
 
     print(f"selftest: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1

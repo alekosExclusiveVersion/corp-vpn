@@ -95,15 +95,31 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 
 ```bash
 ./collect-sites.py --from-app --out sites-fresh.txt   # сначала полный скан (не --hosts!)
-./clean-sites.py --fresh sites-fresh.txt              # dry-run: показать протухшие
+./clean-sites.py --fresh sites-fresh.txt              # отчёт: удалить / карантин
 ./clean-sites.py --fresh sites-fresh.txt --apply      # удалить с бэкапом .bak.*
+./clean-sites.py --fresh sites-fresh.txt --grace 1    # старое поведение: удалять сразу
 ```
 
 Скан обязан быть полным: частичный (`--hosts`, флап MySQL-маршрутов)
 даст ложные срабатывания. Предохранитель отказывается удалять больше
-30% списка без `--force`. `SITE_CRITICAL`, `DOMAINS`, `MYSQL_HOSTS` и
-покрытые `DOMAIN_SUFFIX` не трогаются; осознанно добавленные алиасы,
-которых нет в `csSiteDomain` (напр. `www.`-варианты), держать в `--keep`:
+**50%** списка без `--force` (`--threshold 0.50`).
+
+Протухание с карантином: домен удаляется не после одного промаха, а после
+**3 сканов подряд**, где его нет (`--grace` / `SITES_GRACE`, по умолчанию 3).
+Состояние (`first_seen`/`last_seen`/`miss`) — в
+`~/Library/Application Support/corp-vpn/sites-state.json` (не в git,
+переопределяется `--state`/`CORP_SITES_STATE`). Отчёт печатает два списка:
+
+```
+протухшие: удалить 0, карантин 1, всего доменов 353 (grace=3, порог 50%)
+  удалить: —
+  карантин: kyariz.com (1/3)
+```
+
+Вернувшийся в скан домен сбрасывает счётчик. `SITE_CRITICAL`, `DOMAINS`,
+`MYSQL_HOSTS` и покрытые `DOMAIN_SUFFIX` не считаются протухшими; жив базовый
+домен — жив и его `www.`-вариант. Осознанные алиасы, которых нет в
+`csSiteDomain` (напр. `www.`-варианты, API-хосты), держать в `--keep`:
 
 ```bash
 ./clean-sites.py --fresh sites-fresh.txt --keep opt-ms.com,www.opt-ms.com --apply
@@ -127,9 +143,17 @@ Keychain), привилегии — через `~/bin/sudo` внутри скр�
 ```bash
 ./sites-sync.sh --dry-run    # проверка без изменений
 ./sites-sync.sh --force      # цикл безусловно
+./sites-sync.sh --report     # протухшие/карантин по последнему скану (без сети)
 ./sites-sync.sh --rollback   # откат конфигов на последний .bak + kickstart
 ./sites-sync.sh --selftest   # проверки, 11
 ```
+
+`--report` не ходит в сеть и ничего не меняет: берёт последний
+`~/Library/Logs/corp-sites-sync/fresh-*.txt` и печатает списки «удалить» и
+«карантин» (домен с числом промахов `n/grace`). Частичный скан (есть
+неопрошенные хосты после ретраев) **полностью пропускает чистку** — иначе
+домены недоступных серверов выглядели бы протухшими; счётчики карантина при
+этом тоже не растут. Срок карантина — `SITES_GRACE` (по умолчанию 3 скана).
 
 Уведомления о фактическом статусе — события `sites-sync.*`, только баннер
 macOS (без B24+Telegram). Лог-кольцо
@@ -225,11 +249,11 @@ open -a Karing                # вернуть приложение
 | `corp-routes-clean.sh` | Демон очистки мёртвых маршрутов (сценарии A/B удаляют, сценарий C — фантомный шлюз из fake-IP — по умолчанию только наблюдает); `--selftest` — 88 проверок на фикстурах, `--check` — один проход только на чтение, `--dry-run` — без root и без удалений |
 | `corp-routes-check.sh` | Детектор битых маршрутов Karing, только чтение: fake-IP в назначении и фантомный шлюз из fake-IP; `--sudo-cmd` печатает готовые команды, не выполняя их |
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
-| `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: dry-run по умолчанию, `--apply` с бэкапом, предохранитель от частичного скана (порог 30%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 13 проверок |
-| `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): VPN-гейт, скан с ретраями, чистка, Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--rollback`; `--selftest` — 11 проверок |
+| `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: отчёт «удалить/карантин» по умолчанию, удаление после 3 промахов подряд (`--grace`/`SITES_GRACE`, состояние в `sites-state.json`), `--apply` с бэкапом, предохранитель от частичного скана (порог 50%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 22 проверки |
+| `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): синк Karing, VPN-гейт, скан с ретраями, чистка с grace-карантином (частичный скан — чистка пропускается), Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--report` — протухшие/карантин без сети; `--rollback`; `--selftest` — 11 проверок |
 | `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 31 проверка |
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
 | `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
 | `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 23 проверки |
-| `sites-keep.txt` | Ручные исключения для чистки (осознанные алиасы вне `csSiteDomain`); устанавливается в `/usr/local/etc/sites-keep.txt` один раз, дальше не перезаписывается |
+| `sites-keep.example.txt` | Шаблон ручных исключений для чистки (осознанные алиасы вне `csSiteDomain`); `install.sh` копирует его в `/usr/local/etc/sites-keep.txt`, только если рабочего файла ещё нет (рабочий — локальный, в `.gitignore`) |
 | `README.md` | Документация |
