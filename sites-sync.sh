@@ -71,6 +71,16 @@ done
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
 
+# Обрезка длинного списка для баннера: полный список — в логе.
+clip() {
+  local s="$1" max="${2:-220}"
+  if [ "${#s}" -gt "$max" ]; then
+    printf '%s…' "$(printf '%s' "$s" | cut -c1-"$max")"
+  else
+    printf '%s' "$s"
+  fi
+}
+
 # Защита от параллельных прогонов (flock нет в macOS по умолчанию).
 LOCKDIR="${SITES_SYNC_LOCKDIR:-/tmp/corp-sites-sync.lock}"
 acquire_lock() {
@@ -285,8 +295,12 @@ run_cycle() {
     --keep-file "$dir/keep.txt" --grace "$GRACE" 2>&1)
   removed=$(printf '%s' "$stale" | sed -n 's/.*удалить \([0-9][0-9]*\),.*/\1/p' | head -1)
   removed=${removed:-0}
-  log "clean: удалить $removed; $(printf '%s' "$stale" | grep -m1 '  удалить:' | cut -c1-400)"
-  log "clean: $(printf '%s' "$stale" | grep -m1 '  карантин:' | cut -c1-400)"
+  remove_names=$(printf '%s' "$stale" | sed -n 's/^  удалить: //p' | head -1)
+  quar_names=$(printf '%s' "$stale" | sed -n 's/^  карантин: //p' | head -1)
+  [ "$remove_names" = "—" ] && remove_names=""
+  [ "$quar_names" = "—" ] && quar_names=""
+  log "clean: удалить $removed; ${remove_names:-нет}"
+  log "clean: карантин; ${quar_names:-нет}"
   if [ "$dry" -eq 1 ]; then
     log "dry-run: изменений нет"
     if sh "$REPO/karing-watch.sh" --check >> "$LOG" 2>&1; then
@@ -317,7 +331,13 @@ run_cycle() {
   prune_artifacts
   trim_log "$LOG" "$LOG_KEEP_LINES"
   log "===== FINISH ok ====="
-  emit sites-sync.ok "удалено доменов: $removed, Karing в норме"
+  if [ "$removed" -gt 0 ]; then
+    emit sites-sync.ok "удалено доменов: $removed — $(clip "$remove_names"); Karing в норме"
+  elif [ -n "$quar_names" ]; then
+    emit sites-sync.ok "удалено 0, в карантине: $(clip "$quar_names"); Karing в норме"
+  else
+    emit sites-sync.ok "удалено доменов: 0, Karing в норме"
+  fi
   return 0
 }
 

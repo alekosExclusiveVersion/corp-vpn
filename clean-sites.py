@@ -281,6 +281,7 @@ def main(argv=None):
         with open(path, "w", encoding="utf-8") as f:
             f.write(new_text)
         print(f"{path}: удалено {len(in_conf)} (бэкап {bak})")
+        print(f"  удалены: {' '.join(sorted(in_conf))}")
 
     if rc == 0:
         state["updated"] = today
