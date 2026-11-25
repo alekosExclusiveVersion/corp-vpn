@@ -35,6 +35,46 @@ MySQL:
 - на корп. Wi-Fi (без L2TP) MySQL выходит через `direct_out` с egress корп.
   сети — сервер видит корп. IP и пропускает авторизацию.
 
+## VPN on demand
+
+Туннель L2TP поднимается по обращению к корп. зоне, а не постоянно:
+
+- для каждой зоны из `DOMAIN_SUFFIX` (плюс `ONDEMAND_ZONES`) `install.sh`
+  пишет `/etc/resolver/<зона>` → `127.0.0.1:5354`;
+- демон `vpn-ondemand.py` (`com.tradesoft.corp-vpn-ondemand`) принимает запрос,
+  ставит маркер спроса `/tmp/corp-vpn-demand` и просит `vpn-watchdog.sh`
+  поднять L2TP; после готовности корп. DNS пересылает запрос на
+  `192.168.0.210`/`.220`. Не дождались за 10 с — быстрый `SERVFAIL`, клиент
+  повторит запрос;
+- имена самих VPN-серверов (`vpn1..4.tradesoft.ru` из профилей) и зоны из
+  `ONDEMAND_BYPASS` резолвятся обычным DNS и туннель не поднимают: macOS
+  резолвит адрес сервера в момент dial через тот же системный резолвер, а корп.
+  DNS без туннеля недоступен (иначе `networksetup` висит в `Connecting`);
+- если туннель поднять не удалось (cooldown после неудачи), публичные имена
+  корп. зон (`www.tradesoft.ru` и т.п.) отдаются обычным DNS, а не `SERVFAIL`;
+- `vpn-watchdog.sh` без свежего маркера (300 с) туннель не поднимает;
+- через `ONDEMAND_IDLE` (600 с) без корп. DNS-запросов, трафика на `ppp0` и
+  установленных соединений в корп. подсети туннель гасится (`scutil --nc stop`);
+- на корп. Wi-Fi и корп. LAN (кабель) туннель не поднимается: корп. DNS там
+  отвечает напрямую (признаки — MAC en0 и ARP-MAC шлюза из
+  `CORP_WIFI_EN0_MACS`/`CORP_WIFI_GATEWAY_MACS`);
+- обращение по IP (RDP, MySQL) DNS-триггера не даёт — нужен ручной
+  `./corp-vpn.sh start` (удержание 30 мин) или `./corp-vpn.sh demand N`;
+- `CORP_ONDEMAND=0` в `corp-networks.conf` возвращает прежнее поведение
+  (watchdog держит VPN постоянно).
+
+Состояние — блок «VPN on demand» в `./corp-vpn.sh status` (слушает ли демон,
+возраст маркера, остаток удержания). Лог — `/tmp/corp-vpn-ondemand.log`.
+
+Ограничения: DoH в браузере идёт мимо системного резолвера (триггера нет);
+сайты `SITE_DOMAINS` с публичным DNS тоже не дают триггера, пока их зоны не
+добавлены в `ONDEMAND_ZONES`; публичные имена внутри корп. зон
+(`www.tradesoft.ru`) при выключенном туннеле сначала пытаются поднять туннель
+и только потом отдаются обычным DNS — если это мешает, добавь их в
+`ONDEMAND_BYPASS`; без демона корп. имена не резолвятся вообще,
+поэтому `install.sh` ставит резолверы только после проверки порта, а
+`uninstall.sh` их убирает.
+
 ## Источник данных
 
 Все сети описаны в `corp-networks.conf` (исходник — в репо `corp-vpn`,
@@ -207,15 +247,16 @@ sh karing-rules.sh --selftest                  # генератор и свер�
 sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 96
 sh corp-wifi-routes.sh --selftest               # маршруты корп. Wi-Fi, 10
 sh karing-restart.sh --selftest                 # рестартер/fallback Karing, 12
-sh reconnect-vpn-wake.sh --selftest             # выбор лечения после сна + guard «Mac спит?», 23
+sh reconnect-vpn-wake.sh --selftest             # выбор лечения после сна + guard «Mac спит?» + спрос, 28
+/usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, 51
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
 ./sites-sync.sh --selftest                     # цикл актуализации, 11
-./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 31
+./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 35
 ```
 
-Все восемь работают без root, без сети и без MySQL. `install.sh` прогоняет их
+Все проверки работают без root, без сети и без MySQL. `install.sh` прогоняет их
 гейтом до установки: провал `corp-vpn-routes.sh` или `corp-routes-clean.sh`
 оставляет прежнюю версию соответствующего демона, провал остальных прерывает
 установку с `exit 1`. Проверки `karing-rules.sh --selftest` подменяют `HOME`,
@@ -257,9 +298,10 @@ open -a Karing                # вернуть приложение
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
 | `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: отчёт «удалить/карантин» по умолчанию, удаление после 3 промахов подряд (`--grace`/`SITES_GRACE`, состояние в `sites-state.json`), `--apply` с бэкапом, предохранитель от частичного скана (порог 50%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 22 проверки |
 | `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): синк Karing, VPN-гейт, скан с ретраями, чистка с grace-карантином (частичный скан — чистка пропускается), Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--report` — протухшие/карантин без сети; `--rollback`; `--selftest` — 11 проверок |
-| `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 31 проверка |
+| `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 35 проверок |
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
 | `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
-| `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 23 проверки |
+| `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, on-demand-гейт (без спроса после сна туннель не поднимается), повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 28 проверок |
+| `vpn-ondemand.py` | Демон VPN on demand (`com.tradesoft.corp-vpn-ondemand`, root): слушает `127.0.0.1:5354` (UDP+TCP, параллельно), на DNS-запрос к корп. зоне ставит маркер спроса и просит watchdog поднять L2TP, пересылает запрос на корп. DNS, при простое `ONDEMAND_IDLE` гасит туннель; на корп. Wi-Fi/LAN туннель не поднимает; имена VPN-серверов и `ONDEMAND_BYPASS` резолвит обычным DNS (иначе dial зависает), публичные имена корп. зон при недоступном туннеле отдаёт обычному DNS; `--once NAME` — разбор одного запроса, `--selftest` — 51 проверка |
 | `sites-keep.example.txt` | Шаблон ручных исключений для чистки (осознанные алиасы вне `csSiteDomain`); `install.sh` копирует его в `/usr/local/etc/sites-keep.txt`, только если рабочего файла ещё нет (рабочий — локальный, в `.gitignore`) |
 | `README.md` | Документация |

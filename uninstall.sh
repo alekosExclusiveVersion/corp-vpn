@@ -30,6 +30,13 @@ WIFI_STATE="/var/run/corp-wifi-routes.state"
 WATCHDOG_LABEL="com.tradesoft.corp-vpn-watchdog"
 WATCHDOG_PLIST="/Library/LaunchDaemons/$WATCHDOG_LABEL.plist"
 WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
+ONDEMAND_LABEL="com.tradesoft.corp-vpn-ondemand"
+ONDEMAND_PLIST="/Library/LaunchDaemons/$ONDEMAND_LABEL.plist"
+ONDEMAND_SCRIPT="/usr/local/sbin/vpn-ondemand.py"
+ONDEMAND_LOG="/var/log/corp-vpn-ondemand.log"
+DEMAND_FILE="/tmp/corp-vpn-demand"
+HOLD_FILE="/tmp/corp-vpn-hold"
+RESOLVER_DIR="/etc/resolver"
 DIAG_LABEL="com.tradesoft.corp-vpn-diag"
 DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
 DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
@@ -98,6 +105,24 @@ if launchctl list | grep -q "$WATCHDOG_LABEL"; then
 fi
 rm -f "$WATCHDOG_PLIST" "$WATCHDOG_SCRIPT"
 rm -f /tmp/corp-vpn-watchdog.lock
+
+echo "==> Остановка и удаление демона VPN on demand и резолверов..."
+if launchctl list | grep -q "$ONDEMAND_LABEL"; then
+  launchctl unload "$ONDEMAND_PLIST"
+fi
+rm -f "$ONDEMAND_PLIST" "$ONDEMAND_SCRIPT"
+rm -f "$ONDEMAND_LOG" "${ONDEMAND_LOG}.stdout.log" "${ONDEMAND_LOG}.stderr.log"
+rm -f /var/log/corp-vpn-ondemand.stdout.log /var/log/corp-vpn-ondemand.stderr.log
+rm -f "$DEMAND_FILE" "$HOLD_FILE"
+# Убираем только свои резолверы (по маркеру в первой строке).
+for f in "$RESOLVER_DIR"/*; do
+  [ -f "$f" ] || continue
+  if grep -q '^# corp-vpn on-demand' "$f" 2>/dev/null; then
+    rm -f "$f"
+  fi
+done
+dscacheutil -flushcache 2>/dev/null || true
+killall -HUP mDNSResponder 2>/dev/null || true
 
 echo "==> Остановка и удаление демона-логгера корп. сети/VPN (corp-vpn-diag)..."
 if launchctl list | grep -q "$DIAG_LABEL"; then
@@ -238,6 +263,28 @@ if [ -e "$WATCHDOG_SCRIPT" ] || [ -e "$WATCHDOG_PLIST" ]; then
   fail=1
 else
   echo "  [OK]   файлы демона vpn-watchdog удалены"
+fi
+
+if launchctl list | grep -q "$ONDEMAND_LABEL"; then
+  echo "  [FAIL] демон $ONDEMAND_LABEL всё ещё загружен"
+  fail=1
+else
+  echo "  [OK]   демон $ONDEMAND_LABEL удалён"
+fi
+
+if [ -e "$ONDEMAND_SCRIPT" ] || [ -e "$ONDEMAND_PLIST" ]; then
+  echo "  [FAIL] файлы демона vpn-ondemand остались на диске"
+  fail=1
+else
+  echo "  [OK]   файлы демона vpn-ondemand удалены"
+fi
+
+res_left=$(grep -l '^# corp-vpn on-demand' "$RESOLVER_DIR"/* 2>/dev/null | wc -l | tr -d ' ')
+if [ "${res_left:-0}" -gt 0 ]; then
+  echo "  [FAIL] в $RESOLVER_DIR остались резолверы on-demand ($res_left)"
+  fail=1
+else
+  echo "  [OK]   резолверы on-demand удалены"
 fi
 
 if launchctl list | grep -q "$DIAG_LABEL"; then

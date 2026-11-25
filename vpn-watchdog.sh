@@ -240,7 +240,7 @@ FAIL_FILE="$STATE_DIR/consec_fail"
 #   1) dial делается БЕЗ блокировки watchdog'а (guard 25s — networksetup
 #      иногда висит до часов, логи ручья 23:18->00:24);
 #   2) одна попытка на тик (round-robin по профилям), не цикл по трём;
-#   3) после неудачного dial'а — общий cooldown-маркер на 600s: и watchdog,
+#   3) после неудачного dial'а — общий cooldown-маркер на 180s: и watchdog,
 #      и wake-хук (~/.wakeup, пользовательский context) его уважают. Макер
 #      общий файл /tmp/corp-vpn-dial-cooldown (mtime), user может создать/править.
 DIAL_COOLDOWN_FILE=/tmp/corp-vpn-dial-cooldown
@@ -438,12 +438,49 @@ if [ -n "$connected" ]; then
     exit 0
 fi
 
+# --- On-demand: без свежего спроса туннель не поднимаем (25.11.2026) ---
+# Корп. имена резолвятся только при поднятом туннеле, поэтому спрос на VPN
+# появляется ровно тогда, когда кто-то обращается к корп. зоне: DNS-запрос
+# перехватывает vpn-ondemand.py и ставит маркер /tmp/corp-vpn-demand.
+# Ручной спрос — `corp-vpn.sh start` (маркер + удержание, см. /tmp/corp-vpn-hold).
+# CORP_ONDEMAND=0 в corp-networks.conf возвращает прежнее поведение
+# (watchdog держит туннель постоянно).
+DEMAND_FILE=/tmp/corp-vpn-demand
+DEMAND_TTL=300
+ONDEMAND=1
+if [ -f "$CONF" ] && grep -qE '^CORP_ONDEMAND=' "$CONF"; then
+    ONDEMAND="$(grep -E '^CORP_ONDEMAND=' "$CONF" | head -1 | cut -d= -f2- | tr -d '"' | tr -d '\n')"
+fi
+
+demand_fresh() {
+    local ts
+    [ -f "$DEMAND_FILE" ] || return 1
+    ts=$(stat -f %m "$DEMAND_FILE" 2>/dev/null) || return 1
+    [ -n "$ts" ] || return 1
+    [ $(( $(date +%s) - ts )) -le "$DEMAND_TTL" ]
+}
+
+# «Нет спроса» пишем в лог не чаще раза в 10 минут: тик каждые 30с.
+NO_DEMAND_LOG=$STATE_DIR/no-demand.logged
+log_no_demand() {
+    local ts
+    ts=$(stat -f %m "$NO_DEMAND_LOG" 2>/dev/null) || ts=0
+    [ $(( $(date +%s) - ts )) -ge 600 ] || return 0
+    logger "corp-vpn: нет спроса на корп. сеть (маркер старше ${DEMAND_TTL}s) — auto-connect пропущен"
+    : > "$NO_DEMAND_LOG" 2>/dev/null || true
+}
+
 # Нет активного профиля — поднимаем по приоритету.
-# Анти-шторм: (а) cooldown после неудачного dial'а — не дёргаем macOS 10 мин
+# Анти-шторм: (а) cooldown после неудачного dial'а — не дёргаем macOS 3 мин
 # (каждая попытка в GUI = модалка); (б) одна попытка за тик, round-robin
 # по $PROFILES (networksetup может висеть минуты — ns_dial с guard 25s).
+if [ "$ONDEMAND" = "1" ] && ! demand_fresh; then
+    log_no_demand
+    exit 0
+fi
+
 if dial_cooldown_fresh; then
-    logger "corp-vpn: dial cooldown (<600s после неудачи) — auto-connect пропущен"
+    logger "corp-vpn: dial cooldown (<${DIAL_COOLDOWN_SECS}s после неудачи) — auto-connect пропущен"
     exit 0
 fi
 

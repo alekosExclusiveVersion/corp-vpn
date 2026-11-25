@@ -190,6 +190,32 @@ sleep_verdict() {
 
 mac_asleep() { [ "$(sleep_verdict "$(pm_dump)" "$(pm_useractive)")" = "asleep" ]; }
 
+# --- On-demand (25.11.2026) ----------------------------------------------
+# После сна L2TP поднимаем только если на VPN есть спрос: свежий маркер
+# /tmp/corp-vpn-demand (DNS-запрос к корп. зоне, его ставит vpn-ondemand.py)
+# или удержание /tmp/corp-vpn-hold (corp-vpn.sh start/demand). Иначе туннель
+# поднимет сам vpn-ondemand при первом обращении к корп. имени.
+# CORP_ONDEMAND=0 в corp-networks.conf — прежнее поведение (поднимать всегда).
+ONDEMAND=1
+if [ -f "$CONF" ] && grep -qE '^CORP_ONDEMAND=' "$CONF"; then
+    ONDEMAND="$(grep -E '^CORP_ONDEMAND=' "$CONF" | head -1 | cut -d= -f2- | tr -d '"' | tr -d '\n')"
+fi
+DEMAND_FILE=${CORP_VPN_DEMAND_FILE:-/tmp/corp-vpn-demand}
+HOLD_FILE=${CORP_VPN_HOLD_FILE:-/tmp/corp-vpn-hold}
+DEMAND_TTL=300
+
+demand_wanted() {
+    local now ts
+    now=$(date +%s)
+    if [ -f "$HOLD_FILE" ]; then
+        ts=$(cat "$HOLD_FILE" 2>/dev/null || echo 0)
+        [ "${ts:-0}" -gt "$now" ] && return 0
+    fi
+    [ -f "$DEMAND_FILE" ] || return 1
+    ts=$(stat -f %m "$DEMAND_FILE" 2>/dev/null) || return 1
+    [ $(( now - ts )) -le "$DEMAND_TTL" ]
+}
+
 selftest() {
     st_pass=0; st_fail=0
     teq() {
@@ -259,6 +285,22 @@ selftest() {
     PM_DUMP="$ST_SAVED_PM"
     PM_WARN_SILENT="$ST_SAVED_QUIET"
     rm -rf "$ST_TMP2"
+
+    # demand_wanted: маркер DNS-спроса и ручное удержание.
+    ST_TMP3=$(mktemp -d)
+    ST_SAVED_DEMAND="$DEMAND_FILE"; ST_SAVED_HOLD="$HOLD_FILE"
+    DEMAND_FILE="$ST_TMP3/demand"; HOLD_FILE="$ST_TMP3/hold"
+    demand_wanted; teq "спрос: маркеров нет -> не нужен" "1" "$?"
+    : > "$DEMAND_FILE"
+    demand_wanted; teq "спрос: свежий маркер -> нужен" "0" "$?"
+    touch -t "$(date -r $(( $(date +%s) - 400 )) '+%Y%m%d%H%M.%S')" "$DEMAND_FILE"
+    demand_wanted; teq "спрос: маркер старше TTL -> не нужен" "1" "$?"
+    printf '%s\n' "$(( $(date +%s) + 600 ))" > "$HOLD_FILE"
+    demand_wanted; teq "спрос: удержание активно -> нужен" "0" "$?"
+    printf '%s\n' "$(( $(date +%s) - 1 ))" > "$HOLD_FILE"
+    demand_wanted; teq "спрос: удержание истекло -> не нужен" "1" "$?"
+    DEMAND_FILE="$ST_SAVED_DEMAND"; HOLD_FILE="$ST_SAVED_HOLD"
+    rm -rf "$ST_TMP3"
 
     printf 'selftest: %s passed, %s failed (rc=%s)\n' "$st_pass" "$st_fail" \
         "$([ "$st_fail" -gt 0 ] && echo 1 || echo 0)"
@@ -562,6 +604,15 @@ if [ "$MODE" = "vpn" ]; then
             break
         fi
     done
+fi
+
+# 4b. On-demand: без спроса после сна туннель не поднимаем. Спрос — свежий
+#     маркер DNS-запроса или удержание (corp-vpn.sh start). Первое обращение
+#     к корп. имени поднимет L2TP через vpn-ondemand, так что простой машины
+#     не должен стоить висящего туннеля.
+if [ "$MODE" = "vpn" ] && [ "$ONDEMAND" = "1" ] && ! demand_wanted; then
+    MODE=idle
+    log "on-demand: спроса нет — L2TP после сна не поднимаю (поднимет DNS-триггер)"
 fi
 
 # 5. Подъём L2TP (только вне корп. сети). «Connected» после сна не доверяем:

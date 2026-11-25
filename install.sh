@@ -28,6 +28,11 @@ WIFI_SCRIPT="/usr/local/sbin/corp-wifi-routes.sh"
 WATCHDOG_LABEL="com.tradesoft.corp-vpn-watchdog"
 WATCHDOG_PLIST="/Library/LaunchDaemons/$WATCHDOG_LABEL.plist"
 WATCHDOG_SCRIPT="/usr/local/sbin/vpn-watchdog.sh"
+ONDEMAND_LABEL="com.tradesoft.corp-vpn-ondemand"
+ONDEMAND_PLIST="/Library/LaunchDaemons/$ONDEMAND_LABEL.plist"
+ONDEMAND_SCRIPT="/usr/local/sbin/vpn-ondemand.py"
+ONDEMAND_PORT=5354
+RESOLVER_DIR="/etc/resolver"
 DIAG_LABEL="com.tradesoft.corp-vpn-diag"
 DIAG_PLIST="/Library/LaunchDaemons/$DIAG_LABEL.plist"
 DIAG_SCRIPT="/usr/local/sbin/corp-vpn-diagd.sh"
@@ -202,6 +207,20 @@ else
 fi
 echo
 
+echo "==> Самопроверка демона VPN on demand (без сети и без root)..."
+# vpn-ondemand.py решает, поднимать ли L2TP, и пересылает DNS корп. зон.
+# Ошибка в разборе зон/MAC-эталонов = ложные подъёмы VPN (в т.ч. на корп.
+# Wi-Fi) или мёртвый DNS для корп. имён. Selftest — на чистых функциях.
+if /usr/bin/python3 "$DIR/vpn-ondemand.py" --selftest; then
+  ONDEMAND_SELFTEST_OK=1
+else
+  ONDEMAND_SELFTEST_OK=0
+  fail=1
+  echo "!! ПРОВАЛ самопроверки vpn-ondemand.py — демон и резолверы"
+  echo "!! on-demand не устанавливаются."
+fi
+echo
+
 echo "==> Самопроверка демона wifi-маршрутов (без root и без сети)..."
 # Проверяются чистые функции пробуждения: после сна демон должен обновить кэш
 # corp-IP и снять utun-пины Karing сразу, а не через 5 минут.
@@ -273,6 +292,86 @@ if launchctl list | grep -q "$WATCHDOG_LABEL"; then
   launchctl unload "$WATCHDOG_PLIST" 2>/dev/null || true
 fi
 launchctl load -w "$WATCHDOG_PLIST"
+
+# Резолверы /etc/resolver: корп. зоны уходят на локальный демон on-demand.
+# Чужие файлы не трогаем — удаляем только помеченные нашим комментарием.
+install_ondemand_resolvers() {
+    local zones z f
+    mkdir -p "$RESOLVER_DIR" || return 1
+    for f in "$RESOLVER_DIR"/*; do
+        [ -f "$f" ] || continue
+        if grep -q '^# corp-vpn on-demand' "$f" 2>/dev/null; then
+            rm -f "$f"
+        fi
+    done
+    zones=$(/usr/bin/python3 - "$NETWORKS_CONF" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+zones = []
+for var in ("DOMAIN_SUFFIX", "ONDEMAND_ZONES"):
+    m = re.search(r'^%s="((?:[^"\\]|\\.)*)"' % var, text, re.M | re.S)
+    if not m:
+        continue
+    for raw in m.group(1).split():
+        z = raw.strip().lower().lstrip(".")
+        if z and z not in zones:
+            zones.append(z)
+print("\n".join(zones))
+PY
+)
+    if [ -z "$zones" ]; then
+        echo "  [FAIL] в $NETWORKS_CONF нет зон для $RESOLVER_DIR"
+        return 1
+    fi
+    for z in $zones; do
+        cat > "$RESOLVER_DIR/$z" <<EOF
+# corp-vpn on-demand: корп. зона -> локальный демон (поднимает L2TP по спросу)
+nameserver 127.0.0.1
+port $ONDEMAND_PORT
+EOF
+        chmod 644 "$RESOLVER_DIR/$z"
+    done
+    echo "  [OK] резолверы on-demand: $(printf '%s\n' $zones | wc -l | tr -d ' ') зон"
+    return 0
+}
+
+echo "==> Установка демона VPN on demand (DNS-триггер по корп. зонам)..."
+# Демон слушает 127.0.0.1:5354 и поднимает L2TP, когда приходит DNS-запрос к
+# корп. зоне. Резолверы ставим ТОЛЬКО после того, как порт реально слушается:
+# иначе корп. имена останутся без DNS вообще.
+if [ "${ONDEMAND_SELFTEST_OK:-0}" -eq 1 ]; then
+  cp "$DIR/vpn-ondemand.py" "$ONDEMAND_SCRIPT"
+  chmod 755 "$ONDEMAND_SCRIPT"
+else
+  echo "!! ПРОВАЛ самопроверки — $ONDEMAND_SCRIPT НЕ обновлён."
+fi
+cp "$DIR/com.tradesoft.corp-vpn-ondemand.plist" "$ONDEMAND_PLIST"
+if launchctl list | grep -q "$ONDEMAND_LABEL"; then
+  launchctl unload "$ONDEMAND_PLIST" 2>/dev/null || true
+fi
+launchctl load -w "$ONDEMAND_PLIST"
+ONDEMAND_UP=0
+for i in $(seq 1 10); do
+  if nc -z 127.0.0.1 "$ONDEMAND_PORT" >/dev/null 2>&1; then
+    ONDEMAND_UP=1
+    break
+  fi
+  sleep 1
+done
+if [ "$ONDEMAND_UP" -eq 1 ]; then
+  if install_ondemand_resolvers; then
+    dscacheutil -flushcache 2>/dev/null || true
+    killall -HUP mDNSResponder 2>/dev/null || true
+  else
+    fail=1
+  fi
+else
+  echo "!! демон on-demand не слушает 127.0.0.1:$ONDEMAND_PORT — $RESOLVER_DIR НЕ меняю"
+  echo "!! (корп. имена продолжат работать как раньше, через DNS VPN)"
+  fail=1
+fi
 
 echo "==> Установка демона-логгера корп. сети/VPN (пилот MAC-детекта)..."
 cp "$DIR/corp-vpn-diagd.sh" "$DIAG_SCRIPT"
@@ -495,6 +594,28 @@ else
   fail=1
 fi
 
+if launchctl list | grep -q "$ONDEMAND_LABEL"; then
+  echo "  [OK]   демон $ONDEMAND_LABEL загружен"
+else
+  echo "  [FAIL] демон $ONDEMAND_LABEL не загружен"
+  fail=1
+fi
+
+if [ -x "$ONDEMAND_SCRIPT" ]; then
+  echo "  [OK]   скрипт $ONDEMAND_SCRIPT"
+else
+  echo "  [FAIL] скрипт $ONDEMAND_SCRIPT отсутствует"
+  fail=1
+fi
+
+res_count=$(grep -l '^# corp-vpn on-demand' "$RESOLVER_DIR"/* 2>/dev/null | wc -l | tr -d ' ')
+if [ "${res_count:-0}" -gt 0 ]; then
+  echo "  [OK]   резолверы on-demand: $res_count зон в $RESOLVER_DIR"
+else
+  echo "  [FAIL] в $RESOLVER_DIR нет резолверов on-demand"
+  fail=1
+fi
+
 if launchctl list | grep -q "$DIAG_LABEL"; then
   echo "  [OK]   демон $DIAG_LABEL загружен"
 else
@@ -645,6 +766,9 @@ if [ "$fail" -eq 0 ]; then
   echo "из /usr/local/etc/corp-networks.conf добавятся автоматически."
   echo "При корп. Wi-Fi маршруты добавляются автоматически (corp-wifi-routes)."
   echo "Автоподъём VPN при обрыве — vpn-watchdog (каждые 30с)."
+  echo "VPN on demand — vpn-ondemand (DNS корп. зон поднимает туннель, простой 10 мин гасит)."
+  echo "Ручной спрос для доступа по IP — corp-vpn.sh start (удержание 30 мин)."
+
   echo "Логгер сети/VPN — corp-vpn-diag (каждые 10с, /var/log/corp-vpn-diag.log)."
   echo "Очистка мёртвых маршрутов — corp-routes-clean (каждые 15с, /var/log/corp-routes-clean.log)."
   echo "Очистка БД aisql по заявкам Б24 — corp-db-clean (только Windows; на macOS пропущен)."
