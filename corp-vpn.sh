@@ -159,8 +159,11 @@ ppp_connected() {
 stop() {
     local names n
     names=$(ppp_connected)
-    [ -n "$names" ] || names="$VPN_NAME"
     rm -f "$DEMAND_FILE" "$HOLD_FILE" 2>/dev/null
+    if [ -z "$names" ]; then
+        echo "Туннель не подключён (маркеры спроса и удержания сняты)."
+        return 0
+    fi
     for n in $names; do
         echo "Отключаю $n..."
         scutil --nc stop "$n" 2>/dev/null

@@ -40,7 +40,8 @@ MySQL:
 Туннель L2TP поднимается по обращению к корп. зоне, а не постоянно:
 
 - для каждой зоны из `DOMAIN_SUFFIX` (плюс `ONDEMAND_ZONES`) `install.sh`
-  пишет `/etc/resolver/<зона>` → `127.0.0.1:5354`;
+  пишет `/etc/resolver/<зона>` → `127.0.0.1:5354` (зоны берёт из самого
+  демона: `vpn-ondemand.py --zones` — один парсер с рантаймом);
 - демон `vpn-ondemand.py` (`com.tradesoft.corp-vpn-ondemand`) принимает запрос,
   ставит маркер спроса `/tmp/corp-vpn-demand` и просит `vpn-watchdog.sh`
   поднять L2TP; после готовности корп. DNS пересылает запрос на
@@ -248,7 +249,7 @@ sh corp-routes-clean.sh --selftest              # очистка мёртвых 
 sh corp-wifi-routes.sh --selftest               # маршруты корп. Wi-Fi, 10
 sh karing-restart.sh --selftest                 # рестартер/fallback Karing, 12
 sh reconnect-vpn-wake.sh --selftest             # выбор лечения после сна + guard «Mac спит?» + спрос, 28
-/usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, 51
+/usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, кэши, 64
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
@@ -302,6 +303,6 @@ open -a Karing                # вернуть приложение
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
 | `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
 | `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, on-demand-гейт (без спроса после сна туннель не поднимается), повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 28 проверок |
-| `vpn-ondemand.py` | Демон VPN on demand (`com.tradesoft.corp-vpn-ondemand`, root): слушает `127.0.0.1:5354` (UDP+TCP, параллельно), на DNS-запрос к корп. зоне ставит маркер спроса и просит watchdog поднять L2TP, пересылает запрос на корп. DNS, при простое `ONDEMAND_IDLE` гасит туннель; на корп. Wi-Fi/LAN туннель не поднимает; имена VPN-серверов и `ONDEMAND_BYPASS` резолвит обычным DNS (иначе dial зависает), публичные имена корп. зон при недоступном туннеле отдаёт обычному DNS; `--once NAME` — разбор одного запроса, `--selftest` — 51 проверка |
+| `vpn-ondemand.py` | Демон VPN on demand (`com.tradesoft.corp-vpn-ondemand`, root): слушает `127.0.0.1:5354` (UDP+TCP, параллельно), на DNS-запрос к корп. зоне ставит маркер спроса и просит watchdog поднять L2TP, пересылает запрос на корп. DNS, при простое `ONDEMAND_IDLE` гасит туннель; на корп. Wi-Fi/LAN туннель не поднимает; имена VPN-серверов и `ONDEMAND_BYPASS` резолвит обычным DNS (иначе dial зависает), публичные имена корп. зон при недоступном туннеле отдаёт обычному DNS; `--once NAME` — разбор одного запроса, `--zones` — зоны-триггеры из конфига (использует `install.sh`), `--selftest` — 64 проверки |
 | `sites-keep.example.txt` | Шаблон ручных исключений для чистки (осознанные алиасы вне `csSiteDomain`); `install.sh` копирует его в `/usr/local/etc/sites-keep.txt`, только если рабочего файла ещё нет (рабочий — локальный, в `.gitignore`) |
 | `README.md` | Документация |

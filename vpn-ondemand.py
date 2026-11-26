@@ -64,6 +64,11 @@ PROBE_TTL = 20.0
 DNS_TIMEOUT = 2.0
 PUBLIC_DNS_TTL = 60.0     # кэш «обычных» DNS-серверов (scutil --dns)
 BYPASS_TTL = 300.0        # кэш имён VPN-серверов из профилей
+# Кэши горячего пути: на каждый DNS-запрос нельзя дёргать ifconfig/ipconfig
+# (это ~10 процессов на запрос). Короткий TTL: состояние сети меняется
+# медленнее, а «свежесть» там, где она важна, берётся через force=True.
+VPN_UP_TTL = 2.0
+CORP_LAN_TTL = 20.0
 
 # Фолбэк, если конфиг недоступен: корп. зоны из corp-networks.conf.
 FALLBACK_ZONES = [
@@ -137,18 +142,29 @@ def parse_dns_from_text(text):
     return [x for x in m.group(1).split() if x]
 
 
-def load_config():
-    zones, servers = [], []
+def read_conf_text():
+    """Текст corp-networks.conf ("" если файла нет)."""
     try:
         with open(CONF, encoding="utf-8") as f:
-            text = f.read()
-        for z in (parse_zones_from_text(text)
-                  + parse_zones_from_text(text, "ONDEMAND_ZONES")):
-            if z not in zones:
-                zones.append(z)
-        servers = parse_dns_from_text(text)
+            return f.read()
     except OSError:
-        pass
+        return ""
+
+
+def conf_zones(text):
+    """Зоны-триггеры из конфига: DOMAIN_SUFFIX + ONDEMAND_ZONES (чистая)."""
+    zones = []
+    for z in (parse_zones_from_text(text)
+              + parse_zones_from_text(text, "ONDEMAND_ZONES")):
+        if z not in zones:
+            zones.append(z)
+    return zones
+
+
+def load_config():
+    text = read_conf_text()
+    zones = conf_zones(text)
+    servers = parse_dns_from_text(text)
     return (zones or FALLBACK_ZONES), (servers or FALLBACK_DNS)
 
 
@@ -433,16 +449,23 @@ def log_throttled(key, msg, secs=60):
 
 
 # ------------------------------------------------------------ сеть/туннель ---
-def vpn_up():
+def vpn_up(force=False):
+    """Поднят ли ppp0. Кэш VPN_UP_TTL; force=True — перепроверить сейчас."""
+    now = time.time()
+    if not force:
+        cached = _state.get("vpn_up")
+        if cached and now < cached[1]:
+            return cached[0]
     try:
         out = subprocess.run(["/sbin/ifconfig", CORP_IF], capture_output=True,
                              text=True, timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
     up = "inet " in out
+    _state["vpn_up"] = (up, now + VPN_UP_TTL)
     # Момент подъёма нужен, чтобы не дёргать маршрутный демон, пока он
     # штатно пересобирает маршруты (см. maybe_kick_routes).
-    _state["vpn_up_since"] = _state.get("vpn_up_since") or (time.time() if up else 0.0)
+    _state["vpn_up_since"] = _state.get("vpn_up_since") or (now if up else 0.0)
     if not up:
         _state["vpn_up_since"] = 0.0
     return up
@@ -501,8 +524,18 @@ def corp_wifi_now():
     return res
 
 
-def corp_lan():
-    """Проводной корп. LAN: IP 192.168.128.x на не-Wi-Fi интерфейсе."""
+def corp_lan(force=False):
+    """Проводной корп. LAN: IP 192.168.128.x на не-Wi-Fi интерфейсе.
+
+    Кэш CORP_LAN_TTL: проверка обходит все интерфейсы (ifconfig -lu + ipconfig
+    на каждый), а спрашивают её на каждый DNS-запрос.
+    """
+    now = time.time()
+    if not force:
+        cached = _state.get("corp_lan")
+        if cached and now < cached[1]:
+            return cached[0]
+    res = False
     for iface in _run(["/sbin/ifconfig", "-lu"]).split():
         if iface == "en0" or iface.startswith(
                 ("lo", "utun", "gif", "stf", "anpi", "awdl", "llw", "ppp",
@@ -510,8 +543,10 @@ def corp_lan():
             continue
         if _run(["/usr/sbin/ipconfig", "getifaddr", iface]).strip().startswith(
                 CORP_LAN_PREFIX):
-            return True
-    return False
+            res = True
+            break
+    _state["corp_lan"] = (res, now + CORP_LAN_TTL)
+    return res
 
 
 def direct_corp(servers):
@@ -533,18 +568,26 @@ def corp_direct_net(servers):
     return corp_wifi_now() or corp_lan() or direct_corp(servers)
 
 
+def parse_connected_profiles(list_text):
+    """Имена подключённых PPP-профилей из `scutil --nc list` (чистая функция)."""
+    names = []
+    for line in (list_text or "").splitlines():
+        if "(Connected)" not in line or "PPP" not in line:
+            continue
+        m = re.search(r'"([^"]+)"', line)
+        if m and m.group(1) not in names:
+            names.append(m.group(1))
+    return names
+
+
+def connected_profiles():
+    return parse_connected_profiles(
+        _run(["/usr/sbin/scutil", "--nc", "list"]))
+
+
 def connected_profile():
-    try:
-        out = subprocess.run(["/usr/sbin/scutil", "--nc", "list"],
-                             capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    for line in out.splitlines():
-        if "(Connected)" in line and "PPP" in line:
-            m = re.search(r'"([^"]+)"', line)
-            if m:
-                return m.group(1)
-    return ""
+    names = connected_profiles()
+    return names[0] if names else ""
 
 
 def dial_async(servers=None):
@@ -569,7 +612,7 @@ def dial_async(servers=None):
         deadline = time.time() + 60
         try:
             while time.time() < deadline:
-                if vpn_up():
+                if vpn_up(force=True):
                     break
                 if os.path.exists(WATCHDOG):
                     # Watchdog держит собственный lock: если его тик уже идёт,
@@ -579,7 +622,7 @@ def dial_async(servers=None):
                     subprocess.run(["/usr/sbin/networksetup",
                                     "-connectpppoeservice", "vpn2-ts"],
                                    timeout=40)
-                if vpn_up():
+                if vpn_up(force=True):
                     break
                 time.sleep(3)
         except (OSError, subprocess.SubprocessError) as ex:
@@ -610,7 +653,7 @@ def wait_ready(servers, timeout=WAIT_READY):
             direct = corp_direct_net(servers)
         if direct:
             return "ready"
-        up = vpn_up()
+        up = vpn_up(force=True)
         if up and dns_probe(servers, timeout=0.6):
             return "ready"
         if up and not extended:
@@ -725,14 +768,18 @@ def ppp_active(prev, cur, min_bytes=PPP_TRAFFIC_MIN):
 
 
 def stop_vpn(reason):
-    name = connected_profile()
-    if not name:
+    """Погасить туннель. Профилей может быть несколько (переключения
+    vpn1..vpn4): гасим все подключённые, иначе «stop» оставляет живой чужой."""
+    names = connected_profiles()
+    if not names:
         return False
-    log("idle: %s — отключаю %s" % (reason, name))
-    try:
-        subprocess.run(["/usr/sbin/scutil", "--nc", "stop", name], timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        pass
+    log("idle: %s — отключаю %s" % (reason, ", ".join(names)))
+    for name in names:
+        try:
+            subprocess.run(["/usr/sbin/scutil", "--nc", "stop", name],
+                           timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
     try:
         os.remove(DEMAND_FILE)
     except OSError:
@@ -910,9 +957,18 @@ def main():
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--once", metavar="NAME",
                     help="обработать один запрос и напечатать реакцию (отладка)")
+    ap.add_argument("--zones", action="store_true",
+                    help="напечатать зоны-триггеры из конфига (для install.sh)")
     args = ap.parse_args()
     if args.selftest:
         return selftest()
+    if args.zones:
+        # Только то, что реально в конфиге: фолбэк здесь не нужен, иначе
+        # установщик поставил бы резолверы для зон, которых в конфиге нет.
+        zones = conf_zones(read_conf_text())
+        if zones:
+            print("\n".join(zones))
+        return 0 if zones else 1
 
     trim_log()
     try:
@@ -1035,6 +1091,22 @@ resolver #4
        is_bypass("a.vpn4.tradesoft.ru", ["vpn4.tradesoft.ru"]))
     ck("bypass: чужое имя",
        not is_bypass("www.tradesoft.ru", ["vpn4.tradesoft.ru"]))
+    ck("zones: conf_zones объединяет",
+       conf_zones('DOMAIN_SUFFIX=".a.ru"\nONDEMAND_ZONES="b.com a.ru"')
+       == ["a.ru", "b.com"])
+    ck("zones: conf_zones без повторов",
+       conf_zones('DOMAIN_SUFFIX=".a.ru .a.ru"') == ["a.ru"])
+
+    nc_list2 = ('* (Connected) 1 PPP --> L2TP "vpn2-ts" [PPP:L2TP]\n'
+                '* (Connected) 2 PPP --> L2TP "vpn4-ts" [PPP:L2TP]\n'
+                '* (Disconnected) 3 PPP --> L2TP "vpn1-ts" [PPP:L2TP]\n'
+                '* (Connected) 4 VPN --> IKEv2 "Karing" [VPN:IKEv2]\n')
+    ck("profiles: все подключённые PPP",
+       parse_connected_profiles(nc_list2) == ["vpn2-ts", "vpn4-ts"])
+    ck("profiles: пустой вывод", parse_connected_profiles("") == [])
+    ck("profiles: без дублей",
+       parse_connected_profiles(nc_list2 + nc_list2) == ["vpn2-ts", "vpn4-ts"])
+
     ck("cooldown: свежий", cooldown_fresh(1000, 1100, 180))
     ck("cooldown: истёк", not cooldown_fresh(1000, 1200, 180))
     ck("cooldown: нет файла", not cooldown_fresh(None, 1200, 180))
@@ -1061,6 +1133,46 @@ resolver #4
     ck("servfail: question сохранён", sf[12:] == q[12:])
     rf = build_error(q, 5)
     ck("refused: rcode 5", (struct.unpack(">H", rf[2:4])[0] & 0xF) == 5)
+
+    # --- кэши горячего пути: на каждый DNS-запрос не должно быть процессов ---
+    real_run = subprocess.run
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if list(cmd)[:2] == ["/sbin/ifconfig", "-lu"]:
+            return subprocess.CompletedProcess(cmd, 0, "en4\n", "")
+        if list(cmd)[:2] == ["/usr/sbin/ipconfig", "getifaddr"]:
+            return subprocess.CompletedProcess(cmd, 0, "192.168.128.50\n", "")
+        if list(cmd)[:2] == ["/sbin/ifconfig", "ppp0"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, "\tinet 10.0.0.1 --> 10.0.0.2 netmask 0xffffff00\n", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "")
+
+    try:
+        subprocess.run = fake_run
+        for k in ("vpn_up", "corp_lan", "vpn_up_since"):
+            _state.pop(k, None)
+        ck("vpn_up: поднят", vpn_up() is True)
+        n = len(calls)
+        ck("vpn_up: повторно из кэша", vpn_up() is True and len(calls) == n)
+        ck("vpn_up: force спрашивает снова",
+           vpn_up(force=True) is True and len(calls) == n + 1)
+        _state.pop("corp_lan", None)
+        ck("corp_lan: находит 192.168.128.x", corp_lan() is True)
+        n = len(calls)
+        ck("corp_lan: повторно из кэша", corp_lan() is True and len(calls) == n)
+        ck("corp_lan: force спрашивает снова",
+           corp_lan(force=True) is True and len(calls) == n + 2)
+        # Туннель пропал: vpn_up не должен врать дольше VPN_UP_TTL.
+        _state["vpn_up"] = (True, 0.0)
+        ck("vpn_up: истёкший кэш перепроверяется", vpn_up() is True)
+        _state["corp_lan"] = (False, 0.0)
+        ck("corp_lan: истёкший кэш перепроверяется", corp_lan() is True)
+    finally:
+        subprocess.run = real_run
+        for k in ("vpn_up", "corp_lan", "vpn_up_since"):
+            _state.pop(k, None)
 
     now = 1_000_000
     ck("idle: свежая активность — не гасим",

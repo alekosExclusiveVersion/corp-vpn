@@ -304,23 +304,9 @@ install_ondemand_resolvers() {
             rm -f "$f"
         fi
     done
-    zones=$(/usr/bin/python3 - "$NETWORKS_CONF" <<'PY'
-import re
-import sys
-
-text = open(sys.argv[1], encoding="utf-8").read()
-zones = []
-for var in ("DOMAIN_SUFFIX", "ONDEMAND_ZONES"):
-    m = re.search(r'^%s="((?:[^"\\]|\\.)*)"' % var, text, re.M | re.S)
-    if not m:
-        continue
-    for raw in m.group(1).split():
-        z = raw.strip().lower().lstrip(".")
-        if z and z not in zones:
-            zones.append(z)
-print("\n".join(zones))
-PY
-)
+    # Зоны парсит сам демон (--zones): один источник правды с рантаймом.
+    zones=$(CORP_NETWORKS_CONF="$NETWORKS_CONF" /usr/bin/python3 \
+        "$DIR/vpn-ondemand.py" --zones 2>/dev/null)
     if [ -z "$zones" ]; then
         echo "  [FAIL] в $NETWORKS_CONF нет зон для $RESOLVER_DIR"
         return 1
