@@ -232,6 +232,18 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 LAST_IP_FILE="$STATE_DIR/last_en0_ip"
 FAIL_FILE="$STATE_DIR/consec_fail"
 
+# Одинаковые «пропускаем»-записи пишем не чаще раза в 10 минут: тик каждые
+# 30 с иначе забивает лог (26.11.2026: на корп. Wi-Fi 120 строк в час).
+log_state() {
+    local key f ts
+    key="$1"; shift
+    f="$STATE_DIR/$key.logged"
+    ts=$(stat -f %m "$f" 2>/dev/null); ts=${ts:-0}
+    [ $(( $(date +%s) - ts )) -ge 600 ] || return 0
+    logger "$*"
+    : > "$f" 2>/dev/null || true
+}
+
 # --- Диал-шторм/модалки (23.10.2026, ночь: цепочка vpn3->vpn4->vpn2) ---
 # Каждая сетап-попытка networksetup -connectpppoeservice идёт через
 # NESMLegacySession в Aqua-сессии пользователя, и при неудаче macOS
@@ -365,7 +377,7 @@ if is_corp_wifi; then
             logger "corp-vpn: $p torn down on corp Wi-Fi (L2TP blocked there)"
         fi
     done
-    logger "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped"
+    log_state corp-wifi "corp-vpn: on corp Wi-Fi — VPN auto-connect skipped"
     exit 0
 fi
 
@@ -376,7 +388,7 @@ if is_corp_lan; then
             logger "corp-vpn: $p torn down on corp LAN (wired, resources accessible directly)"
         fi
     done
-    logger "corp-vpn: on corp LAN (wired) — VPN auto-connect skipped"
+    log_state corp-lan "corp-vpn: on corp LAN (wired) — VPN auto-connect skipped"
     exit 0
 fi
 

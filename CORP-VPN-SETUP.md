@@ -966,6 +966,15 @@ security add-generic-password -a koshkin -s collect-sites -w
 `en0` из `CORP_WIFI_EN0_MACS`, ARP-MAC шлюза из `CORP_WIFI_GATEWAY_MACS`) плюс
 прямая DNS-проба, и в этом режиме dial не запускает.
 
+**Корп. сеть напрямую (проверено на корп. Wi-Fi 26.11.2026):** `corp-vpn.sh
+start|demand` определяют корп. сеть по IP `192.168.128.x` на любом интерфейсе
+(включая `en0`) и отвечают «VPN не нужен», не создавая маркер спроса. В
+watchdog'е и демоне корп. Wi-Fi дополнительно определяется по MAC-эталонам
+(`ifconfig en0` под root показывает настоящий MAC; не-root видит
+`02:00:00:00:00:00` — маскировка macOS). Записи «пропускаем на корп. Wi-Fi/LAN»
+пишутся в лог не чаще раза в 10 минут (маркеры
+`/tmp/corp-vpn-watchdog-state/corp-wifi.logged`, `corp-lan.logged`).
+
 **Ручной спрос:** `corp-vpn.sh start` (удержание 30 мин) и
 `corp-vpn.sh demand N` — для обращений по IP (RDP, MySQL), где DNS-триггера
 нет. Удержание — `/tmp/corp-vpn-hold` (эпоха), демон его уважает. `stop` снимает

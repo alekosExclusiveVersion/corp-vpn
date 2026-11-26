@@ -33,6 +33,24 @@ bridge_up() {
     nc -z 127.0.0.1 "$BRIDGE_PORT" >/dev/null 2>&1
 }
 
+# Корп. сеть доступна напрямую (корп. Wi-Fi или проводной корп. LAN):
+# IP 192.168.128.x на любом интерфейсе, включая en0. В этом режиме VPN не
+# нужен, а на корп. Wi-Fi L2TP вообще не поднимается (сеть глушит L2TP-в-ESP).
+corp_direct_net() {
+    local iface ip
+    for iface in $(ifconfig -lu 2>/dev/null); do
+        case "$iface" in
+            lo|utun*|gif*|stf*|anpi*|awdl*|llw*|ppp*|vnic*|ap*|bridge*) continue ;;
+        esac
+        ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
+        [ -n "$ip" ] || continue
+        case "$ip" in
+            192.168.128.*) printf '%s: %s' "$iface" "$ip"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
 status() {
     echo "== Корп. туннель =="
     if corp_up; then
@@ -95,23 +113,17 @@ mark_demand() {
 }
 
 start() {
+    local found
+    if found=$(corp_direct_net); then
+        echo "Обнаружено подключение к корп. сети ($found)."
+        echo "VPN не требуется — корп. ресурсы доступны напрямую."
+        return 0
+    fi
     mark_demand "${HOLD_MIN:-30}" >/dev/null 2>&1
     if corp_up; then
         echo "Корп. туннель уже поднят."
         return 0
     fi
-    # Проводное подключение к корп. сети: VPN не нужен, ресурсы доступны напрямую.
-    for iface in $(ifconfig -lu 2>/dev/null); do
-        case "$iface" in
-            en0|lo|utun*|gif*|stf*|anpi*|awdl*|llw*|ppp*|vnic*|ap*) continue ;;
-        esac
-        ip=$(ipconfig getifaddr "$iface" 2>/dev/null)
-        if [ -n "$ip" ] && printf '%s' "$ip" | grep -qE '^192\.168\.128\.'; then
-            echo "Обнаружено проводное подключение к корп. сети ($iface: $ip)."
-            echo "VPN не требуется — корп. ресурсы доступны напрямую."
-            return 0
-        fi
-    done
     echo "Подключаю $VPN_NAME (networksetup)..."
     networksetup -connectpppoeservice "$VPN_NAME" 2>/dev/null
     sleep 6
@@ -127,7 +139,11 @@ start() {
 # Ручной спрос: пригодится, если обращаешься по IP (RDP, MySQL) — DNS-триггера
 # там нет. Туннель поднимется и не будет погашен по простою заданные минуты.
 demand() {
-    local minutes="${1:-30}"
+    local minutes="${1:-30}" found
+    if found=$(corp_direct_net); then
+        echo "Корп. сеть доступна напрямую ($found) — VPN не нужен."
+        return 0
+    fi
     mark_demand "$minutes" || { echo "Не удалось записать маркер спроса."; return 1; }
     echo "OK: спрос отмечен, удержание $minutes мин."
     HOLD_MIN="$minutes" start
