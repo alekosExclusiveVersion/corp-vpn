@@ -12,7 +12,9 @@ root-вход через корп. egress (п. 6) и watchdog автоподкл
 + догон пропущенного прогона): скан `collect-sites.py --from-app` с ретраями
 (флап MySQL-маршрутов: `Access denied ... 'koshkin'@'94.241.244.242'` —
 домашний IP через `direct_out` Karing мимо `ppp0` в момент хиджака),
-чистка `clean-sites.py --apply` (keep = `sites-keep.txt` + auto-конфиг),
+чистка `clean-sites.py --apply` (keep = `sites-keep.txt` + auto-конфиг;
+счётчики grace-карантина пишутся каждый прогон в
+`~/Library/Application Support/corp-vpn/sites-state.json` через `--save-state`),
 `karing-rules.sh -i` с авто-рестартом Karing; уведомления `sites-sync.*`
 (только баннер macOS, без B24/TG); лог-кольцо + чистка
 артефактов старше 30 дней; `--rollback` на последний `.bak`.

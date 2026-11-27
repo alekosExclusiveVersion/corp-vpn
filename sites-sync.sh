@@ -53,6 +53,9 @@ LOGDIR="${SITES_SYNC_LOGDIR:-$HOME/Library/Logs/corp-sites-sync}"
 LOG="$LOGDIR/corp-sites-sync.log"
 LAST_OK="$LOGDIR/last-ok"
 SKIP_COUNT="$LOGDIR/skip-count"
+# Счётчики протухания доменов (grace-карантин). Путь задаём явно: при --apply
+# clean-sites.py запускается через sudo, и expanduser("~") дал бы /var/root.
+STATE="$HOME/Library/Application Support/corp-vpn/sites-state.json"
 LOG_KEEP_LINES=2000
 KEEP_DAYS=30
 MAX_TRIES=6
@@ -291,8 +294,14 @@ run_cycle() {
 
   build_keep "$MANUAL_KEEP" "$AUTO_CONF" > "$dir/keep.txt"
 
+  # В плановом прогоне сохраняем счётчики протухания (--save-state): иначе
+  # домен без удалений вечно висит «1/3» и никогда не удаляется.
+  save_state=""
+  [ "$dry" -eq 0 ] && save_state="--save-state"
+  mkdir -p "$(dirname "$STATE")" 2>/dev/null
   stale=$("$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
-    --keep-file "$dir/keep.txt" --grace "$GRACE" 2>&1)
+    --keep-file "$dir/keep.txt" --grace "$GRACE" --state "$STATE" \
+    $save_state 2>&1)
   removed=$(printf '%s' "$stale" | sed -n 's/.*удалить \([0-9][0-9]*\),.*/\1/p' | head -1)
   removed=${removed:-0}
   remove_names=$(printf '%s' "$stale" | sed -n 's/^  удалить: //p' | head -1)
@@ -313,8 +322,11 @@ run_cycle() {
 
   if [ "$removed" -gt 0 ]; then
     if $SUDO "$VENV_PY" "$REPO/clean-sites.py" --fresh "$union" \
-        --keep-file "$dir/keep.txt" --grace "$GRACE" --apply >> "$LOG" 2>&1; then
+        --keep-file "$dir/keep.txt" --grace "$GRACE" --state "$STATE" \
+        --apply >> "$LOG" 2>&1; then
       log "clean --apply ok, удалено $removed"
+      # Файл состояния после root-записи должен остаться доступным юзеру.
+      $SUDO chown "$(id -u):$(id -g)" "$STATE" 2>/dev/null || true
       $SUDO launchctl kickstart -k system/com.tradesoft.corp-vpn-routes \
         >/dev/null 2>&1 || log "WARN: kickstart демона"
     else
@@ -485,7 +497,7 @@ report_stale() {
   build_keep "$MANUAL_KEEP" "$AUTO_CONF" > "$keep"
   echo "скан: $fresh ($(wc -l < "$fresh" | tr -d ' ') доменов), grace=$GRACE"
   "${VENV_PY:-python3}" "$REPO/clean-sites.py" --fresh "$fresh" \
-    --keep-file "$keep" --grace "$GRACE"
+    --keep-file "$keep" --grace "$GRACE" --state "$STATE"
   rc=$?
   rm -f "$keep"
   return $rc

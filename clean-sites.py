@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -194,6 +195,9 @@ def main(argv=None):
                     help="применить даже при превышении порога")
     ap.add_argument("--apply", action="store_true",
                     help="удалить с бэкапом .bak.YYYYMMDD-HHMMSS")
+    ap.add_argument("--save-state", action="store_true",
+                    help="сохранить счётчики протухания, ничего не удаляя "
+                         "(плановый прогон: miss должен расти и без удалений)")
     ap.add_argument("--selftest", action="store_true",
                     help="встроенные проверки, без сети и MySQL")
     args = ap.parse_args(argv)
@@ -259,6 +263,12 @@ def main(argv=None):
     rc = 0
     if not args.apply:
         rc = 1 if (to_remove or quarantine) else 0
+        if args.save_state:
+            # Без этого домен, которого нет в скане, вечно висит «1/3»:
+            # состояние писалось только при удалении, а удалять обычно нечего.
+            state["updated"] = today
+            save_state(args.state, state)
+            print(f"состояние: {args.state}")
         print("dry-run: без --apply изменения не вносятся")
         return rc
 
@@ -361,6 +371,22 @@ def selftest():
     st4 = {"version": 1, "domains": {}}
     rm, q = update_state(st4, ["old.ru"], set(), set(), set(), 1, "2026-11-18")
     ck("grace=1: удаление сразу", rm == [("old.ru", 1)] and q == [])
+
+    # --- состояние переживает прогоны без удалений (--save-state) ---------
+    with tempfile.TemporaryDirectory() as td:
+        sp = os.path.join(td, "sub", "state.json")
+        ck("state: нет файла — с чистого", load_state(sp)["domains"] == {})
+        for day, expect in (("2026-11-18", 1), ("2026-11-19", 2),
+                            ("2026-11-20", 3)):
+            st = load_state(sp)
+            rm, q = update_state(st, ["old.ru"], set(), set(), set(), 3, day)
+            save_state(sp, st)
+            ck("state: miss=%d пережил сохранение" % expect,
+               load_state(sp)["domains"]["old.ru"]["miss"] == expect)
+        ck("state: на 3-м прогоне — удаление", rm == [("old.ru", 3)])
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("{битый json")
+        ck("state: битый JSON — с чистого", load_state(sp)["domains"] == {})
 
     print(f"selftest: {passed} passed, {failed} failed")
     return 0 if failed == 0 else 1

@@ -158,7 +158,11 @@ security add-generic-password -a koshkin -s collect-sites -w   # один раз
 **3 сканов подряд**, где его нет (`--grace` / `SITES_GRACE`, по умолчанию 3).
 Состояние (`first_seen`/`last_seen`/`miss`) — в
 `~/Library/Application Support/corp-vpn/sites-state.json` (не в git,
-переопределяется `--state`/`CORP_SITES_STATE`). Отчёт печатает два списка:
+переопределяется `--state`/`CORP_SITES_STATE`). Плановый прогон сохраняет его
+каждый раз (`--save-state`), даже когда удалять нечего: иначе счётчик
+начинался бы с нуля и домен вечно висел бы «1/3» (исправлено 27.11.2026).
+Путь передаётся явно — `--apply` идёт через sudo, и `~` под root указывает
+на `/var/root`. Отчёт печатает два списка:
 
 ```
 протухшие: удалить 0, карантин 1, всего доменов 353 (grace=3, порог 50%)
@@ -255,7 +259,7 @@ sh reconnect-vpn-wake.sh --selftest             # выбор лечения по
 /usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, кэши, 68
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
-./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
+./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 28
 ./sites-sync.sh --selftest                     # цикл актуализации, 11
 ./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 35
 ```
@@ -300,7 +304,7 @@ open -a Karing                # вернуть приложение
 | `corp-routes-clean.sh` | Демон очистки мёртвых маршрутов (сценарии A/B удаляют, сценарий C — фантомный шлюз из fake-IP — по умолчанию только наблюдает); `--selftest` — 88 проверок на фикстурах, `--check` — один проход только на чтение, `--dry-run` — без root и без удалений |
 | `corp-routes-check.sh` | Детектор битых маршрутов Karing, только чтение: fake-IP в назначении и фантомный шлюз из fake-IP; `--sudo-cmd` печатает готовые команды, не выполняя их |
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
-| `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: отчёт «удалить/карантин» по умолчанию, удаление после 3 промахов подряд (`--grace`/`SITES_GRACE`, состояние в `sites-state.json`), `--apply` с бэкапом, предохранитель от частичного скана (порог 50%, `--force`), `--keep` для осознанных алиасов; MySQL не трогает; `--selftest` — 22 проверки |
+| `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: отчёт «удалить/карантин» по умолчанию, удаление после 3 промахов подряд (`--grace`/`SITES_GRACE`, состояние в `sites-state.json`), `--apply` с бэкапом, предохранитель от частичного скана (порог 50%, `--force`), `--keep` для осознанных алиасов; `--save-state` сохраняет счётчики и без удалений; MySQL не трогает; `--selftest` — 28 проверок |
 | `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): синк Karing, VPN-гейт, скан с ретраями, чистка с grace-карантином (частичный скан — чистка пропускается), Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--report` — протухшие/карантин без сети; `--rollback`; `--selftest` — 11 проверок |
 | `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 35 проверок |
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
