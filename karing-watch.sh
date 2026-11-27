@@ -53,6 +53,10 @@ SUDO="${KWATCH_SUDO:-$HOME/bin/sudo}"
 COOLDOWN="${KWATCH_COOLDOWN:-1800}"
 QUIT_SLEEP="${KWATCH_QUIT_SLEEP:-6}"
 OPEN_SLEEP="${KWATCH_OPEN_SLEEP:-15}"
+# Проверка после синка: Karing после старта ещё перечитывает/перезаписывает
+# файлы, и одиночная проверка может поймать недописанный JSON (ложный FAIL).
+VERIFY_TRIES="${KWATCH_VERIFY_TRIES:-4}"
+VERIFY_SLEEP="${KWATCH_VERIFY_SLEEP:-15}"
 # Общий лок ресинка: sites-sync, WatchPaths-агент и этот вотчер могут
 # сработать одновременно (правка конфига + плановый прогон) — рестарт
 # Karing должен быть один.
@@ -109,6 +113,30 @@ karing_check() { sh "$RULES" --check; }
 # Строки дрейфа из --check (пусто = чисто).
 drift_lines() {
   karing_check 2>&1 | grep -E 'ОТСУТСТВУЮТ|ДРЕЙФ' || true
+}
+
+# Проверка после синка с попытками: $1 — сколько раз сверять (по умолчанию 1).
+# Пусто и код 0 — дрейфа нет; иначе печатает строки дрейфа и код 1.
+wait_drift_settled() {
+  local tries=${1:-1} i=1 drift
+  while :; do
+    drift=$(drift_lines)
+    [ -z "$drift" ] && return 0
+    [ "$i" -ge "$tries" ] && break
+    i=$(( i + 1 ))
+    sleep "$VERIFY_SLEEP"
+  done
+  printf '%s' "$drift"
+  return 1
+}
+
+# Полный отчёт --check в лог: при остаточном дрейфе нужно видеть, что именно
+# разошлось (drift_lines оставляет только сводку «ДРЕЙФ: N»).
+log_check_detail() {
+  local line
+  karing_check 2>&1 | while IFS= read -r line; do
+    [ -n "$line" ] && log "  $line"
+  done
 }
 
 # Кулдаун ресинка: не чаще раза в COOLDOWN секунд.
@@ -177,16 +205,19 @@ _resync_locked() {
     emit karing-watch.fail "karing -i: ошибка записи конфига"
     return 1
   fi
+  local tries=1
   if [ "$was_running" -eq 1 ]; then
     karing_open
+    tries="$VERIFY_TRIES"
   fi
-  if drift=$(drift_lines); [ -z "$drift" ]; then
+  if drift=$(wait_drift_settled "$tries"); then
     log "karing: после применения чисто"
     mark_resync
     emit karing-watch.ok "ts-network синхронизирован с корп. конфигами"
     return 0
   else
     log "FAIL: дрейф остался после синхронизации: $drift"
+    log_check_detail
     mark_resync
     emit karing-watch.fail "дрейф Karing остался после синхронизации"
     return 1
@@ -279,6 +310,7 @@ selftest() {
   LAST_RESYNC="$tmp/logs/last-resync"
   LOCKDIR="$tmp/lock"
   SIGNALS="$tmp/signals" SUDO="$tmp/fake-sudo" COOLDOWN=100
+  VERIFY_TRIES=3 VERIFY_SLEEP=0
   mkdir -p "$tmp/logs"
 
   # Подмены внешних эффектов. karing_check отвечает по сценарию:
@@ -292,11 +324,21 @@ selftest() {
     local n
     n=$(cat "$tmp/checks" 2>/dev/null || echo 0)
     printf '%s' "$(( n + 1 ))" > "$tmp/checks"
-    if [ "$n" -eq 0 ]; then printf '%s\n' "$CHECK_FIRST"; else printf '%s\n' "$CHECK_REST"; fi
+    # Точечный сценарий: check-N переопределяет N-ю проверку по счёту.
+    if [ -f "$tmp/check-$(( n + 1 ))" ]; then
+      cat "$tmp/check-$(( n + 1 ))"
+    elif [ "$n" -eq 0 ]; then
+      printf '%s\n' "$CHECK_FIRST"
+    else
+      printf '%s\n' "$CHECK_REST"
+    fi
     return 0
   }
   CHECK_FIRST='Дрейфа нет' CHECK_REST='Дрейфа нет'
-  clean_state() { rm -f "$tmp/applied" "$tmp/checks" "$tmp/still-running" "$tmp/logs/last-resync"; }
+  clean_state() {
+    rm -f "$tmp/applied" "$tmp/checks" "$tmp/still-running" "$tmp/logs/last-resync"
+    rm -f "$tmp"/check-*
+  }
 
   ck "signal: формат" "1" \
     "$(signal_line karing-watch.ok msg | grep -cE '^[0-9]+\|karing-watch.ok\|msg$' || true)" "fmt"
@@ -361,6 +403,22 @@ selftest() {
   run_cycle >/dev/null 2>&1
   ck "cycle: остаточный дрейф код 1" "1" "$?" "cy13"
   ck "cycle: остаточный дрейф ставит метку" "0" "$([ -f "$tmp/logs/last-resync" ]; echo $?)" "cy14"
+
+  # Дрейф после рестарта «доезжает»: 2-я проверка ещё видит расхождение,
+  # 3-я — чисто. Это не FAIL: ждём, пока Karing перечитает конфиг.
+  CHECK_FIRST='ДРЕЙФ: 1 расхождение' CHECK_REST='Дрейфа нет'
+  clean_state
+  printf 'ДРЕЙФ: 1 расхождение\n' > "$tmp/check-2"
+  printf '%s' "$(( $(date +%s) - 200 ))" > "$tmp/logs/last-resync"
+  : > "$tmp/still-running"; : > "$tmp/quit-works"
+  : > "$tmp/signals3"; SIGNALS="$tmp/signals3"
+  run_cycle >/dev/null 2>&1
+  ck "cycle: дрейф «доехал» — код 0" "0" "$?" "cy16"
+  ck "cycle: дрейф «доехал» — без fail" "0" \
+    "$(grep -c '|karing-watch.fail|' "$tmp/signals3" || true)" "cy17"
+  ck "cycle: дрейф «доехал» — шлёт ok" "1" \
+    "$(grep -c '|karing-watch.ok|' "$tmp/signals3" || true)" "cy18"
+  SIGNALS="$tmp/signals"
 
   # Нет генератора: fail без падений.
   RULES="$tmp/no-such-rules.sh"

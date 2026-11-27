@@ -218,8 +218,15 @@ macOS (без B24+Telegram). Лог-кольцо
 
 Юзер-агент `com.tradesoft.corp-karing-watch` (каждые 10 мин + при логине):
 `karing-rules.sh --check` без VPN-гейта, при дрейфе `quit → -i → open`
-с перепроверкой. Кулдаун ресинка — 30 мин (`KWATCH_COOLDOWN`), guard
-незакрывшегося Karing, общий лок `/tmp/corp-karing-resync.lock`.
+с перепроверкой. Перепроверка после старта Karing — с попытками
+(`KWATCH_VERIFY_TRIES`, по умолчанию 4, пауза `KWATCH_VERIFY_SLEEP` 15 с):
+Karing после запуска ещё перечитывает и перезаписывает свои файлы, и
+одиночная проверка может поймать недописанный JSON — это давало ложный
+`karing-watch.fail` «дрейф остался» (27.11.2026, ушёл сам к следующей
+проверке). Если дрейф всё же остался, в лог пишется полный отчёт `--check`
+(что именно разошлось), а не только сводка «ДРЕЙФ: N». Кулдаун ресинка —
+30 мин (`KWATCH_COOLDOWN`), guard незакрывшегося Karing, общий лок
+`/tmp/corp-karing-resync.lock`.
 
 Второй агент `com.tradesoft.corp-karing-sync-onchange` (`WatchPaths` на
 `/usr/local/etc/corp-networks.conf` и `-auto`) вызывает этот же скрипт с
@@ -237,8 +244,7 @@ macOS (без B24+Telegram). Лог-кольцо
 ./karing-watch.sh --check      # только сверка, без изменений
 ./karing-watch.sh --sync       # синк по дрейфу сейчас, без кулдауна
 ./karing-watch.sh --force      # ресинк безусловно (отладка)
-./karing-watch.sh --selftest   # проверки, 35
-```
+./karing-watch.sh --selftest   # проверки, 38
 ```
 
 События `karing-watch.ok` / `karing-watch.fail` — только баннер macOS
@@ -261,7 +267,7 @@ sh reconnect-vpn-wake.sh --selftest             # выбор лечения по
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 28
 ./sites-sync.sh --selftest                     # цикл актуализации, 11
-./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 35
+./karing-watch.sh --selftest                   # вотчер дрейфа Karing, 38
 ```
 
 Все проверки работают без root, без сети и без MySQL. `install.sh` прогоняет их
@@ -306,7 +312,7 @@ open -a Karing                # вернуть приложение
 | `collect-sites.py` | Сбор доменов сайтов из корп. MySQL в `SITE_DOMAINS`; учётки — из реестра Parallels SQL Admin (`--from-app`) либо из Keychain (`--password-keychain`); `--clean` чистит файл на месте |
 | `clean-sites.py` | Чистка `SITE_DOMAINS` от доменов, пропавших из живых БД: отчёт «удалить/карантин» по умолчанию, удаление после 3 промахов подряд (`--grace`/`SITES_GRACE`, состояние в `sites-state.json`), `--apply` с бэкапом, предохранитель от частичного скана (порог 50%, `--force`), `--keep` для осознанных алиасов; `--save-state` сохраняет счётчики и без удалений; MySQL не трогает; `--selftest` — 28 проверок |
 | `sites-sync.sh` | Цикл актуализации доменов (LaunchAgent 08:00/14:00/20:00 + догон): синк Karing, VPN-гейт, скан с ретраями, чистка с grace-карантином (частичный скан — чистка пропускается), Karing `-i` с рестартом, чистка `.bak` (своих и Karing); события `sites-sync.*` — только баннер macOS; `--report` — протухшие/карантин без сети; `--rollback`; `--selftest` — 11 проверок |
-| `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин); напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 35 проверок |
+| `karing-watch.sh` | Вотчер дрейфа Karing (LaunchAgent каждые 10 мин + при логине): `--check` без VPN-гейта, при дрейфе `-i` с рестартом Karing (кулдаун 30 мин), перепроверка после старта с попытками (ложный «дрейф остался» из-за недописанного конфига Karing), полный отчёт в лог при остаточном дрейфе; напоминание о грязном репо (`repo-dirty.remind`, грязь 48ч+, повтор раз в сутки); события `karing-watch.*` — только баннер macOS; `--selftest` — 38 проверок |
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
 | `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
 | `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, on-demand-гейт (без спроса после сна туннель не поднимается), повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 28 проверок |
