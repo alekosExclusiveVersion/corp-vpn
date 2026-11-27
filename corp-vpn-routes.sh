@@ -36,6 +36,10 @@ STATE=/var/run/corp-vpn-routes.state
 LOCAL_STATE=/var/run/corp-vpn-local.state
 SIGNALS="${CORP_SIGNALS:-/var/run/corp-vpn-signals}"
 SIGNALED_VPN_STATE="${CORP_SIGNALS_VPN_STATE:-/var/run/corp-vpn-signals.vpn}"
+# Маркер «туннель погасил демон on-demand по простою»: такой vpn.down — рутина,
+# баннер о нём не показываем (ручной stop и обрыв маркер не оставляют).
+IDLE_STOP_FILE="${CORP_VPN_IDLE_STOP_FILE:-/tmp/corp-vpn-idle-stop}"
+IDLE_STOP_TTL="${CORP_VPN_IDLE_STOP_TTL:-180}"
 
 # Сигнальная очередь для юзер-агента уведомлений (corp-notify.sh).
 # Строка: ts|event|message.
@@ -60,6 +64,13 @@ diag() {
   logger -t "$LOG_TAG" "$ev $*"
 }
 
+# Свежий ли маркер idle-останова (чистая функция для selftest).
+# $1 — mtime файла (пусто = файла нет), $2 — «сейчас», $3 — окно в секундах.
+idle_stop_fresh() {
+  [ -n "$1" ] || return 1
+  [ $(( $2 - $1 )) -lt "${3:-$IDLE_STOP_TTL}" ]
+}
+
 # Сигнал смены состояния корп. VPN: только при реальном переходе up<->down
 # (не при переподключении в рамках сессии и не при ложном Connected).
 signal_vpn_transition() {
@@ -68,7 +79,16 @@ signal_vpn_transition() {
     echo "$state" > "$SIGNALED_VPN_STATE"
     case "$state" in
       up)   signal "vpn.up"   "корп VPN активен ($iface)" ;;
-      down) signal "vpn.down" "корп VPN отключился" ;;
+      down)
+        # Погасил демон on-demand по простою — не баннер, только диаг-лог.
+        mtime=$(stat -f %m "$IDLE_STOP_FILE" 2>/dev/null)
+        if idle_stop_fresh "$mtime" "$(date +%s)"; then
+          rm -f "$IDLE_STOP_FILE" 2>/dev/null
+          diag "VPN_DOWN_IDLE" "no vpn.down signal (idle stop by on-demand)"
+        else
+          signal "vpn.down" "корп VPN отключился"
+        fi
+        ;;
     esac
   fi
 }
@@ -796,6 +816,14 @@ selftest() {
 
   ST_IF_ALL=""
   ST_NETSTAT=""
+
+  # --- маркер idle-останова: баннер vpn.down подавляется только для него ---
+  teq "idle-stop: свежий маркер" 0 \
+    "$(idle_stop_fresh 1000 1100 180 && echo 0 || echo 1)"
+  teq "idle-stop: старый маркер" 1 \
+    "$(idle_stop_fresh 1000 1200 180 && echo 0 || echo 1)"
+  teq "idle-stop: маркера нет" 1 \
+    "$(idle_stop_fresh "" 1200 180 && echo 0 || echo 1)"
 
   # --- фикстуры ---
   # POINTOPOINT-интерфейсы: маска берётся по имени ("netmask 0x.."), а не по

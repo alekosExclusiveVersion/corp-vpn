@@ -104,7 +104,7 @@ VPN-сессии (`same_vpn_session` → `assert_routes`, событие `WAKE_S
 распараллелен (окно `RESOLVE_JOBS`, дедуп IP, готовность через атомарный
 `rename`) — полная пересборка 14 с вместо 75–140; `tunnel_alive` ограничен
 бюджетом 4 с, `sweep_corp_hijacks` вызывается первым делом на wake;
-selftest демона — 62 проверки.
+selftest демона — 65 проверок.
 
 ---
 
@@ -966,7 +966,11 @@ security add-generic-password -a koshkin -s collect-sites -w
 4. `idle_loop` демона каждые 30 с: если туннель поднят и `ONDEMAND_IDLE` (600 с)
    не было ни корп. DNS-запросов, ни заметного трафика на `ppp0`
    (`>= 8 КБ` за тик), ни установленных соединений в корп. подсети — гасит
-   туннель (`scutil --nc stop`) и удаляет маркер.
+   все подключённые PPP-профили (`scutil --nc stop`), удаляет маркер спроса и
+   пишет маркер idle-останова `/tmp/corp-vpn-idle-stop`. По этому маркеру
+   маршрутный демон **не** шлёт баннер `vpn.down` (иначе on-demand давал бы по
+   баннеру на каждый цикл); ручной `stop` и реальный обрыв маркера не
+   оставляют — о них баннер приходит как раньше.
 5. `~/.wakeup` после сна поднимает L2TP только при свежем маркере/удержании;
    иначе пишет `on-demand: спроса нет` и оставляет подъём DNS-триггеру.
 
@@ -1049,11 +1053,11 @@ default            172.25.125.111     UGScIg     en0      ← телефон/л�
 | Детектор битых маршрутов (30.09.2026) | `./corp-routes-check.sh` | `OK: все fakeip-маршруты идут через utun*, фантомных шлюзов нет` |
 | Аналитика очистки, только чтение (30.09.2026) | `sh corp-routes-clean.sh --check` | кандидатов C нет, файлы в `/var/run`, `/var/log` не тронуты |
 | Selftest очистки мёртвых маршрутов | `sh corp-routes-clean.sh --selftest` | `88 passed, 0 failed` |
-| Selftest демона маршрутов | `sh corp-vpn-routes.sh --selftest` | `41 passed, 0 failed` |
+| Selftest демона маршрутов | `sh corp-vpn-routes.sh --selftest` | `65 passed, 0 failed` |
 | VPN on demand: подъём по DNS (25.11.2026) | туннель выключен → `dig @127.0.0.1 -p 5354 grafana.tradesoft.ru` | туннель поднялся за ~7 с, ответ `192.168.0.232` за ~15 с |
 | VPN on demand: имя VPN-сервера | `dig @127.0.0.1 -p 5354 vpn4.tradesoft.ru` | `109.194.204.125` из обычного DNS, туннель НЕ поднимается |
-| VPN on demand: idle-останов | `stop_vpn()` / простой `ONDEMAND_IDLE` | профиль найден (`vpn2-ts`), туннель погашен, маркер снят |
-| Selftest on-demand | `/usr/bin/python3 vpn-ondemand.py --selftest` | `64 passed, 0 failed` |
+| VPN on demand: idle-останов | `stop_vpn()` / простой `ONDEMAND_IDLE` | профиль найден (`vpn2-ts`), туннель погашен, маркер снят, `vpn.down` не сигналится |
+| Selftest on-demand | `/usr/bin/python3 vpn-ondemand.py --selftest` | `68 passed, 0 failed` |
 
 ---
 
@@ -1392,6 +1396,9 @@ aleksei) читает новые строки по байтовому указа
   (corp-vpn-diagd, только на переходе состояния);
 - `vpn.up` / `vpn.down` — корп VPN поднялся/отключился (corp-vpn-routes,
   только на смене `last_iface`; маркер `/var/run/corp-vpn-signals.vpn`).
+  `vpn.down` **не** шлётся, если туннель погасил демон on-demand по простою
+  (свежий маркер `/tmp/corp-vpn-idle-stop`, окно 180 с): в диаг-логе это
+  `VPN_DOWN_IDLE`. Ручной `corp-vpn.sh stop` и обрыв — с баннером.
 - `db-clean.ok` / `db-clean.dryrun` / `db-clean.fail` — результаты автоочистки
   БД aisql (corp-db-clean, ежедневно 03:00; отдельный проект
   `~/Work/scripts/db-clean/` — см. его README.md).

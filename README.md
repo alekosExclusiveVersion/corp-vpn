@@ -53,6 +53,9 @@ MySQL:
   DNS без туннеля недоступен (иначе `networksetup` висит в `Connecting`);
 - если туннель поднять не удалось (cooldown после неудачи), публичные имена
   корп. зон (`www.tradesoft.ru` и т.п.) отдаются обычным DNS, а не `SERVFAIL`;
+- останов по простою не шумит баннером: демон пишет маркер
+  `/tmp/corp-vpn-idle-stop`, и `vpn.down` в Notification Center не приходит
+  (ручной `stop` и обрыв — с баннером, как раньше);
 - `vpn-watchdog.sh` без свежего маркера (300 с) туннель не поднимает;
 - через `ONDEMAND_IDLE` (600 с) без корп. DNS-запросов, трафика на `ppp0` и
   установленных соединений в корп. подсети туннель гасится (`scutil --nc stop`);
@@ -243,13 +246,13 @@ macOS (без B24+Telegram). Лог-кольцо
 ## Самопроверки
 
 ```bash
-sh corp-vpn-routes.sh --selftest              # демон маршрутов, 62 проверки
+sh corp-vpn-routes.sh --selftest              # демон маршрутов, 65 проверок
 sh karing-rules.sh --selftest                  # генератор и сверка дрейфа, 19
 sh corp-routes-clean.sh --selftest              # очистка мёртвых маршрутов, 96
 sh corp-wifi-routes.sh --selftest               # маршруты корп. Wi-Fi, 10
 sh karing-restart.sh --selftest                 # рестартер/fallback Karing, 12
 sh reconnect-vpn-wake.sh --selftest             # выбор лечения после сна + guard «Mac спит?» + спрос, 28
-/usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, кэши, 64
+/usr/bin/python3 vpn-ondemand.py --selftest     # VPN on demand: зоны, MAC, idle, bypass, кэши, 68
 ../parallels-sql-admins/.venv/bin/python \
     collect-sites.py --selftest                # фильтр доменов, 33
 ./clean-sites.py --selftest                    # чистка SITE_DOMAINS, 13
@@ -303,6 +306,6 @@ open -a Karing                # вернуть приложение
 | `karing-restart.sh` | Рестартер и аварийное закрытие Karing (user-level, без root): `--force` — безусловно (wake-хук), `--if-dead` — только при провале внешней пробы, `--fallback` — выйти из Karing (зависший добивается TERM/KILL, оставшийся `Connected` снимается `scutil --nc stop`) → дождаться `default` вне utun → сбросить DNS-кэш fake-IP → проверить трафик; ждёт трафик, а не статус `Connected` (норма 1–5 с, предел 8 с); при успехе обновляет `last-resync`, при провале — `last-fail` (чтобы не усыплять вотчер); `--dry-run`, `--selftest` — 12 проверок |
 | `corp-wifi-routes.sh` | Демон маршрутов при корп. Wi-Fi: пины `VPN_SERVERS` и `CORP_GATEWAY_HOSTS` через шлюз Wi-Fi, снятие utun-пинов Karing с публичных IP корп. доменов; по маркеру wake/разрыву тика обновляет кэш corp-IP и пины сразу; `--selftest` — 10 проверок |
 | `reconnect-vpn-wake.sh` | Wake-хук (копируется в `~/.wakeup`, ставится `install.sh`): маркер пробуждения для root-демонов, синхронный рестарт Karing с ожиданием трафика, при провале — fallback «закрыть Karing» (2 с до прямого интернета), подъём L2TP с guard'ами корп. Wi-Fi/LAN, on-demand-гейт (без спроса после сна туннель не поднимается), повторный маркер и проверка сети 3/5/7с (15 с вместо 60) с выбором лечения `choose_fix` (мертва внешняя → fallback, мертва только корп. → L2TP) и диагнозом в баннере; `WAKE_DRY_RUN=1` — без побочных эффектов, `--selftest` — 28 проверок |
-| `vpn-ondemand.py` | Демон VPN on demand (`com.tradesoft.corp-vpn-ondemand`, root): слушает `127.0.0.1:5354` (UDP+TCP, параллельно), на DNS-запрос к корп. зоне ставит маркер спроса и просит watchdog поднять L2TP, пересылает запрос на корп. DNS, при простое `ONDEMAND_IDLE` гасит туннель; на корп. Wi-Fi/LAN туннель не поднимает; имена VPN-серверов и `ONDEMAND_BYPASS` резолвит обычным DNS (иначе dial зависает), публичные имена корп. зон при недоступном туннеле отдаёт обычному DNS; `--once NAME` — разбор одного запроса, `--zones` — зоны-триггеры из конфига (использует `install.sh`), `--selftest` — 64 проверки |
+| `vpn-ondemand.py` | Демон VPN on demand (`com.tradesoft.corp-vpn-ondemand`, root): слушает `127.0.0.1:5354` (UDP+TCP, параллельно), на DNS-запрос к корп. зоне ставит маркер спроса и просит watchdog поднять L2TP, пересылает запрос на корп. DNS, при простое `ONDEMAND_IDLE` гасит туннель; на корп. Wi-Fi/LAN туннель не поднимает; имена VPN-серверов и `ONDEMAND_BYPASS` резолвит обычным DNS (иначе dial зависает), публичные имена корп. зон при недоступном туннеле отдаёт обычному DNS; `--once NAME` — разбор одного запроса, `--zones` — зоны-триггеры из конфига (использует `install.sh`), `--selftest` — 68 проверок |
 | `sites-keep.example.txt` | Шаблон ручных исключений для чистки (осознанные алиасы вне `csSiteDomain`); `install.sh` копирует его в `/usr/local/etc/sites-keep.txt`, только если рабочего файла ещё нет (рабочий — локальный, в `.gitignore`) |
 | `README.md` | Документация |

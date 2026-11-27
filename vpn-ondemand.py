@@ -47,6 +47,10 @@ CONF = os.environ.get("CORP_NETWORKS_CONF", "/usr/local/etc/corp-networks.conf")
 LOG = os.environ.get("CORP_ONDEMAND_LOG", "/tmp/corp-vpn-ondemand.log")
 DEMAND_FILE = os.environ.get("CORP_VPN_DEMAND_FILE", "/tmp/corp-vpn-demand")
 HOLD_FILE = os.environ.get("CORP_VPN_HOLD_FILE", "/tmp/corp-vpn-hold")
+# Маркер «туннель погашен по простою»: маршрутный демон по нему не шлёт
+# баннер vpn.down (иначе on-demand даёт по баннеру на каждый цикл).
+IDLE_STOP_FILE = os.environ.get("CORP_VPN_IDLE_STOP_FILE",
+                                "/tmp/corp-vpn-idle-stop")
 DIAL_COOLDOWN_FILE = os.environ.get("CORP_VPN_DIAL_COOLDOWN",
                                     "/tmp/corp-vpn-dial-cooldown")
 DIAL_COOLDOWN_SECS = int(os.environ.get("CORP_DIAL_COOLDOWN_SECS", "180"))
@@ -781,6 +785,11 @@ def stop_vpn(reason):
         except (OSError, subprocess.SubprocessError):
             pass
     try:
+        with open(IDLE_STOP_FILE, "w", encoding="utf-8") as f:
+            f.write("%d\n" % int(time.time()))
+    except OSError:
+        pass
+    try:
         os.remove(DEMAND_FILE)
     except OSError:
         pass
@@ -971,6 +980,11 @@ def main():
         return 0 if zones else 1
 
     trim_log()
+    # Маркер с прошлого запуска не должен подавлять настоящий vpn.down.
+    try:
+        os.remove(IDLE_STOP_FILE)
+    except OSError:
+        pass
     try:
         IDLE = int(conf_var("ONDEMAND_IDLE", str(IDLE)) or IDLE)
     except ValueError:
@@ -1173,6 +1187,44 @@ resolver #4
         subprocess.run = real_run
         for k in ("vpn_up", "corp_lan", "vpn_up_since"):
             _state.pop(k, None)
+
+    # --- stop_vpn: маркер idle-останова (маршрутный демон по нему не шлёт
+    #     баннер vpn.down); без подключённых профилей маркер не пишется ---
+    marker = "/tmp/corp-vpn-idle-stop.selftest"
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    saved = {k: globals()[k] for k in
+             ("IDLE_STOP_FILE", "DEMAND_FILE", "connected_profiles")}
+    saved_run = subprocess.run
+
+    def fake_stop_run(cmd, **kw):
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    try:
+        globals()["IDLE_STOP_FILE"] = marker
+        globals()["DEMAND_FILE"] = marker + ".demand"
+        globals()["connected_profiles"] = lambda: []
+        subprocess.run = fake_stop_run
+        ck("stop_vpn: без туннеля — False", stop_vpn("selftest") is False)
+        ck("stop_vpn: без туннеля маркер не пишется",
+           not os.path.exists(marker))
+        globals()["connected_profiles"] = lambda: ["vpn-test"]
+        ck("stop_vpn: с туннелем — True", stop_vpn("selftest") is True)
+        with open(marker, encoding="utf-8") as f:
+            ts = int(f.read().strip())
+        ck("stop_vpn: маркер с текущим временем",
+           abs(ts - time.time()) < 60)
+    finally:
+        for k, v in saved.items():
+            globals()[k] = v
+        subprocess.run = saved_run
+        for f in (marker, marker + ".demand"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
 
     now = 1_000_000
     ck("idle: свежая активность — не гасим",
