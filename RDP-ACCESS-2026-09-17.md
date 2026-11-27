@@ -96,3 +96,31 @@ login Keychain (service `opencode.rdp`) через `~/bin/keychain-get` и по�
 - Сервер: LSM Event 25 «Успешное (пере)подключение сеанса», `quser` —
   активная сессия `a.koshkin` (rdp-tcp#0, ID 3), источник 192.168.160.192.
 - Клиент: `state=Connected`, `current bandwidth` до ~26 Мбит/с, RTT ~24 мс.
+
+## 27.11.2026: реконнекты при работающем подключении
+
+Другой симптом: сессия идёт, но TCP-транспорт внезапно закрывается
+(`TcpTransportOnClosed ... Operation now in progress`), через ~50 с
+(`total-missed=5`) клиент объявляет `CMSTATE_DROPPED` и затем reconnect.
+Причины — не пароль и не NLA:
+
+- Karing сам перезапускает туннель (~раз в 60–90 мин; 7 раз за день),
+  `utun4` пересоздаётся; в логе Windows App в момент обрыва:
+  `[NetworkMonitor] ... VPN is inactive, interface: utun4 ... unsatisfied`.
+- DNS Karing (`10.20.0.2`) отдаёт для `*.tradesoft.corp` **fake-IP**
+  `198.20.0.x`, маршрут идёт через `utun4`; сокет RDP оказывается
+  завязан на туннель и рвётся вместе с ним. При резолве в реальный IP
+  (`192.168.128.160`) трафик идёт через `en0` и не зависит от Karing.
+
+**Fix:** RDP-хосты прописаны в `RDP_STATIC_IPS` (`corp-networks.conf`);
+`karing-rules.sh -i` записывает их в `dns.static_ips` настроек Karing
+(файл `karing_setting.json`, вместе с `enable_static_ip=true`). Настройка
+переживает рестарт приложения. Править `service_core.json` бесполезно —
+Karing перезаписывает его из своей памяти при старте (проверено 27.11).
+Дрейф ловится `karing-rules.sh --check`, вотчер чинит его сам.
+
+Проверка: `dscacheutil -q host -a name sup25.tradesoft.corp` →
+`192.168.128.160`; `lsof -nP -iTCP:3389 -sTCP:ESTABLISHED` →
+`192.168.128.79 -> 192.168.128.160:3389` (интерфейс `en0`, не `utun4`).
+`dig @10.20.0.2` может по-прежнему показывать fake-IP — это прямой запрос
+к DNS-серверу Karing, системный резолвер использует static_ips.

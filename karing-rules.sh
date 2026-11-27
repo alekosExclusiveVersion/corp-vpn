@@ -6,6 +6,7 @@
 # Запуск:
 #   ./karing-rules.sh            # JSON-группы для вставки в Karing
 #   ./karing-rules.sh --singbox  # правила в формате sing-box
+#   ./karing-rules.sh --dns      # статические DNS-записи RDP-хостов (JSON)
 #   ./karing-rules.sh --check    # сверять live-конфиг Karing с corp-networks.conf
 #   ./karing-rules.sh -i         # применить в конфиг Karing (с бэкапом)
 #
@@ -24,6 +25,13 @@
 #   "На прямую"  — остаётся для личных правок пользователя (напр.
 #                  .yandex.ru, .bitrix24.ru); корп. элементы из
 #                  конфига из неё переносятся в ts-network.
+# DNS-статистика (karing_setting.json, dns.static_ips): RDP-хосты из
+#           RDP_STATIC_IPS резолвятся в реальные IP, а не в fake-IP
+#           198.20.0.x. Иначе сокет Windows App садится на utun4 и сессия
+#           рвётся при каждом рестарте Karing (NetworkMonitor пишет
+#           "VPN is inactive ... Status=unsatisfied"). Настройка живёт в
+#           settings Karing и переживает рестарт; править service_core.json
+#           бесполезно — Karing перезаписывает его из своей памяти.
 # Группы "Корп L2TP" больше НЕТ: MySQL/корп. хосты маршрутизирует
 # демон corp-vpn-routes (host-маршруты через ppp), поэтому Karing
 # не должен перехватывать *.tradesoft.ru (иначе прибивает их к utun).
@@ -38,6 +46,7 @@ CONF="${CORP_NETWORKS_CONF:-/usr/local/etc/corp-networks.conf}"
 KARING_DIR="$HOME/Library/Group Containers/group.com.nebula.karing"
 ROUTING_JSON="$KARING_DIR/karing_routing_group.json"
 SUBSCRIBE_JSON="$KARING_DIR/karing_subscribe_use.json"
+SETTINGS_JSON="$KARING_DIR/karing_setting.json"
 
 # shellcheck disable=SC1090
 . "$CONF"
@@ -67,6 +76,12 @@ VPN_SERVERS="${VPN_SERVERS:-}"
 # Переопределяется через CORP_NETWORKS_AUTO (нужно selftest на фикстурах).
 AUTO_CONF="${CORP_NETWORKS_AUTO:-/usr/local/etc/corp-networks-auto.conf}"
 AUTO_SITE_DOMAINS="$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" 2>/dev/null | tr '\n' ' ')"
+
+# RDP-хосты, которым нужно принудительно задать реальный IP вместо fake-IP
+# Karing. Формат: "host=ip host2=ip2" (IP явно, без резолва на лету —
+# иначе можно записать fake-IP 198.20.0.x как "статический"). Хранится в
+# dns.static_ips настроек Karing и не затирается при рестарте приложения.
+RDP_STATIC_IPS="${RDP_STATIC_IPS:-}"
 
 to_json_array() {
   # Повторы убираются с сохранением порядка: SITE_DOMAINS и MYSQL_HOSTS
@@ -114,6 +129,25 @@ singbox_rule() {
   printf '  "name": "ts-network[Корпоративная сеть]",\n  "type": "logical",\n  "mode": "or"\n}\n'
 }
 
+static_ips_json() {
+  # Статические DNS-записи для dns.static_ips Karing (RDP-хосты -> реальные IP).
+  python3 - "$RDP_STATIC_IPS" <<'PY'
+import json, sys
+out = {}
+for item in sys.argv[1].split():
+    if '=' not in item:
+        print(f'WARN: пропущено «{item}» — ожидался host=ip', file=sys.stderr)
+        continue
+    host, ip = item.split('=', 1)
+    if host and ip:
+        out.setdefault(host, [])
+        if ip not in out[host]:
+            out[host].append(ip)
+print(json.dumps({"enable_static_ip": True, "static_ips": out},
+                 ensure_ascii=False, indent=2))
+PY
+}
+
 apply() {
   # Синхронизирует группы Karing с corp-networks.conf (с бэкапами):
   #   - группа "На прямую" создаётся из конфига ТОЛЬКО если её нет,
@@ -126,9 +160,10 @@ apply() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   group_json > "$tmpdir/direct.json"
-  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" <<'PY'
+  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" "$SETTINGS_JSON" "$RDP_STATIC_IPS" <<'PY'
 import json, sys, shutil, time, os, socket
 routing_path, subscribe_path, tmpdir = sys.argv[1:4]
+settings_path, rdp_static_raw = sys.argv[11:13]
 corp_domains = (sys.argv[4] + ' ' + sys.argv[5] + ' ' + sys.argv[6] + ' ' + sys.argv[10]).split()
 mysql_hosts = sys.argv[6].split()
 domain_suffixes = sys.argv[7].split() if len(sys.argv) > 7 else []
@@ -262,9 +297,40 @@ if not any(e.get('diversion_groupid') == 'final' for e in div):
 sub['diversion_group'] = div
 save(subscribe_path, sub)
 
+# --- karing_setting.json: статические DNS-записи RDP-хостов ---
+# service_core.json править бесполезно: Karing перезаписывает его из
+# своей памяти при старте. Настройки (dns.static_ips) живут в settings
+# и переживают рестарт. Личные записи не трогаем.
+wanted = {}
+for item in rdp_static_raw.split():
+    if '=' in item:
+        host, ip = item.split('=', 1)
+        if host and ip:
+            wanted.setdefault(host, [])
+            if ip not in wanted[host]:
+                wanted[host].append(ip)
+settings = load(settings_path, None)
+if settings is None:
+    print('WARN: karing_setting.json отсутствует/не читается — static_ips не применены',
+          file=sys.stderr)
+else:
+    dns = settings.setdefault('dns', {})
+    dns['enable_static_ip'] = True
+    static = dns.setdefault('static_ips', {})
+    for host, ips in wanted.items():
+        # fake-IP из пула Karing не должен остаться "статическим"
+        cur = [x for x in static.get(host, [])
+               if not x.startswith(('198.18.', '198.19.', '198.20.', '198.21.'))]
+        for ip in ips:
+            if ip not in cur:
+                cur.append(ip)
+        static[host] = cur
+    save(settings_path, settings)
+
 print('OK: группа "ts-network" синхронизирована с corp-networks.conf')
 print('    корп. домены/суффиксы/IP -> "ts-network" (direct_out)')
 print('    личные правки остались в "На прямую"')
+print(f'    DNS static_ips (RDP): {len(wanted)} хостов -> karing_setting.json')
 print('    ' + routing_path)
 PY
   rm -rf "$tmpdir"
@@ -275,11 +341,13 @@ check() {
   # Ничего не изменяет. Код возврата: 0 — расхождений нет, 1 — есть дрейф,
   # 2 — конфиг не прочитан (пригодно как гейт в мониторинге).
   python3 - "$0" "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$DOMAINS" "$SITE_DOMAINS" \
-      "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" <<'PY'
+      "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" \
+      "$SETTINGS_JSON" "$RDP_STATIC_IPS" <<'PY'
 import json, sys, os, socket, subprocess
 
 self_name = sys.argv[1]
 routing_path, subscribe_path = sys.argv[2:4]
+settings_path, rdp_static_raw = sys.argv[11:13]
 DOMAINS, SITE_DOMAINS, MYSQL_HOSTS, DOMAIN_SUFFIX, NET_ROUTES, VPN_SERVERS, AUTO_DOMAINS = \
     (sys.argv[i].split() for i in range(4, 11))
 
@@ -358,7 +426,7 @@ for key in ('domain', 'domain_suffix', 'ip_cidr'):
               " — ip_cidr проверен не полностью")
     if missing:
         drift += len(missing)
-        print(f"  {'':15} ОТСУТСТВУЮТ ({len(missing)}): {', '.join(sorted(missing))}")
+        print(f"  {key:15} ОТСУТСТВУЮТ ({len(missing)}): {', '.join(sorted(missing))}")
     if extra:
         shown = ', '.join(extra[:10])
         more = f" и ещё {len(extra) - 10}" if len(extra) > 10 else ""
@@ -391,6 +459,38 @@ try:
         print(f"  diversion_group  ts-network -> НЕ direct_out ({got})")
 except Exception as ex:
     print(f"  diversion_group  не прочитан: {ex}")
+
+# --- DNS static_ips: RDP-хосты не должны резолвиться в fake-IP ---
+wanted = {}
+for item in rdp_static_raw.split():
+    if '=' in item:
+        host, ip = item.split('=', 1)
+        if host and ip:
+            wanted.setdefault(host, [])
+            if ip not in wanted[host]:
+                wanted[host].append(ip)
+try:
+    with open(settings_path, encoding='utf-8') as f:
+        settings = json.load(f)
+except Exception as ex:
+    settings = None
+    drift += 1
+    print(f"  DNS static_ips  не прочитан {settings_path}: {ex}")
+if settings is not None:
+    dns = settings.get('dns', {})
+    static = dns.get('static_ips', {})
+    if not dns.get('enable_static_ip'):
+        drift += 1
+        print('  DNS static_ips  ОТКЛЮЧЕНЫ (enable_static_ip=false)')
+    miss = [f'{h}={ip}' for h, ips in wanted.items()
+            for ip in ips if ip not in static.get(h, [])]
+    if miss:
+        drift += len(miss)
+        print(f'  DNS static_ips  ОТСУТСТВУЮТ ({len(miss)}): '
+              f"{', '.join(sorted(miss))}")
+    else:
+        print(f'  DNS static_ips  ок ({len(wanted)} хостов RDP, '
+              f'всего записей {len(static)})')
 
 print()
 if drift:
@@ -436,6 +536,7 @@ DOMAINS="m.ru"
 DOMAIN_SUFFIX=".tradesoft.ru"
 NET_ROUTES="192.168.0.0/16"
 VPN_SERVERS="203.0.113.7"
+RDP_STATIC_IPS="rdp.corp=192.0.2.10"
 CONF
   printf '# пустой auto-конфиг (комменты игнорируются)\n' > "$tmp/auto-empty"
   printf 'auto-learn.ru\n' > "$tmp/auto-one"
@@ -445,7 +546,7 @@ CONF
 
   # live-конфиг, полностью совпадающий с conf
   python3 - "$kg/karing_routing_group.json" <<'PY'
-import json, sys
+import json, sys, os
 doc = {
   "items": [{
     "groupid": "custom", "urlOrPath": "", "remark": "Самостоятельная настройка",
@@ -469,6 +570,19 @@ with open(sys.argv[1].replace('routing_group', 'subscribe_use'), 'w',
         {"diversion_groupid": "custom", "diversion_name": "ts-network",
          "server_groupid": "direct", "server_name": "direct_out",
          "dns_servers": []}]}, f, ensure_ascii=False, indent=2)
+
+settings = {
+    "dns": {
+        "enable_static_ip": True,
+        "proxy_resolve_mode": "fakeip",
+        "static_ips": {"rdp.corp": ["192.0.2.10"],
+                       "personal.example": ["192.0.2.99"]},
+    },
+    "perapp": {"enable": False},
+}
+with open(os.path.join(os.path.dirname(sys.argv[1]), 'karing_setting.json'), 'w',
+          encoding='utf-8') as f:
+    json.dump(settings, f, ensure_ascii=False, indent=2)
 PY
 
   out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
@@ -478,12 +592,74 @@ PY
   ck "check: чистая группа, дубли не отмечены" "0" \
     "$(printf '%s' "$out" | grep -c 'дублей')"
 
+  # --- DNS static_ips для RDP (fake-IP рвёт сессию при рестарте Karing) ---
+  ck "check: DNS static_ips ок" "1" \
+    "$(printf '%s' "$out" | grep -c 'DNS static_ips  ок')"
+
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding='utf-8'))
+d['dns']['static_ips'].pop('rdp.corp', None)
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: DNS static_ips отсутствует" "1" \
+    "$(printf '%s' "$out" | grep -c 'DNS static_ips  ОТСУТСТВУЮТ (1): rdp\.corp=192\.0\.2\.10')"
+
+  HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" \
+    "$DIR/karing-rules.sh" -i >/dev/null 2>&1
+  ck "apply: код 0" "0" "$?"
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+s = d['dns']
+assert s['enable_static_ip'] is True
+assert s['static_ips'].get('rdp.corp') == ['192.0.2.10']
+assert '192.0.2.99' in s['static_ips'].get('personal.example', []), 'личные записи потеряны'
+print('ok')
+PY
+  ck "apply: static_ips восстановлены, личные записи целы" "0" "$?"
+
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding='utf-8'))
+d['dns']['enable_static_ip'] = False
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: DNS static_ips отключены" "1" \
+    "$(printf '%s' "$out" | grep -c 'DNS static_ips  ОТКЛЮЧЕНЫ')"
+
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding='utf-8'))
+d['dns']['enable_static_ip'] = True
+d['dns']['static_ips']['rdp.corp'] = ['198.20.0.5']  # fake-IP вместо реального
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: DNS static_ips с fake-IP" "1" \
+    "$(printf '%s' "$out" | grep -c 'DNS static_ips  ОТСУТСТВУЮТ (1): rdp\.corp=192\.0\.2\.10')"
+
+  HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" \
+    "$DIR/karing-rules.sh" -i >/dev/null 2>&1
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+assert d['dns']['static_ips']['rdp.corp'] == ['192.0.2.10'], 'fake-IP не убран'
+print('ok')
+PY
+  ck "apply: fake-IP убран из static_ips" "0" "$?"
+
   # --- auto-конфиг learn-находок входит в управляемый список ---
   # (выполняется на чистом live, до мутаций ниже).
   out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-one" "$DIR/karing-rules.sh" --check 2>&1)"
   ck "check: auto-домен вне live, код 1" "1" "$?"
   ck "check: назван отсутствующий auto-домен" "1" \
-    "$(printf '%s' "$out" | grep -c 'ОТСУТСТВУЮТ (1): auto-learn\.ru')"
+    "$(printf '%s' "$out" | grep -c '^  domain .*ОТСУТСТВУЮТ (1): auto-learn\.ru')"
   HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-one" \
     "$DIR/karing-rules.sh" \
     | python3 -c 'import json,sys
@@ -563,6 +739,14 @@ for r in d["rules"]:
 print("ok")' \
       >/dev/null 2>&1
     ck "singbox: валидный JSON direct_out без дублей" "0" "$?"
+    CORP_NETWORKS_CONF="$real_conf" "$DIR/karing-rules.sh" --dns \
+      | python3 -c 'import json,sys
+d=json.load(sys.stdin)
+assert d["enable_static_ip"] is True
+assert d.get("static_ips") and all(isinstance(v,list) for v in d["static_ips"].values())
+print("ok")' \
+      >/dev/null 2>&1
+    ck "dns: валидный JSON static_ips для RDP-хостов" "0" "$?"
   fi
 
   printf 'selftest: %d passed, %d failed\n' "$pass" "$fail"
@@ -574,5 +758,6 @@ case "${1:-}" in
   --check)     check ;;
   --selftest)  selftest ;;
   --singbox)   singbox_rule ;;
+  --dns)       static_ips_json ;;
   *)           group_json ;;
 esac
