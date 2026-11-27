@@ -82,6 +82,8 @@ AUTO_SITE_DOMAINS="$(grep -vE '^[[:space:]]*(#|$)' "$AUTO_CONF" 2>/dev/null | tr
 # иначе можно записать fake-IP 198.20.0.x как "статический"). Хранится в
 # dns.static_ips настроек Karing и не затирается при рестарте приложения.
 RDP_STATIC_IPS="${RDP_STATIC_IPS:-}"
+# Устаревшие хосты — удаляются из dns.static_ips при -i.
+RDP_STATIC_IPS_DROP="${RDP_STATIC_IPS_DROP:-}"
 
 to_json_array() {
   # Повторы убираются с сохранением порядка: SITE_DOMAINS и MYSQL_HOSTS
@@ -131,8 +133,9 @@ singbox_rule() {
 
 static_ips_json() {
   # Статические DNS-записи для dns.static_ips Karing (RDP-хосты -> реальные IP).
-  python3 - "$RDP_STATIC_IPS" <<'PY'
+  python3 - "$RDP_STATIC_IPS" "$RDP_STATIC_IPS_DROP" <<'PY'
 import json, sys
+drop = sys.argv[2].split()
 out = {}
 for item in sys.argv[1].split():
     if '=' not in item:
@@ -143,7 +146,7 @@ for item in sys.argv[1].split():
         out.setdefault(host, [])
         if ip not in out[host]:
             out[host].append(ip)
-print(json.dumps({"enable_static_ip": True, "static_ips": out},
+print(json.dumps({"enable_static_ip": True, "static_ips": out, "drop": drop},
                  ensure_ascii=False, indent=2))
 PY
 }
@@ -160,10 +163,11 @@ apply() {
   local tmpdir
   tmpdir="$(mktemp -d)"
   group_json > "$tmpdir/direct.json"
-  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" "$SETTINGS_JSON" "$RDP_STATIC_IPS" <<'PY'
+  python3 - "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$tmpdir" "$DOMAINS" "$SITE_DOMAINS" "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" "$SETTINGS_JSON" "$RDP_STATIC_IPS" "$RDP_STATIC_IPS_DROP" <<'PY'
 import json, sys, shutil, time, os, socket
 routing_path, subscribe_path, tmpdir = sys.argv[1:4]
 settings_path, rdp_static_raw = sys.argv[11:13]
+rdp_drop = sys.argv[13].split() if len(sys.argv) > 13 else []
 corp_domains = (sys.argv[4] + ' ' + sys.argv[5] + ' ' + sys.argv[6] + ' ' + sys.argv[10]).split()
 mysql_hosts = sys.argv[6].split()
 domain_suffixes = sys.argv[7].split() if len(sys.argv) > 7 else []
@@ -317,6 +321,8 @@ else:
     dns = settings.setdefault('dns', {})
     dns['enable_static_ip'] = True
     static = dns.setdefault('static_ips', {})
+    for host in rdp_drop:
+        static.pop(host, None)
     for host, ips in wanted.items():
         # fake-IP из пула Karing не должен остаться "статическим"
         cur = [x for x in static.get(host, [])
@@ -330,7 +336,8 @@ else:
 print('OK: группа "ts-network" синхронизирована с corp-networks.conf')
 print('    корп. домены/суффиксы/IP -> "ts-network" (direct_out)')
 print('    личные правки остались в "На прямую"')
-print(f'    DNS static_ips (RDP): {len(wanted)} хостов -> karing_setting.json')
+print(f'    DNS static_ips (RDP): {len(wanted)} хостов, удалено устаревших: '
+      f'{len(rdp_drop)} -> karing_setting.json')
 print('    ' + routing_path)
 PY
   rm -rf "$tmpdir"
@@ -342,12 +349,13 @@ check() {
   # 2 — конфиг не прочитан (пригодно как гейт в мониторинге).
   python3 - "$0" "$ROUTING_JSON" "$SUBSCRIBE_JSON" "$DOMAINS" "$SITE_DOMAINS" \
       "$MYSQL_HOSTS" "$DOMAIN_SUFFIX" "$NET_ROUTES" "$VPN_SERVERS" "$AUTO_SITE_DOMAINS" \
-      "$SETTINGS_JSON" "$RDP_STATIC_IPS" <<'PY'
+      "$SETTINGS_JSON" "$RDP_STATIC_IPS" "$RDP_STATIC_IPS_DROP" <<'PY'
 import json, sys, os, socket, subprocess
 
 self_name = sys.argv[1]
 routing_path, subscribe_path = sys.argv[2:4]
 settings_path, rdp_static_raw = sys.argv[11:13]
+rdp_drop = sys.argv[13].split() if len(sys.argv) > 13 else []
 DOMAINS, SITE_DOMAINS, MYSQL_HOSTS, DOMAIN_SUFFIX, NET_ROUTES, VPN_SERVERS, AUTO_DOMAINS = \
     (sys.argv[i].split() for i in range(4, 11))
 
@@ -482,13 +490,18 @@ if settings is not None:
     if not dns.get('enable_static_ip'):
         drift += 1
         print('  DNS static_ips  ОТКЛЮЧЕНЫ (enable_static_ip=false)')
+    stale = [h for h in rdp_drop if h in static]
     miss = [f'{h}={ip}' for h, ips in wanted.items()
             for ip in ips if ip not in static.get(h, [])]
     if miss:
         drift += len(miss)
         print(f'  DNS static_ips  ОТСУТСТВУЮТ ({len(miss)}): '
               f"{', '.join(sorted(miss))}")
-    else:
+    if stale:
+        drift += len(stale)
+        print(f'  DNS static_ips  УСТАРЕВШИЕ ({len(stale)}): '
+              f"{', '.join(sorted(stale))}")
+    if not miss and not stale:
         print(f'  DNS static_ips  ок ({len(wanted)} хостов RDP, '
               f'всего записей {len(static)})')
 
@@ -537,6 +550,7 @@ DOMAIN_SUFFIX=".tradesoft.ru"
 NET_ROUTES="192.168.0.0/16"
 VPN_SERVERS="203.0.113.7"
 RDP_STATIC_IPS="rdp.corp=192.0.2.10"
+RDP_STATIC_IPS_DROP="old.rdp"
 CONF
   printf '# пустой auto-конфиг (комменты игнорируются)\n' > "$tmp/auto-empty"
   printf 'auto-learn.ru\n' > "$tmp/auto-one"
@@ -654,6 +668,26 @@ print('ok')
 PY
   ck "apply: fake-IP убран из static_ips" "0" "$?"
 
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding='utf-8'))
+d['dns']['static_ips']['old.rdp'] = ['192.0.2.77']
+json.dump(d, open(p, 'w', encoding='utf-8'), ensure_ascii=False, indent=2)
+PY
+  out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" "$DIR/karing-rules.sh" --check 2>&1)"
+  ck "check: устаревший RDP-хост замечен" "1" \
+    "$(printf '%s' "$out" | grep -c 'DNS static_ips  УСТАРЕВШИЕ (1): old\.rdp')"
+  HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-empty" \
+    "$DIR/karing-rules.sh" -i >/dev/null 2>&1
+  python3 - "$kg/karing_setting.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding='utf-8'))
+assert 'old.rdp' not in d['dns']['static_ips'], 'устаревший хост не удалён'
+print('ok')
+PY
+  ck "apply: устаревший RDP-хост удалён" "0" "$?"
+
   # --- auto-конфиг learn-находок входит в управляемый список ---
   # (выполняется на чистом live, до мутаций ниже).
   out="$(HOME="$home" CORP_NETWORKS_CONF="$conf" CORP_NETWORKS_AUTO="$tmp/auto-one" "$DIR/karing-rules.sh" --check 2>&1)"
@@ -743,6 +777,7 @@ print("ok")' \
       | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 assert d["enable_static_ip"] is True
+assert d["drop"] == ["testing26.tradesoft.corp"]
 assert d.get("static_ips") and all(isinstance(v,list) for v in d["static_ips"].values())
 print("ok")' \
       >/dev/null 2>&1

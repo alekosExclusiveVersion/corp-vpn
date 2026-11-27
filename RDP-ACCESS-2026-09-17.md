@@ -113,7 +113,9 @@ login Keychain (service `opencode.rdp`) через `~/bin/keychain-get` и по�
   (`192.168.128.160`) трафик идёт через `en0` и не зависит от Karing.
 
 **Fix:** RDP-хосты прописаны в `RDP_STATIC_IPS` (`corp-networks.conf`);
-`karing-rules.sh -i` записывает их в `dns.static_ips` настроек Karing
+устаревшие (например, несуществующий `testing26.tradesoft.corp`) — в
+`RDP_STATIC_IPS_DROP` и удаляются при `-i`. `karing-rules.sh -i` записывает
+актуальные записи в `dns.static_ips` настроек Karing
 (файл `karing_setting.json`, вместе с `enable_static_ip=true`). Настройка
 переживает рестарт приложения. Править `service_core.json` бесполезно —
 Karing перезаписывает его из своей памяти при старте (проверено 27.11).
